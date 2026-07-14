@@ -1,0 +1,45 @@
+{
+  "id": "llm_qwen3_text_gen",
+  "name": "千问3.5",
+  "type": "text.chat",
+  "engine": "comfyui",
+  "version": "1.0.0",
+  "description": "文字生成工作流，输入 prompt 后输出脚本、分镜或结构化文本",
+  "input_schema": {
+    "summary": "输入文字需求，生成脚本、角色或分镜结构化 JSON。",
+    "required": [
+      "prompt"
+    ],
+    "optional": [
+      "messages",
+      "response_format"
+    ],
+    "response": {
+      "type": "json",
+      "format": "json_object"
+    },
+    "inputs": [
+      {
+        "name": "prompt",
+        "type": "text",
+        "label": "文字需求",
+        "required": true
+      },
+      {
+        "name": "messages",
+        "type": "messages",
+        "label": "聊天消息",
+        "required": false
+      },
+      {
+        "name": "response_format",
+        "type": "object",
+        "label": "响应格式",
+        "required": false,
+        "default": {
+          "type": "json_object"
+        }
+      }
+    ]
+  }
+}

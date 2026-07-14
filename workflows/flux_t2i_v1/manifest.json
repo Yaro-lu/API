@@ -1,0 +1,8 @@
+{
+  "id": "flux_t2i_v1",
+  "name": "flux2",
+  "type": "image.text_to_image",
+  "engine": "comfyui",
+  "version": "1.0.0",
+  "description": "通用文生图工作流，输入 prompt 即可生成图片"
+}

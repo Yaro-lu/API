@@ -1,0 +1,8 @@
+{
+  "id": "wan_flf2v_v1",
+  "name": "wan2.1",
+  "type": "video.first_last_to_video",
+  "engine": "comfyui",
+  "version": "1.0.0",
+  "description": "首帧+尾帧转视频工作流"
+}
