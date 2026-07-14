@@ -31,6 +31,20 @@ BASE_DIR = Path(__file__).parent.parent.parent
 GUI_ASSET_DIR = Path(__file__).parent / "assets"
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+from app.core.runtime_package import (
+    RUNTIME_PACKAGE_NAME,
+    RUNTIME_RELEASE_URL,
+    archive_extract_command,
+    archive_list_command,
+    find_extractor,
+    invalid_archive_entries,
+    missing_archive_entries,
+    missing_runtime_paths,
+    parse_archive_members,
+    verify_sha256,
+)
+
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
 
@@ -88,7 +102,6 @@ API_PORT = 18188
 COMFY_PORT = 8188
 API_BASE = f"http://127.0.0.1:{API_PORT}"
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
-RUNTIME_PACKAGE_NAME = "runtime-nvidia-rtx30plus-cu130-v1.0.0.7z"
 SERVER_SYNC_MAX_RETRIES = 3
 MODEL_REQUIREMENTS = {
     "Flux2": {
@@ -234,9 +247,7 @@ def _release_instance_lock():
 
 def _check_runtime_exists() -> bool:
     """检查 runtime 目录核心文件是否存在"""
-    python_exe = BASE_DIR / "runtime" / "python" / "python.exe"
-    comfy_main = BASE_DIR / "runtime" / "ComfyUI" / "main.py"
-    return python_exe.exists() and comfy_main.exists()
+    return not missing_runtime_paths(BASE_DIR)
 
 
 def _check_models_status() -> dict:
@@ -2744,7 +2755,7 @@ class GatewayApp(WindowBase):
 
         tk.Label(
             content,
-            text=f"需要安装 {RUNTIME_PACKAGE_NAME}，可以选择本地 7z 包，也可以从国内镜像自动下载并安装。",
+            text=f"需要安装 {RUNTIME_PACKAGE_NAME}，可以选择本地 7z 包，也可以从官方 Release 或配置的镜像自动下载安装。",
             font=F["normal"],
             fg=C["text2"],
             bg=C["card"],
@@ -2765,7 +2776,7 @@ class GatewayApp(WindowBase):
             self._button(card, button, command, "plain").pack(pady=(0, 20), ipadx=22, ipady=5)
 
         install_card("1", "□", "选择 7z 环境包", "从本地选择已经下载好的 7z 运行环境包进行安装。", "选择文件", self._select_runtime)
-        install_card("2", "☁", "从国内镜像一键安装", "自动下载运行环境并解压到客户端目录。", "一键安装", self._install_runtime_from_mirror)
+        install_card("2", "☁", "在线一键安装", "从官方 Release 或配置的镜像下载并安装运行环境。", "一键安装", self._install_runtime_from_mirror)
         install_card("3", "▣", "安装同目录环境包", "自动查找客户端同目录下的 7z 环境包并安装。", "开始安装", self._install_local_runtime)
 
         secondary_row = tk.Frame(content, bg=C["card"])
@@ -2813,7 +2824,7 @@ class GatewayApp(WindowBase):
             runtime_cfg.get("mirror_url") or
             cfg.get("runtime_mirror_url") or
             os.environ.get("LINGJING_RUNTIME_MIRROR_URL") or
-            ""
+            RUNTIME_RELEASE_URL
         ).strip()
 
     def _install_runtime_from_mirror(self):
@@ -2823,9 +2834,9 @@ class GatewayApp(WindowBase):
             return
 
         messagebox.showerror(
-            "未配置镜像地址",
-            "当前版本没有配置运行环境包默认下载地址，无法自动安装。\n\n"
-            "请先使用本地 7z 包安装，或在 runtime/config.local.json 中配置 runtime.mirror_url 后再点一键安装。"
+            "未配置下载地址",
+            "当前版本没有配置运行环境包下载地址，无法自动安装。\n\n"
+            "请先使用本地 7z 包安装，或配置 runtime.mirror_url 后再点一键安装。"
         )
 
     def _download_runtime(self, url: str):
@@ -2838,7 +2849,7 @@ class GatewayApp(WindowBase):
         popup.resizable(False, False)
         self._center_popup(popup, 430, 150)
 
-        tk.Label(popup, text="正在从国内镜像下载运行环境...", font=F["bold"],
+        tk.Label(popup, text="正在下载运行环境...", font=F["bold"],
                  fg=C["text"], bg=C["surface"]).pack(pady=(22, 8))
         progress_lbl = tk.Label(popup, text="准备下载...", font=F["small"],
                                 fg=C["warn"], bg=C["surface"])
@@ -2850,15 +2861,46 @@ class GatewayApp(WindowBase):
                 cache_dir = BASE_DIR / "cache"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 target = cache_dir / RUNTIME_PACKAGE_NAME
+                partial = target.with_name(f"{target.name}.part")
+                sidecar = Path(f"{target}.sha256")
 
-                def hook(block_count, block_size, total_size):
-                    if total_size > 0:
-                        pct = min(100, int(block_count * block_size * 100 / total_size))
-                        self.after(0, lambda p=pct: progress_lbl.config(text=f"下载中：{p}%"))
-                    else:
-                        self.after(0, lambda: progress_lbl.config(text="下载中..."))
+                resume_at = partial.stat().st_size if partial.exists() else 0
+                headers = {"User-Agent": "LingJing-Desktop/0.1.0"}
+                if resume_at:
+                    headers["Range"] = f"bytes={resume_at}-"
+                request = ur.Request(url, headers=headers)
+                with ur.urlopen(request, timeout=30) as response:
+                    partial_response = getattr(response, "status", None) == 206
+                    mode = "ab" if resume_at and partial_response else "wb"
+                    if mode == "wb":
+                        resume_at = 0
+                    remaining = int(response.headers.get("Content-Length") or 0)
+                    total_size = resume_at + remaining if remaining else 0
+                    downloaded = resume_at
+                    with partial.open(mode) as handle:
+                        while True:
+                            chunk = response.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size:
+                                pct = min(100, int(downloaded * 100 / total_size))
+                                self.after(0, lambda p=pct: progress_lbl.config(text=f"下载中：{p}%"))
+                            else:
+                                size_mb = downloaded / (1024 * 1024)
+                                self.after(0, lambda s=size_mb: progress_lbl.config(text=f"已下载：{s:.1f} MB"))
+                partial.replace(target)
 
-                ur.urlretrieve(url, target, hook)
+                self.after(0, lambda: progress_lbl.config(text="正在下载校验文件..."))
+                try:
+                    checksum_request = ur.Request(f"{url}.sha256", headers={"User-Agent": "LingJing-Desktop/0.1.0"})
+                    with ur.urlopen(checksum_request, timeout=30) as response:
+                        sidecar.write_bytes(response.read())
+                except Exception:
+                    if url.rstrip("/") == RUNTIME_RELEASE_URL.rstrip("/"):
+                        raise RuntimeError("官方环境包 SHA256 校验文件下载失败")
+
                 self.after(0, popup.destroy)
                 self.after(100, lambda: self._extract_runtime(target))
             except Exception as ex:
@@ -2894,16 +2936,55 @@ class GatewayApp(WindowBase):
 
         def _do_extract():
             try:
-                progress_lbl.config(text="正在解压...")
-                # 使用 7z 解压
-                seven_zip = BASE_DIR / "bin" / "7z.exe"
-                if not seven_zip.exists():
-                    seven_zip = "7z"
+                package = Path(pkg_path)
+                if not package.is_file():
+                    raise FileNotFoundError(f"环境包不存在: {package}")
 
-                cmd = [str(seven_zip), "x", str(pkg_path), f"-o{BASE_DIR}", "-y"]
-                result = subprocess.run(cmd, cwd=str(BASE_DIR), capture_output=True, text=True, timeout=600)
+                sidecar = Path(f"{package}.sha256")
+                if sidecar.is_file():
+                    self.after(0, lambda: progress_lbl.config(text="正在校验 SHA256..."))
+                    valid, expected, actual = verify_sha256(package, sidecar)
+                    if not valid:
+                        raise RuntimeError(
+                            f"SHA256 校验失败（期望 {expected[:12]}...，实际 {actual[:12]}...）"
+                        )
+
+                extractor = find_extractor(BASE_DIR)
+                if not extractor:
+                    raise RuntimeError("未找到可用的 7-Zip 或 Windows tar.exe 解压工具")
+
+                self.after(0, lambda: progress_lbl.config(text="正在检查环境包结构..."))
+                list_result = subprocess.run(
+                    archive_list_command(extractor, package),
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                if list_result.returncode != 0:
+                    raise RuntimeError(list_result.stderr.strip() or "无法读取环境包目录")
+                members = parse_archive_members(extractor, list_result.stdout)
+                missing = missing_archive_entries(members)
+                invalid = invalid_archive_entries(members)
+                if missing:
+                    raise RuntimeError(f"环境包目录结构不完整，缺少: {', '.join(missing)}")
+                if invalid:
+                    raise RuntimeError(f"环境包包含不允许的路径: {invalid[0]}")
+
+                self.after(0, lambda: progress_lbl.config(text="正在解压..."))
+                result = subprocess.run(
+                    archive_extract_command(extractor, package, BASE_DIR),
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                )
                 if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "7z 解压失败")
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "环境包解压失败")
+
+                missing_after_install = missing_runtime_paths(BASE_DIR)
+                if missing_after_install:
+                    raise RuntimeError(f"安装后环境仍不完整，缺少: {', '.join(missing_after_install)}")
 
                 self.after(0, popup.destroy)
                 self.after(0, self._show_main_content)

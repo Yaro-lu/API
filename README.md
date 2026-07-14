@@ -26,6 +26,15 @@ Cloudflare Quick Tunnel 临时公网 URL
 
 ### 2. 安装依赖
 
+推荐从 [GitHub Releases](https://github.com/Yaro-lu/API/releases) 下载与客户端提示同名的
+`runtime-nvidia-rtx30plus-cu130-v*.7z` 便携环境包，并同时下载对应的 `.sha256` 文件。
+客户端支持在线下载、本地选择和同目录自动安装；安装时会校验 SHA256、压缩包目录结构和安装结果。
+
+环境包包含便携 Python、`.venv` 依赖、ComfyUI 与 Cloudflared，不包含任何模型、API Key、账户会话、请求记录或生成结果。
+模型应单独放在客户端根目录的 `models/` 中。
+
+开发模式也可以自行安装依赖：
+
 ```bash
 pip install -r requirements.txt
 ```
