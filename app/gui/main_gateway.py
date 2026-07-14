@@ -44,6 +44,7 @@ from app.core.runtime_package import (
     parse_archive_members,
     verify_sha256,
 )
+from app.gui.dashboard_pages import StaticDashboardPages
 
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
@@ -69,6 +70,13 @@ C = {
     "progress_bg": "#ecf0f5",
     "shadow":   "#dfe8f5",
     "button":   "#fbfdff",
+    "sidebar":  "#ffffff",
+    "sidebar_active": "#eeecff",
+    "sidebar_border": "#dfe7f3",
+    "soft_primary": "#eeecff",
+    "soft_success": "#eaf9f1",
+    "soft_warn": "#fff5e6",
+    "soft_error": "#fff0f0",
 }
 F = {
     "brand":  ("Microsoft YaHei UI", 22, "bold"),
@@ -84,13 +92,14 @@ F = {
     "url":    ("Consolas", 9),
 }
 LAYOUT = {
-    "window_w": 820,
-    "window_h": 660,
-    "min_w": 780,
-    "min_h": 640,
+    "window_w": 1180,
+    "window_h": 760,
+    "min_w": 1090,
+    "min_h": 700,
+    "sidebar_w": 204,
     "outer": 18,
     "gap": 10,
-    "top_h": 92,
+    "top_h": 78,
     "status_h": 38,
     "info_h": 72,
     "left_w": 240,
@@ -484,14 +493,19 @@ class GatewayApp(WindowBase):
         self._current_task_text = "无任务"
 
         self._setup_style()
+        self._build_app_shell()
+        self._build_sidebar()
         self._build_title_bar()
+        self._build_page_host()
         self._build_bottom_lights()
         self._build_info_cards()
         self._build_main_area()
         self._build_workflow_model_panel()
         self._build_progress_panel()
         self._build_action_buttons()
+        self._build_static_pages()
         self._build_footer()
+        self._show_page("overview")
 
         self.center()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -817,66 +831,196 @@ class GatewayApp(WindowBase):
         self.after(0, self._start_backend)
 
     # ══════════════════════════════════════════════════════
+    # 应用外壳：侧栏 + 页面容器
+    # ══════════════════════════════════════════════════════
+    def _build_app_shell(self):
+        self._app_shell = tk.Frame(self, bg=C["bg"])
+        self._app_shell.pack(fill="both", expand=True)
+
+        self._sidebar = tk.Frame(
+            self._app_shell,
+            bg=C["sidebar"],
+            width=LAYOUT["sidebar_w"],
+            highlightthickness=1,
+            highlightbackground=C["sidebar_border"],
+        )
+        self._sidebar.pack(side="left", fill="y")
+        self._sidebar.pack_propagate(False)
+
+        self._content_root = tk.Frame(self._app_shell, bg=C["bg"])
+        self._content_root.pack(side="left", fill="both", expand=True)
+
+    def _build_sidebar(self):
+        brand = tk.Frame(self._sidebar, bg=C["sidebar"])
+        brand.pack(fill="x", padx=16, pady=(18, 15))
+
+        icon_path = BASE_DIR / "icon.png"
+        if icon_path.exists():
+            try:
+                from PIL import Image, ImageTk
+                icon = Image.open(icon_path).convert("RGBA").resize((38, 38), Image.LANCZOS)
+                self._sidebar_brand_icon = ImageTk.PhotoImage(icon)
+                self._image_refs.append(self._sidebar_brand_icon)
+                tk.Label(brand, image=self._sidebar_brand_icon, bg=C["sidebar"]).pack(side="left", padx=(0, 9))
+            except Exception:
+                tk.Label(brand, text="▷", font=("Microsoft YaHei UI", 20, "bold"), fg=C["primary"], bg=C["sidebar"]).pack(side="left", padx=(0, 10))
+
+        brand_text = tk.Frame(brand, bg=C["sidebar"])
+        brand_text.pack(side="left", fill="x", expand=True)
+        tk.Label(brand_text, text="灵镜造片厂", font=("Microsoft YaHei UI", 13, "bold"), fg=C["text"], bg=C["sidebar"]).pack(anchor="w")
+        tk.Label(brand_text, text="LOCAL AI GATEWAY", font=("Consolas", 7), fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", pady=(2, 0))
+
+        tk.Frame(self._sidebar, bg=C["sidebar_border"], height=1).pack(fill="x", padx=14, pady=(0, 12))
+        tk.Label(self._sidebar, text="工作台", font=F["tiny"], fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=22, pady=(0, 7))
+
+        nav_specs = [
+            ("overview", "▦", "概览"),
+            ("services", "↗", "接口服务"),
+            ("workflows", "◇", "工作流"),
+            ("tasks", "◷", "任务中心"),
+            ("network", "◎", "网络访问"),
+            ("resources", "▣", "资源管理"),
+            ("settings", "⚙", "设置"),
+        ]
+        self._nav_buttons = {}
+        for page_id, icon, label in nav_specs:
+            if CTK_AVAILABLE:
+                button = ctk.CTkButton(
+                    self._sidebar,
+                    text=f"{icon}    {label}",
+                    font=F["button"],
+                    anchor="w",
+                    height=39,
+                    corner_radius=8,
+                    fg_color="transparent",
+                    hover_color=C["hover"],
+                    text_color=C["text2"],
+                    command=lambda key=page_id: self._show_page(key),
+                )
+            else:
+                button = tk.Button(
+                    self._sidebar,
+                    text=f"{icon}    {label}",
+                    font=F["button"],
+                    anchor="w",
+                    bg=C["sidebar"],
+                    fg=C["text2"],
+                    activebackground=C["hover"],
+                    activeforeground=C["text"],
+                    relief="flat",
+                    bd=0,
+                    cursor="hand2",
+                    command=lambda key=page_id: self._show_page(key),
+                )
+            button.pack(fill="x", padx=12, pady=2)
+            self._nav_buttons[page_id] = button
+
+        tk.Frame(self._sidebar, bg=C["sidebar"]).pack(fill="both", expand=True)
+
+        node = tk.Frame(self._sidebar, bg=C["hover"], highlightthickness=1, highlightbackground=C["border2"])
+        node.pack(fill="x", padx=12, pady=(8, 10))
+        row = tk.Frame(node, bg=C["hover"])
+        row.pack(fill="x", padx=10, pady=(9, 2))
+        dot = tk.Canvas(row, width=10, height=10, bg=C["hover"], highlightthickness=0)
+        dot.pack(side="left", padx=(0, 7), pady=(2, 0))
+        dot.create_oval(1, 1, 9, 9, fill=C["success"], outline="")
+        tk.Label(row, text="本机节点", font=F["bold"], fg=C["text"], bg=C["hover"]).pack(side="left")
+        tk.Label(node, text="客户端正在运行", font=F["tiny"], fg=C["text2"], bg=C["hover"]).pack(anchor="w", padx=27, pady=(0, 9))
+
+        try:
+            version = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+        except Exception:
+            version = "dev"
+        tk.Label(self._sidebar, text=f"Desktop  {version}", font=("Consolas", 7), fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=18, pady=(0, 14))
+
+    def _build_page_host(self):
+        self._page_host = tk.Frame(self._content_root, bg=C["bg"])
+        self._page_host.pack(fill="both", expand=True)
+        self._pages = {}
+        self._current_page_id = ""
+        self._overview_page = tk.Frame(self._page_host, bg=C["bg"])
+        self._pages["overview"] = self._overview_page
+
+    def _build_static_pages(self):
+        factory = StaticDashboardPages(self, C, F)
+        for page_id in ("services", "workflows", "tasks", "network", "resources", "settings"):
+            self._pages[page_id] = factory.build(self._page_host, page_id)
+
+    def _show_page(self, page_id: str):
+        page = self._pages.get(page_id)
+        if page is None:
+            return
+        if self._current_page_id == page_id and page.winfo_ismapped():
+            return
+
+        current = self._pages.get(self._current_page_id)
+        if current is not None and current.winfo_ismapped():
+            current.pack_forget()
+        page.pack(fill="both", expand=True)
+        self._current_page_id = page_id
+
+        page_meta = {
+            "overview": ("控制台概览", "运行状态、访问凭据与当前工作流"),
+            "services": ("接口服务", "管理对外兼容协议、公开模型名与调用路由"),
+            "workflows": ("工作流", "导入任意工作流并声明输入、输出与依赖"),
+            "tasks": ("任务中心", "统一查看异步队列、进度、结果与恢复状态"),
+            "network": ("网络访问", "配置本机、局域网与公网调用方式"),
+            "resources": ("资源管理", "独立维护客户端、环境、模型和工作流包"),
+            "settings": ("设置", "访问安全、任务并发、存储与默认路由"),
+        }
+        title, subtitle = page_meta[page_id]
+        if hasattr(self, "_page_title_label"):
+            self._page_title_label.config(text=title)
+            self._page_subtitle_label.config(text=subtitle)
+
+        for key, button in self._nav_buttons.items():
+            active = key == page_id
+            if CTK_AVAILABLE:
+                button.configure(
+                    fg_color=C["sidebar_active"] if active else "transparent",
+                    text_color=C["primary"] if active else C["text2"],
+                )
+            else:
+                button.configure(
+                    bg=C["sidebar_active"] if active else C["sidebar"],
+                    fg=C["primary"] if active else C["text2"],
+                )
+
+    # ══════════════════════════════════════════════════════
     # 顶栏：品牌 + 账号信息
     # ══════════════════════════════════════════════════════
     def _build_title_bar(self):
-        bar = self._card(self)
+        bar = self._card(self._content_root)
         bar.configure(height=LAYOUT["top_h"])
-        bar.pack(fill="x", padx=LAYOUT["outer"], pady=(10, 0))
+        bar.pack(fill="x", padx=16, pady=(12, 8))
         bar.pack_propagate(False)
 
         left = tk.Frame(bar, bg=C["surface"])
-        left.pack(side="left", padx=18, pady=20)
-
-        # 品牌 logo：参考图为左侧图标 + 文字标。
-        logo_row = tk.Frame(left, bg=C["surface"])
-        logo_row.pack(anchor="w")
-        icon_img_path = BASE_DIR / "icon.png"
-        title_img_path = BASE_DIR / "font.png"
-        if not title_img_path.exists():
-            title_img_path = Path.home() / "Desktop" / "font.png"
-        if icon_img_path.exists():
-            try:
-                from PIL import Image, ImageTk
-                icon_img = Image.open(icon_img_path).convert("RGBA").resize((34, 34), Image.LANCZOS)
-                self._brand_icon_img = ImageTk.PhotoImage(icon_img)
-                tk.Label(logo_row, image=self._brand_icon_img, bg=C["surface"]).pack(side="left", padx=(0, 9))
-            except Exception:
-                tk.Label(logo_row, text="▷", font=("Microsoft YaHei UI", 18, "bold"),
-                         fg=C["primary"], bg=C["surface"]).pack(side="left", padx=(0, 10))
-        text_stack = tk.Frame(logo_row, bg=C["surface"])
-        text_stack.pack(side="left", anchor="center")
-        if title_img_path.exists():
-            try:
-                from PIL import Image, ImageTk
-                pil_img = Image.open(title_img_path).convert("RGBA")
-                # The source image contains a tiny tagline; scaling the whole image
-                # makes that line fuzzy, so only use the main wordmark here.
-                main_h = max(1, int(pil_img.height * 0.68))
-                pil_img = pil_img.crop((0, 0, pil_img.width, main_h))
-                h = 34
-                w = int(pil_img.width * h / pil_img.height)
-                pil_img = pil_img.resize((w, h), Image.LANCZOS)
-                self._title_img = ImageTk.PhotoImage(pil_img)
-                tk.Label(text_stack, image=self._title_img, bg=C["surface"]).pack(anchor="w")
-            except Exception:
-                tk.Label(text_stack, text="灵镜造片厂", font=F["brand"],
-                         fg=C["text"], bg=C["surface"]).pack(anchor="w")
-        else:
-            tk.Label(text_stack, text="灵镜造片厂", font=F["brand"],
-                     fg=C["text"], bg=C["surface"]).pack(anchor="w")
-        tk.Label(
-            text_stack,
-            text="— 从灵感到成片的 AI 导演工作台 —",
-            font=("Microsoft YaHei UI", 8),
-            fg=C["text2"],
+        left.pack(side="left", padx=18, pady=12)
+        tk.Label(left, text="LOCAL AI GATEWAY  /  DESKTOP", font=("Consolas", 7), fg=C["primary"], bg=C["surface"]).pack(anchor="w")
+        title_row = tk.Frame(left, bg=C["surface"])
+        title_row.pack(anchor="w", pady=(1, 0))
+        self._page_title_label = tk.Label(
+            title_row,
+            text="控制台概览",
+            font=("Microsoft YaHei UI", 16, "bold"),
+            fg=C["text"],
             bg=C["surface"],
-        ).pack(anchor="w", pady=(0, 0))
+        )
+        self._page_title_label.pack(side="left")
+        self._page_subtitle_label = tk.Label(
+            title_row,
+            text="运行状态、访问凭据与当前工作流",
+            font=F["small"],
+            fg=C["muted"],
+            bg=C["surface"],
+        )
+        self._page_subtitle_label.pack(side="left", padx=(12, 0), pady=(4, 0))
 
         tk.Frame(bar, bg=C["surface"]).pack(side="left", fill="x", expand=True)
 
         right = tk.Frame(bar, bg=C["surface"])
-        right.pack(side="right", padx=18, pady=25)
+        right.pack(side="right", padx=16, pady=18)
 
         self._account_badge = tk.Frame(right, bg=C["surface"], cursor="hand2")
         self._account_badge.pack(side="left", padx=(0, 12))
@@ -910,7 +1054,7 @@ class GatewayApp(WindowBase):
     # 底部状态灯条
     # ══════════════════════════════════════════════════════
     def _build_bottom_lights(self):
-        bar = self._card(self, fill="x", padx=LAYOUT["outer"], pady=(12, 8))
+        bar = self._card(self._overview_page, fill="x", padx=LAYOUT["outer"], pady=(4, 8))
         bar.configure(height=LAYOUT["status_h"])
         bar.pack_propagate(False)
 
@@ -982,7 +1126,7 @@ class GatewayApp(WindowBase):
     # URL + Key 卡片
     # ══════════════════════════════════════════════════════
     def _build_info_cards(self):
-        self._info_frame = tk.Frame(self, bg=C["bg"])
+        self._info_frame = tk.Frame(self._overview_page, bg=C["bg"])
         self._info_frame.pack(fill="x", padx=LAYOUT["outer"], pady=(8, 10))
 
         # 公网 URL
@@ -1214,7 +1358,7 @@ class GatewayApp(WindowBase):
         ).pack(side="left", ipadx=8, ipady=4, padx=(6, 0))
 
     def _build_main_area(self):
-        self._main_area = tk.Frame(self, bg=C["bg"])
+        self._main_area = tk.Frame(self._overview_page, bg=C["bg"])
         self._main_area.pack(fill="both", expand=True, padx=LAYOUT["outer"], pady=(0, 12))
 
         self._left_panel_parent = tk.Frame(self._main_area, bg=C["bg"], width=LAYOUT["left_w"])
@@ -2686,7 +2830,7 @@ class GatewayApp(WindowBase):
         return canvas
 
     def _build_action_buttons(self):
-        btn_frame = tk.Frame(self, bg=C["bg"])
+        btn_frame = tk.Frame(self._overview_page, bg=C["bg"])
         self._btn_frame = btn_frame
         btn_frame.pack(fill="x", padx=LAYOUT["outer"], pady=(0, 12))
 
@@ -2743,7 +2887,7 @@ class GatewayApp(WindowBase):
                 pass
             self._runtime_missing_frame = None
 
-        frame = tk.Frame(self, bg=C["bg"])
+        frame = tk.Frame(self._overview_page, bg=C["bg"])
         frame.pack(fill="both", expand=True, padx=LAYOUT["outer"], pady=(8, 12))
 
         content = self._card(frame, fill="both", expand=True)
@@ -3007,7 +3151,7 @@ class GatewayApp(WindowBase):
     # 底部状态栏
     # ══════════════════════════════════════════════════════
     def _build_footer(self):
-        bar = tk.Frame(self, bg=C["surface"], height=LAYOUT["footer_h"])
+        bar = tk.Frame(self._content_root, bg=C["surface"], height=LAYOUT["footer_h"])
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
         self._loading_bar = tk.Frame(bar, bg=C["surface"])
