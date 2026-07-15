@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Optional
 import mimetypes
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
@@ -212,6 +213,7 @@ def _model_group_for_type(model_type: str) -> str:
 
 def _local_model_status() -> dict:
     models_dir = BASE_DIR / "models"
+    qwen_files = ["text_encoders/qwen3.5_4b_bf16.safetensors"]
     flux_files = [
         "diffusion_models/flux-2-klein-9b-fp8.safetensors",
         "text_encoders/qwen_3_8b_fp8mixed.safetensors",
@@ -224,6 +226,7 @@ def _local_model_status() -> dict:
         "clip_vision/clip_vision_h.safetensors",
     ]
     return {
+        "qwen35": all((models_dir / f).exists() for f in qwen_files),
         "flux2": all((models_dir / f).exists() for f in flux_files),
         "wan21": all((models_dir / f).exists() for f in wan_files),
     }
@@ -236,6 +239,8 @@ def _workflow_available(model_id: str, model_type: str) -> bool:
         return status["wan21"]
     if "flux" in text:
         return status["flux2"]
+    if "qwen" in text or "千问" in text:
+        return status["qwen35"]
     return True
 
 
@@ -547,7 +552,18 @@ def create_app() -> FastAPI:
     )
     registry.scan_folder()
 
-    app = FastAPI(title="Local AI API Gateway", version="0.2.0")
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            # Graceful server shutdown must also stop its Tunnel child.
+            if tunnel is not None:
+                tunnel.stop()
+            if state is not None:
+                state.set_offline()
+
+    app = FastAPI(title="Local AI API Gateway", version="0.2.0", lifespan=lifespan)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(
         CORSMiddleware,
@@ -821,7 +837,8 @@ def create_app() -> FastAPI:
         model_status = _local_model_status()
         flux2_ok = model_status["flux2"]
         wan21_ok = model_status["wan21"]
-        models_all_ok = flux2_ok and wan21_ok
+        qwen35_ok = model_status["qwen35"]
+        models_all_ok = qwen35_ok and flux2_ok and wan21_ok
 
         # 当前任务进度
         with _task_lock:
@@ -860,6 +877,7 @@ def create_app() -> FastAPI:
                 "status": "complete" if models_all_ok else "incomplete",
                 "Flux2": "complete" if flux2_ok else "missing",
                 "Wan2.1": "complete" if wan21_ok else "missing",
+                "Qwen3.5": "complete" if qwen35_ok else "missing",
                 "list": model_list,
                 "image": model_groups.get("image", []),
                 "video": model_groups.get("video", []),
@@ -1211,13 +1229,18 @@ def main():
     state = RuntimeState(config.runtime_dir)
     state.start_session(port)
 
-    if not args.no_tunnel:
-        start_tunnel(config)
+    try:
+        if not args.no_tunnel:
+            start_tunnel(config)
 
-    app = create_app()
-    print(f"[API] Listening on http://{host}:{port}")
-    print(f"[API] API Key: {state.api_key}")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+        app = create_app()
+        print(f"[API] Listening on http://{host}:{port}")
+        print(f"[API] API Key: {state.api_key}")
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        if tunnel is not None:
+            tunnel.stop()
+        state.set_offline()
 
 
 if __name__ == "__main__":

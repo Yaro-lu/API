@@ -33,6 +33,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from app.core.runtime_package import (
+    REQUIRED_RUNTIME_PATHS,
     RUNTIME_PACKAGE_NAME,
     RUNTIME_RELEASE_URL,
     archive_extract_command,
@@ -44,6 +45,8 @@ from app.core.runtime_package import (
     parse_archive_members,
     verify_sha256,
 )
+from app.core.process_supervisor import ProcessSupervisor
+from app.core.runtime_state import RuntimeState
 from app.gui.dashboard_pages import StaticDashboardPages
 
 _INSTANCE_LOCK_HANDLE = None
@@ -113,6 +116,15 @@ API_BASE = f"http://127.0.0.1:{API_PORT}"
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
 SERVER_SYNC_MAX_RETRIES = 3
 MODEL_REQUIREMENTS = {
+    "Qwen3.5": {
+        "title": "Qwen3.5 文字模型",
+        "items": [
+            {
+                "path": "text_encoders/qwen3.5_4b_bf16.safetensors",
+                "url": "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/text_encoders/qwen3.5_4b_bf16.safetensors",
+            },
+        ],
+    },
     "Flux2": {
         "title": "Flux2 图片模型",
         "items": [
@@ -223,6 +235,13 @@ def _acquire_instance_lock() -> bool:
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = open(lock_dir / "gateway.lock", "a+b")
     try:
+        # msvcrt locks from the current file position.  Always lock byte 0;
+        # locking at append/EOF lets a second instance lock a different byte.
+        lock_handle.seek(0, os.SEEK_END)
+        if lock_handle.tell() == 0:
+            lock_handle.write(b"0")
+            lock_handle.flush()
+        lock_handle.seek(0)
         msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         try:
@@ -259,15 +278,36 @@ def _check_runtime_exists() -> bool:
     return not missing_runtime_paths(BASE_DIR)
 
 
+def _runtime_has_package_files() -> bool:
+    """Return whether this installation contains any managed runtime file."""
+    return any((BASE_DIR / path).is_file() for path in REQUIRED_RUNTIME_PATHS)
+
+
+def _model_file_ready(path: Path) -> bool:
+    """Reject missing and empty placeholders when reporting model readiness."""
+    try:
+        path = Path(path)
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _check_models_status() -> dict:
-    """检查 Flux2 和 Wan2.1 模型完整性"""
+    """Check every model group used by the bundled workflows."""
     result = {
+        "Qwen3.5": "缺失",
         "Flux2": "缺失",
         "Wan2.1": "缺失",
         "all_ok": False,
-        "missing": {"Flux2": [], "Wan2.1": []},
+        "missing": {"Qwen3.5": [], "Flux2": [], "Wan2.1": []},
     }
     models_dir = BASE_DIR / "models"
+
+    qwen_files = ["text_encoders/qwen3.5_4b_bf16.safetensors"]
+    qwen_missing = [Path(f).name for f in qwen_files if not _model_file_ready(models_dir / f)]
+    qwen_ok = not qwen_missing
+    result["Qwen3.5"] = "完整" if qwen_ok else "缺失"
+    result["missing"]["Qwen3.5"] = qwen_missing
 
     # Flux2 检查
     flux_files = [
@@ -275,7 +315,7 @@ def _check_models_status() -> dict:
         "text_encoders/qwen_3_8b_fp8mixed.safetensors",
         "vae/full_encoder_small_decoder.safetensors",
     ]
-    flux_missing = [Path(f).name for f in flux_files if not (models_dir / f).exists()]
+    flux_missing = [Path(f).name for f in flux_files if not _model_file_ready(models_dir / f)]
     flux_ok = not flux_missing
     result["Flux2"] = "完整" if flux_ok else "缺失"
     result["missing"]["Flux2"] = flux_missing
@@ -287,16 +327,16 @@ def _check_models_status() -> dict:
         "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
         "clip_vision/clip_vision_h.safetensors",
     ]
-    wan_missing = [Path(f).name for f in wan_files if not (models_dir / f).exists()]
+    wan_missing = [Path(f).name for f in wan_files if not _model_file_ready(models_dir / f)]
     wan_ok = not wan_missing
     result["Wan2.1"] = "完整" if wan_ok else "缺失"
     result["missing"]["Wan2.1"] = wan_missing
 
-    result["all_ok"] = flux_ok and wan_ok
+    result["all_ok"] = qwen_ok and flux_ok and wan_ok
     return result
 
 
-def _check_torch(python_path: Path) -> dict:
+def _check_torch(python_path: Path, run_command=subprocess.run) -> dict:
     """通过 runtime python 检查 PyTorch / CUDA"""
     check_script = """
 import json
@@ -312,7 +352,7 @@ except Exception as e:
     print(json.dumps({"error": str(e)}))
 """
     try:
-        proc = subprocess.run(
+        proc = run_command(
             [str(python_path), "-c", check_script],
             capture_output=True, text=True, timeout=30,
             cwd=str(BASE_DIR),
@@ -334,14 +374,17 @@ except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def _check_system_env() -> dict:
+def _check_system_env(run_command=subprocess.run) -> dict:
     """检查系统环境（nvidia-smi, GPU）"""
     try:
-        output = subprocess.check_output(
+        result = run_command(
             ["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
              "--format=csv,noheader,nounits"],
-            text=True, stderr=subprocess.DEVNULL, timeout=10,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
         )
+        if result.returncode != 0:
+            return {"success": False, "error": "未检测到 NVIDIA 显卡驱动"}
+        output = result.stdout
         lines = output.strip().split("\n")
         if not lines:
             return {"success": False, "error": "未检测到 NVIDIA 显卡"}
@@ -453,6 +496,9 @@ class GatewayApp(WindowBase):
         # 子进程
         self._comfy_proc = None
         self._api_proc = None
+        self._process_supervisor = ProcessSupervisor(BASE_DIR)
+        self._runtime_maintenance_lock = threading.RLock()
+        self._runtime_maintenance_in_progress = False
         self._tunnel_url = ""
         self._api_key = ""
         self._poll_run = False
@@ -463,13 +509,16 @@ class GatewayApp(WindowBase):
         self._server_user_email = ""
         self._server_url_value = "https://ai.lol-lu.site"
         self._server_account_profile = {}
-        self._server_mode = "unset"
+        # Local mode is the product default.  Platform login is optional and
+        # must never block the local API gateway from starting.
+        self._server_mode = "guest"
         self._server_sync_running = False
         self._server_sync_fail_count = 0
         self._heartbeat_run = True
         self._offline_notice_sent = False
         self._login_prompt_shown = False
         self._login_popup = None
+        self._runtime_maintenance_popup = None
         self._account_status_text = ""
         self._initial_session_sync_done = False
         self._comfy_starting_until = 0
@@ -490,6 +539,7 @@ class GatewayApp(WindowBase):
 
         # 状态缓存
         self._model_status = _check_models_status()
+        self._environment_status = {}
         self._current_task_text = "无任务"
 
         self._setup_style()
@@ -506,6 +556,8 @@ class GatewayApp(WindowBase):
         self._build_static_pages()
         self._build_footer()
         self._show_page("overview")
+        if self._server_mode == "guest":
+            self._set_light("server", "online", "本地模式")
 
         self.center()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -514,7 +566,6 @@ class GatewayApp(WindowBase):
         # 异步启动序列
         threading.Thread(target=self._startup_sequence, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        self.after(700, self._maybe_show_login_prompt)
 
     def center(self):
         self.update_idletasks()
@@ -648,9 +699,8 @@ class GatewayApp(WindowBase):
             pass
 
     def _maybe_show_login_prompt(self):
-        if self._server_mode == "logged_in" and self._server_session_token:
-            return
-        self._show_login_prompt()
+        """Platform login is opt-in; startup always continues in local mode."""
+        return
 
     def _setup_style(self):
         if CTK_AVAILABLE:
@@ -779,13 +829,33 @@ class GatewayApp(WindowBase):
     # ══════════════════════════════════════════════════════
     # 启动序列
     # ══════════════════════════════════════════════════════
+    def _run_runtime_probe(self, role: str, args, **kwargs):
+        """Launch an environment probe only while runtime replacement is excluded."""
+        lock = self._runtime_maintenance_lock
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("运行环境正在维护")
+        try:
+            if self._shutting_down or self._runtime_maintenance_in_progress:
+                raise RuntimeError("运行环境正在维护")
+            return self._process_supervisor.run(role, args, **kwargs)
+        finally:
+            lock.release()
+
     def _startup_sequence(self):
         """主启动序列（后台线程）"""
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
         # 1. GUI 已启动
 
         # 2. 检查系统环境
         self.after(0, lambda: self._set_light("env", "loading"))
-        env = _check_system_env()
+        env = _check_system_env(
+            lambda args, **kwargs: self._run_runtime_probe(
+                "environment-check", args, **kwargs
+            )
+        )
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
         time.sleep(0.3)
         if env.get("success"):
             self.after(0, lambda: self._set_light("env", "online", f"已安装 ({env.get('gpu_name','')})"))
@@ -806,7 +876,14 @@ class GatewayApp(WindowBase):
         python_exe = BASE_DIR / "runtime" / "python" / "python.exe"
         torch_ok = False
         if python_exe.exists():
-            torch_info = _check_torch(python_exe)
+            torch_info = _check_torch(
+                python_exe,
+                lambda args, **kwargs: self._run_runtime_probe(
+                    "torch-check", args, **kwargs
+                ),
+            )
+            if self._shutting_down or self._runtime_maintenance_active():
+                return
             torch_ok = torch_info.get("success", False)
             if not torch_ok:
                 print(f"[Startup] PyTorch 异常: {torch_info.get('error')}")
@@ -828,7 +905,8 @@ class GatewayApp(WindowBase):
         _ensure_extra_model_paths()
 
         # 7-11. 启动服务
-        self.after(0, self._start_backend)
+        if not self._runtime_maintenance_active():
+            self.after(0, self._start_backend)
 
     # ══════════════════════════════════════════════════════
     # 应用外壳：侧栏 + 页面容器
@@ -874,12 +952,9 @@ class GatewayApp(WindowBase):
         tk.Label(self._sidebar, text="工作台", font=F["tiny"], fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=22, pady=(0, 7))
 
         nav_specs = [
-            ("overview", "▦", "概览"),
-            ("services", "↗", "接口服务"),
+            ("overview", "▦", "控制台"),
             ("workflows", "◇", "工作流"),
-            ("tasks", "◷", "任务中心"),
-            ("network", "◎", "网络访问"),
-            ("resources", "▣", "资源管理"),
+            ("resources", "▣", "模型与环境"),
             ("settings", "⚙", "设置"),
         ]
         self._nav_buttons = {}
@@ -942,9 +1017,9 @@ class GatewayApp(WindowBase):
         self._pages["overview"] = self._overview_page
 
     def _build_static_pages(self):
-        factory = StaticDashboardPages(self, C, F)
-        for page_id in ("services", "workflows", "tasks", "network", "resources", "settings"):
-            self._pages[page_id] = factory.build(self._page_host, page_id)
+        self._dashboard_pages = StaticDashboardPages(self, C, F)
+        for page_id in ("workflows", "resources", "settings"):
+            self._pages[page_id] = self._dashboard_pages.build(self._page_host, page_id)
 
     def _show_page(self, page_id: str):
         page = self._pages.get(page_id)
@@ -960,13 +1035,10 @@ class GatewayApp(WindowBase):
         self._current_page_id = page_id
 
         page_meta = {
-            "overview": ("控制台概览", "运行状态、访问凭据与当前工作流"),
-            "services": ("接口服务", "管理对外兼容协议、公开模型名与调用路由"),
-            "workflows": ("工作流", "导入任意工作流并声明输入、输出与依赖"),
-            "tasks": ("任务中心", "统一查看异步队列、进度、结果与恢复状态"),
-            "network": ("网络访问", "配置本机、局域网与公网调用方式"),
-            "resources": ("资源管理", "独立维护客户端、环境、模型和工作流包"),
-            "settings": ("设置", "访问安全、任务并发、存储与默认路由"),
+            "overview": ("控制台", "服务状态、调用信息与当前任务"),
+            "workflows": ("工作流", "添加、检查和管理本机生成能力"),
+            "resources": ("模型与环境", "准备运行环境并补齐工作流所需模型"),
+            "settings": ("设置", "访问密钥、文件位置与软件基础配置"),
         }
         title, subtitle = page_meta[page_id]
         if hasattr(self, "_page_title_label"):
@@ -986,6 +1058,13 @@ class GatewayApp(WindowBase):
                     fg=C["primary"] if active else C["text2"],
                 )
 
+    def _open_runtime_maintenance(self):
+        """Open the shared maintenance center without starting an install."""
+        self._show_page("resources")
+        dashboard = getattr(self, "_dashboard_pages", None)
+        if dashboard is not None:
+            self.after_idle(dashboard.focus_runtime_maintenance)
+
     # ══════════════════════════════════════════════════════
     # 顶栏：品牌 + 账号信息
     # ══════════════════════════════════════════════════════
@@ -1002,7 +1081,7 @@ class GatewayApp(WindowBase):
         title_row.pack(anchor="w", pady=(1, 0))
         self._page_title_label = tk.Label(
             title_row,
-            text="控制台概览",
+            text="控制台",
             font=("Microsoft YaHei UI", 16, "bold"),
             fg=C["text"],
             bg=C["surface"],
@@ -1010,7 +1089,7 @@ class GatewayApp(WindowBase):
         self._page_title_label.pack(side="left")
         self._page_subtitle_label = tk.Label(
             title_row,
-            text="运行状态、访问凭据与当前工作流",
+            text="服务状态、调用信息与当前任务",
             font=F["small"],
             fg=C["muted"],
             bg=C["surface"],
@@ -1044,10 +1123,7 @@ class GatewayApp(WindowBase):
         )
         self._account_summary_label.pack(side="left")
         for widget in (self._account_badge, self._account_avatar_label, self._account_summary_label):
-            widget.bind("<Button-1>", lambda _event: self._show_login_prompt(force=True))
-
-        self._button(right, "注册", self._open_register, "plain", width=76).pack(side="left", padx=(0, 8))
-        self._button(right, "充值", self._open_recharge, "primary", width=76).pack(side="left")
+            widget.bind("<Button-1>", lambda _event: self._show_account_popup())
         self._render_account_badge()
 
     # ══════════════════════════════════════════════════════
@@ -1171,7 +1247,7 @@ class GatewayApp(WindowBase):
 
     def _account_summary_text(self) -> str:
         if self._server_mode == "guest":
-            return "游客模式"
+            return "本地模式"
         email = self._server_user_email or "未登录"
         profile = self._server_account_profile if isinstance(self._server_account_profile, dict) else {}
         user = profile.get("user") if isinstance(profile.get("user"), dict) else profile
@@ -1184,7 +1260,7 @@ class GatewayApp(WindowBase):
             or user.get("vip_level")
             or user.get("vip")
         )
-        membership = str(
+        membership_value = (
             account.get("membership")
             or account.get("membershipStatus")
             or account.get("memberLevel")
@@ -1195,6 +1271,16 @@ class GatewayApp(WindowBase):
             or user.get("member_level")
             or "普通用户"
         )
+        if isinstance(membership_value, dict):
+            membership = str(
+                membership_value.get("name")
+                or membership_value.get("label")
+                or membership_value.get("level")
+                or membership_value.get("status")
+                or "普通用户"
+            )
+        else:
+            membership = str(membership_value)
         if isinstance(vip_level, bool):
             vip_text = "VIP" if vip_level else membership
         elif vip_level not in (None, ""):
@@ -1233,11 +1319,100 @@ class GatewayApp(WindowBase):
             self._draw_account_avatar(avatar, C["primary"])
             self._account_summary_label.config(text=self._account_summary_text(), fg=C["text"])
         elif self._server_mode == "guest":
-            self._draw_account_avatar("游", C["warn"])
-            self._account_summary_label.config(text="游客模式", fg=C["text"])
+            self._draw_account_avatar("本", C["success"])
+            self._account_summary_label.config(text="本地模式", fg=C["text"])
         else:
             self._draw_account_avatar("登", C["text2"])
             self._account_summary_label.config(text="未登录", fg=C["text2"])
+
+    def _show_account_popup(self):
+        """Show account details when logged in; otherwise offer optional login."""
+        if self._server_mode != "logged_in" or not self._server_session_token:
+            self._show_login_prompt(force=True)
+            return
+
+        existing = getattr(self, "_account_popup", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+
+        popup = tk.Toplevel(self)
+        self._account_popup = popup
+        popup.title("账号信息")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.resizable(False, False)
+        self._center_popup(popup, 460, 310)
+
+        def close_popup():
+            self._account_popup = None
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
+
+        head = tk.Frame(panel, bg=C["card"])
+        head.pack(fill="x", padx=24, pady=(22, 14))
+        avatar = tk.Canvas(head, width=48, height=48, bg=C["card"], highlightthickness=0)
+        avatar.pack(side="left", padx=(0, 12))
+        RoundedFrame._round_rect(avatar, 1, 1, 47, 47, 12, fill=C["primary"], outline=C["primary"])
+        avatar.create_text(24, 24, text=(self._server_user_email[:1] or "账").upper(), fill="#fff", font=("Microsoft YaHei UI", 14, "bold"))
+        identity = tk.Frame(head, bg=C["card"])
+        identity.pack(side="left", fill="x", expand=True)
+        tk.Label(identity, text=self._server_user_email or "平台账号", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w")
+        account_summary = self._account_summary_text()
+        email_prefix = f"{self._server_user_email} · "
+        if account_summary.startswith(email_prefix):
+            account_summary = account_summary[len(email_prefix):]
+        tk.Label(identity, text=account_summary, font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", pady=(4, 0))
+        self._badge_for_account_popup = tk.Label(head, text="  已同步  ", font=F["small"], fg=C["success"], bg=C["soft_success"], padx=4, pady=3)
+        self._badge_for_account_popup.pack(side="right")
+
+        info = tk.Frame(panel, bg=C["hover"], highlightthickness=1, highlightbackground=C["border2"])
+        info.pack(fill="x", padx=24, pady=(0, 16))
+        rows = [
+            ("平台同步", "已开启"),
+            ("本地服务", "退出登录后仍可正常使用"),
+            ("公网连接", "由本机 Tunnel 独立提供"),
+        ]
+        for label, value in rows:
+            row = tk.Frame(info, bg=C["hover"])
+            row.pack(fill="x", padx=12, pady=6)
+            tk.Label(row, text=label, font=F["small"], fg=C["muted"], bg=C["hover"]).pack(side="left")
+            tk.Label(row, text=value, font=F["small"], fg=C["text"], bg=C["hover"]).pack(side="right")
+
+        actions = tk.Frame(panel, bg=C["card"])
+        actions.pack(fill="x", padx=24, pady=(0, 18))
+        self._button(actions, "退出登录", lambda: self._logout_account(close_popup), "plain").pack(fill="x", expand=True)
+
+    def _logout_account(self, close_callback=None):
+        server_url = self._server_url_value
+        token = self._server_session_token
+        self._server_session_token = ""
+        self._server_user_email = ""
+        self._server_account_profile = {}
+        self._server_mode = "guest"
+        self._initial_session_sync_done = False
+        self._server_password_var.set("")
+        self._save_account_session()
+        self._render_account_badge()
+        self._set_account_status("本地模式：不会连接平台服务端", "success")
+        self._set_light("server", "online", "本地模式")
+        if callable(close_callback):
+            close_callback()
+        if token:
+            threading.Thread(
+                target=self._notify_server_offline,
+                kwargs={"server_url": server_url, "token": token},
+                daemon=True,
+            ).start()
 
     def _apply_account_visibility(self):
         if not hasattr(self, "_account_frame"):
@@ -1331,18 +1506,6 @@ class GatewayApp(WindowBase):
             bd=0,
             cursor="hand2",
             command=self._open_register,
-        ).pack(side="left", ipadx=8, ipady=4, padx=(6, 0))
-        tk.Button(
-            btn_box,
-            text="充值",
-            font=F["small"],
-            bg=C["surface"],
-            fg=C["warn"],
-            activebackground=C["hover"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._open_recharge,
         ).pack(side="left", ipadx=8, ipady=4, padx=(6, 0))
         tk.Button(
             btn_box,
@@ -1778,6 +1941,8 @@ class GatewayApp(WindowBase):
             return "Wan2.1"
         if "flux" in text:
             return "Flux2"
+        if "qwen" in text or "千问" in text:
+            return "Qwen3.5"
         return ""
 
     def _workflow_display_name(self, workflow: dict) -> str:
@@ -1882,7 +2047,7 @@ class GatewayApp(WindowBase):
         models_dir = BASE_DIR / "models"
         for item in spec.get("items", []):
             rel_path = item.get("path", "")
-            if rel_path and not (models_dir / rel_path).exists():
+            if rel_path and not _model_file_ready(models_dir / rel_path):
                 items.append(item)
         return items
 
@@ -1930,6 +2095,31 @@ class GatewayApp(WindowBase):
             control = self._build_model_download_row(rows, model_key, item, index)
             download_controls.append(control)
 
+        def cleanup_hidden_popup():
+            try:
+                if not popup.winfo_exists():
+                    return
+                if any(control.get("state") == "downloading" for control in download_controls):
+                    popup.after(600, cleanup_hidden_popup)
+                    return
+                popup.destroy()
+            except Exception:
+                pass
+
+        def close_popup():
+            if any(control.get("state") == "downloading" for control in download_controls):
+                try:
+                    popup.grab_release()
+                except Exception:
+                    pass
+                popup.withdraw()
+                self._footer_label.config(text="  模型继续在后台下载，完成后会自动重新检查")
+                popup.after(600, cleanup_hidden_popup)
+                return
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+
         actions = tk.Frame(panel, bg=C["card"])
         actions.pack(fill="x", padx=18, pady=(0, 14))
 
@@ -1941,7 +2131,7 @@ class GatewayApp(WindowBase):
         if download_controls:
             self._button(actions, "下载全部缺失", download_all, "primary", width=110).pack(side="left", ipadx=12, ipady=6)
         self._button(actions, "打开模型目录", self._open_models, "plain").pack(side="left", ipadx=12, ipady=6, padx=(10, 0))
-        self._button(actions, "关闭", popup.destroy, "plain").pack(side="right", ipadx=12, ipady=6)
+        self._button(actions, "关闭", close_popup, "plain").pack(side="right", ipadx=12, ipady=6)
 
     def _build_model_download_row(self, parent, model_key: str, item: dict, index: int) -> dict:
         rel_path = str(item.get("path") or "").strip()
@@ -2863,7 +3053,7 @@ class GatewayApp(WindowBase):
 
         action(0, "打开输出目录", "folder", self._open_outputs)
         action(1, "打开模型目录", "cube", self._open_models)
-        action(2, "安装运行环境", "gear", self._install_runtime, warn=True)
+        action(2, "安装运行环境", "gear", self._open_runtime_maintenance, warn=True)
         action(3, "重启后台", "refresh", self._restart_backend, warn=True)
 
     # ══════════════════════════════════════════════════════
@@ -2972,9 +3162,17 @@ class GatewayApp(WindowBase):
         ).strip()
 
     def _install_runtime_from_mirror(self):
+        repairing = _runtime_has_package_files()
+        if repairing and not messagebox.askyesno(
+            "安装或修复运行环境",
+            "安装过程中会暂时停止 ComfyUI、API 和公网连接，完成后自动重新启动。\n\n"
+            "模型、工作流和生成结果不会被删除。是否继续？",
+            parent=self,
+        ):
+            return
         url = self._runtime_mirror_url()
         if url:
-            self._download_runtime(url)
+            self._download_runtime(url, repair_confirmed=repairing)
             return
 
         messagebox.showerror(
@@ -2983,7 +3181,7 @@ class GatewayApp(WindowBase):
             "请先使用本地 7z 包安装，或配置 runtime.mirror_url 后再点一键安装。"
         )
 
-    def _download_runtime(self, url: str):
+    def _download_runtime(self, url: str, repair_confirmed: bool = False):
         popup = tk.Toplevel(self)
         popup.title("下载运行环境")
         popup.geometry("430x150")
@@ -2998,6 +3196,19 @@ class GatewayApp(WindowBase):
         progress_lbl = tk.Label(popup, text="准备下载...", font=F["small"],
                                 fg=C["warn"], bg=C["surface"])
         progress_lbl.pack()
+
+        def keep_download_open():
+            progress_lbl.config(text="下载正在进行，完成前请保持窗口开启", fg=C["warn"])
+
+        def show_download_error(message: str):
+            try:
+                progress_lbl.config(text=f"下载失败：{message}", fg=C["error"])
+                popup.grab_release()
+                popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+            except Exception:
+                pass
+
+        popup.protocol("WM_DELETE_WINDOW", keep_download_open)
 
         def _do_download():
             try:
@@ -3046,9 +3257,10 @@ class GatewayApp(WindowBase):
                         raise RuntimeError("官方环境包 SHA256 校验文件下载失败")
 
                 self.after(0, popup.destroy)
-                self.after(100, lambda: self._extract_runtime(target))
+                self.after(100, lambda: self._extract_runtime(target, repair_confirmed=repair_confirmed))
             except Exception as ex:
-                self.after(0, lambda e=str(ex): progress_lbl.config(text=f"下载失败：{e}", fg=C["error"]))
+                if not self._shutting_down:
+                    self.after(0, lambda e=str(ex): show_download_error(e))
 
         threading.Thread(target=_do_download, daemon=True).start()
 
@@ -3060,8 +3272,16 @@ class GatewayApp(WindowBase):
         if path:
             self._extract_runtime(Path(path))
 
-    def _extract_runtime(self, pkg_path: Path):
+    def _extract_runtime(self, pkg_path: Path, repair_confirmed: bool = False):
         """解压 runtime 包"""
+        if _runtime_has_package_files() and not repair_confirmed:
+            if not messagebox.askyesno(
+                "安装或修复运行环境",
+                "安装过程中会暂时停止 ComfyUI、API 和公网连接，完成后自动重新启动。\n\n"
+                "模型、工作流和生成结果不会被删除。是否继续？",
+                parent=self,
+            ):
+                return
         # 后台线程解压
         popup = tk.Toplevel(self)
         popup.title("安装中")
@@ -3078,7 +3298,29 @@ class GatewayApp(WindowBase):
                                 fg=C["warn"], bg=C["surface"])
         progress_lbl.pack()
 
+        def keep_install_open():
+            progress_lbl.config(text="安装正在进行，完成前请保持窗口开启", fg=C["warn"])
+
+        def show_install_error(message: str):
+            try:
+                progress_lbl.config(text=f"失败: {message}", fg=C["error"])
+                popup.grab_release()
+                popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+            except Exception:
+                pass
+            self._environment_status = {
+                "package_ready": _check_runtime_exists(),
+                "ready": False,
+                "message": str(message),
+            }
+            if hasattr(self, "_dashboard_pages"):
+                self._dashboard_pages.refresh(self._last_health)
+
+        popup.protocol("WM_DELETE_WINDOW", keep_install_open)
+
         def _do_extract():
+            maintenance_started = False
+            running_before: set[str] = set()
             try:
                 package = Path(pkg_path)
                 if not package.is_file():
@@ -3098,7 +3340,8 @@ class GatewayApp(WindowBase):
                     raise RuntimeError("未找到可用的 7-Zip 或 Windows tar.exe 解压工具")
 
                 self.after(0, lambda: progress_lbl.config(text="正在检查环境包结构..."))
-                list_result = subprocess.run(
+                list_result = self._process_supervisor.run(
+                    "runtime-install",
                     archive_list_command(extractor, package),
                     cwd=str(BASE_DIR),
                     capture_output=True,
@@ -3114,9 +3357,19 @@ class GatewayApp(WindowBase):
                     raise RuntimeError(f"环境包目录结构不完整，缺少: {', '.join(missing)}")
                 if invalid:
                     raise RuntimeError(f"环境包包含不允许的路径: {invalid[0]}")
+                if self._shutting_down:
+                    return
+
+                self.after(0, lambda: progress_lbl.config(text="正在暂停后台服务..."))
+                maintenance_started, running_before, stop_error = self._begin_runtime_maintenance()
+                if not maintenance_started:
+                    raise RuntimeError(stop_error or "无法开始运行环境维护")
+                if stop_error:
+                    raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
 
                 self.after(0, lambda: progress_lbl.config(text="正在解压..."))
-                result = subprocess.run(
+                result = self._process_supervisor.run(
+                    "runtime-install",
                     archive_extract_command(extractor, package, BASE_DIR),
                     cwd=str(BASE_DIR),
                     capture_output=True,
@@ -3130,13 +3383,82 @@ class GatewayApp(WindowBase):
                 if missing_after_install:
                     raise RuntimeError(f"安装后环境仍不完整，缺少: {', '.join(missing_after_install)}")
 
-                self.after(0, popup.destroy)
-                self.after(0, self._show_main_content)
-                self.after(500, lambda: threading.Thread(target=self._startup_sequence, daemon=True).start())
+                if not self._shutting_down:
+                    self._end_runtime_maintenance(restart=True)
+                    maintenance_started = False
+
+                    def finish_install():
+                        try:
+                            popup.destroy()
+                        except Exception:
+                            pass
+                        self._environment_status = {}
+                        self._show_main_content()
+                        if hasattr(self, "_dashboard_pages"):
+                            self._dashboard_pages.refresh(self._last_health)
+                            if self._current_page_id == "resources":
+                                self.after_idle(self._dashboard_pages.focus_runtime_maintenance)
+
+                    self.after(0, finish_install)
             except Exception as e:
-                self.after(0, lambda: progress_lbl.config(text=f"失败: {e}", fg=C["error"]))
+                if maintenance_started:
+                    can_restore = bool(running_before) and _check_runtime_exists()
+                    self._end_runtime_maintenance(restart=can_restore)
+                    maintenance_started = False
+                if not self._shutting_down:
+                    self.after(0, lambda error=str(e): show_install_error(error))
+            finally:
+                if maintenance_started:
+                    can_restore = bool(running_before) and _check_runtime_exists()
+                    self._end_runtime_maintenance(restart=can_restore)
 
         threading.Thread(target=_do_extract, daemon=True).start()
+
+    def _runtime_maintenance_active(self) -> bool:
+        lock = self.__dict__.get("_runtime_maintenance_lock")
+        if lock is None:
+            return bool(self.__dict__.get("_runtime_maintenance_in_progress", False))
+        with lock:
+            return bool(self._runtime_maintenance_in_progress)
+
+    def _begin_runtime_maintenance(self) -> tuple[bool, set[str], str]:
+        """Reserve runtime replacement and stop services without a launch race."""
+        with self._runtime_maintenance_lock:
+            if self._shutting_down:
+                return False, set(), "客户端正在退出"
+            if self._runtime_maintenance_in_progress:
+                return False, set(), "已有运行环境维护任务正在进行"
+            self._runtime_maintenance_in_progress = True
+            running_before = {
+                role
+                for role in ("comfyui", "api")
+                if self._process_supervisor.is_running(role)
+            }
+            return True, running_before, self._stop_runtime_for_maintenance()
+
+    def _end_runtime_maintenance(self, restart: bool):
+        """Release the maintenance guard and optionally restore backend services."""
+        with self._runtime_maintenance_lock:
+            self._runtime_maintenance_in_progress = False
+        if restart and not self._shutting_down:
+            self.after(
+                500,
+                lambda: threading.Thread(target=self._startup_sequence, daemon=True).start(),
+            )
+
+    def _stop_runtime_for_maintenance(self) -> str:
+        """Stop only processes that may lock runtime files before replacement."""
+        self._poll_run = False
+        errors = []
+        for role in ("comfyui", "api", "torch-check", "environment-check"):
+            error = self._process_supervisor.terminate(role, timeout=8)
+            if error:
+                errors.append(f"{role}: {error}")
+        if not self._process_supervisor.is_running("comfyui"):
+            self._comfy_proc = None
+        if not self._process_supervisor.is_running("api"):
+            self._api_proc = None
+        return "；".join(errors)
 
     def _open_install_guide(self):
         """打开安装说明"""
@@ -3184,12 +3506,114 @@ class GatewayApp(WindowBase):
 
     def _set_api_key(self, api_key: str):
         self._key_label.config(text=self._short_middle(api_key, 18, 10) if api_key else "—")
+        settings_label = getattr(self, "_settings_key_label", None)
+        if settings_label is not None:
+            masked = f"{api_key[:12]}{'•' * 12}{api_key[-6:]}" if len(api_key) > 20 else "服务启动后自动生成"
+            try:
+                settings_label.config(text=masked)
+            except Exception:
+                pass
 
     def _copy_public_url(self):
-        self._copy(self._tunnel_url or API_BASE)
+        self._copy(self._tunnel_url)
 
     def _copy_api_key(self):
         self._copy(self._api_key)
+
+    def _edit_api_key(self):
+        """Let the user change the local gateway key and apply it safely."""
+        popup = tk.Toplevel(self)
+        popup.title("修改访问密钥")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.resizable(False, False)
+        popup.grab_set()
+        self._center_popup(popup, 540, 255)
+
+        panel = self._card(popup, fill="both", expand=True, padx=16, pady=16)
+        tk.Label(panel, text="修改访问密钥", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=22, pady=(20, 5))
+        tk.Label(
+            panel,
+            text="其他软件使用这个 Key 调用客户端。保存后，正在运行的 API 会自动重启。",
+            font=F["small"],
+            fg=C["text2"],
+            bg=C["card"],
+        ).pack(anchor="w", padx=22)
+
+        entry = self._entry_widget(panel, width=430 if CTK_AVAILABLE else 52)
+        entry.pack(fill="x", padx=22, pady=(14, 5), ipady=7 if not CTK_AVAILABLE else 0)
+        entry.insert(0, self._api_key or f"sk-local-{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}")
+        status = tk.Label(panel, text="16–128 位，仅支持字母、数字、点、下划线和短横线。", font=F["tiny"], fg=C["muted"], bg=C["card"])
+        status.pack(anchor="w", padx=22)
+
+        actions = tk.Frame(panel, bg=C["card"])
+        actions.pack(fill="x", padx=22, pady=(13, 0))
+
+        def regenerate():
+            value = f"sk-local-{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}"
+            entry.delete(0, "end")
+            entry.insert(0, value)
+            status.config(text="已生成新密钥，点击保存后生效。", fg=C["warn"])
+
+        def save():
+            value = entry.get().strip()
+            if not 16 <= len(value) <= 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+                status.config(text="密钥格式不正确，请按提示修改。", fg=C["error"])
+                return
+            status.config(text="正在保存并应用...", fg=C["warn"])
+            regenerate_button.configure(state="disabled")
+            save_button.configure(state="disabled")
+
+            def apply_key():
+                was_running = self._process_supervisor.is_running("api")
+                if was_running:
+                    error = self._process_supervisor.terminate("api", timeout=8)
+                    if error:
+                        self.after(0, lambda e=error: show_error(f"API 无法安全重启：{e}"))
+                        return
+                    self._api_proc = None
+                try:
+                    # Stop the old API before writing.  Its in-memory state may
+                    # contain the previous key and must not overwrite this save.
+                    RuntimeState(BASE_DIR / "runtime").set_api_key(value)
+                except Exception as exc:
+                    if was_running and not self._shutting_down:
+                        self.after(0, self._start_api_service)
+                    self.after(0, lambda e=exc: show_error(f"保存失败：{e}"))
+                    return
+                self.after(0, lambda: finish_save(value, was_running))
+
+            threading.Thread(target=apply_key, daemon=True).start()
+
+        def show_error(message: str):
+            try:
+                if popup.winfo_exists():
+                    status.config(text=message, fg=C["error"])
+                    regenerate_button.configure(state="normal")
+                    save_button.configure(state="normal")
+            except Exception:
+                pass
+
+        def finish_save(value: str, restart_api: bool):
+            self._api_key = value
+            self._set_api_key(value)
+            try:
+                popup.grab_release()
+                popup.destroy()
+            except Exception:
+                pass
+            self._footer_label.config(text="  访问密钥已保存")
+            if restart_api and not self._shutting_down:
+                self._footer_label.config(text="  访问密钥已保存，正在重启 API...")
+                self._set_light("api", "loading", "重启中")
+                self._set_light("tunnel", "loading", "重连中")
+                self._start_api_service()
+                self._ensure_health_polling()
+
+        regenerate_button = self._button(actions, "重新生成", regenerate, "plain", width=88)
+        regenerate_button.pack(side="left")
+        save_button = self._button(actions, "保存并应用", save, "primary", width=104)
+        save_button.pack(side="right")
 
     def _json_headers(self, server_url: str = "", token: str = "") -> dict:
         server_url = (server_url or "").rstrip("/")
@@ -3267,8 +3691,8 @@ class GatewayApp(WindowBase):
         self._save_account_session()
         self._render_account_badge()
         self._apply_account_visibility()
-        self._set_account_status("游客模式：可复制 URL / Key 给第三方调用", "warn")
-        self._set_light("server", "loading", "游客模式")
+        self._set_account_status("本地模式：不会连接平台服务端", "success")
+        self._set_light("server", "online", "本地模式")
 
     def _show_login_prompt(self, force: bool = False):
         if self._shutting_down:
@@ -3286,14 +3710,14 @@ class GatewayApp(WindowBase):
 
         popup = tk.Toplevel(self)
         self._login_popup = popup
-        popup.title("连接服务端")
-        popup.geometry("540x380")
+        popup.title("登录平台账号")
+        popup.geometry("600x470")
         popup.configure(bg=C["bg"])
         popup.transient(self)
         popup.grab_set()
-        popup.resizable(False, False)
-        popup.minsize(540, 380)
-        self._center_popup(popup, 540, 380)
+        popup.resizable(True, True)
+        popup.minsize(580, 450)
+        self._center_popup(popup, 600, 470)
 
         def close_popup():
             self._login_popup = None
@@ -3311,9 +3735,9 @@ class GatewayApp(WindowBase):
         title_row.pack(fill="x", padx=28, pady=(22, 8))
         tk.Label(title_row, text="▷", font=("Microsoft YaHei UI", 18, "bold"),
                  fg="#ffffff", bg=C["primary"], width=3).pack(side="left", padx=(0, 10), ipady=4)
-        tk.Label(title_row, text="连接灵镜造片厂服务端", font=F["title"],
+        tk.Label(title_row, text="登录灵镜造片厂账号", font=F["title"],
                  fg=C["text"], bg=C["card"]).pack(side="left")
-        tk.Label(panel, text="登录后自动同步公网 URL / API Key；不登录可使用游客模式给第三方调用。",
+        tk.Label(panel, text="登录后可同步会员与平台信息；不登录也能完整使用本地工作流、API 和 Tunnel。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=28, pady=(0, 18))
 
         form = tk.Frame(panel, bg=C["card"])
@@ -3353,41 +3777,58 @@ class GatewayApp(WindowBase):
                 email=email_entry.get().strip(),
                 password=password_entry.get(),
             )
-            self._login_and_sync()
-            status_lbl.config(text="正在登录，结果会显示在主界面服务端连接栏。", fg=C["warn"])
-            popup.after(700, close_popup)
+            def on_result(success: bool, message: str):
+                try:
+                    if not popup.winfo_exists():
+                        return
+                    status_lbl.config(text=message, fg=C["success"] if success else C["error"])
+                    login_button.configure(state="normal", text="登录并同步")
+                    if success:
+                        popup.after(500, close_popup)
+                    else:
+                        password_entry.focus_set()
+                except Exception:
+                    pass
 
-        self._button(actions, "登录并同步", login, "primary").pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
-        self._button(actions, "游客模式", guest, "plain").pack(side="left", fill="x", expand=True, ipady=7, padx=(8, 0))
+            status_lbl.config(text="正在验证账号...", fg=C["warn"])
+            login_button.configure(state="disabled", text="正在登录...")
+            self._login_and_sync(on_result=on_result)
+
+        login_button = self._button(actions, "登录并同步", login, "primary")
+        login_button.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
+        self._button(actions, "继续使用本地模式", guest, "plain").pack(side="left", fill="x", expand=True, ipady=7, padx=(8, 0))
 
         links = tk.Frame(panel, bg=C["card"])
         links.pack(fill="x", padx=28, pady=(16, 0))
         tk.Button(links, text="注册账号", font=F["small"], bg=C["card"], fg=C["primary"],
                   activebackground=C["card"], relief="flat", bd=0, cursor="hand2",
                   command=self._open_register).pack(side="left")
-        tk.Button(links, text="充值中心（即将开放）", font=F["small"], bg=C["card"], fg=C["primary"],
-                  activebackground=C["card"], relief="flat", bd=0, cursor="hand2",
-                  command=self._open_recharge).pack(side="right")
 
-    def _login_and_sync(self):
+    def _login_and_sync(self, on_result=None):
         if self._server_sync_running:
+            if callable(on_result):
+                on_result(False, "已有登录请求正在处理中，请稍候。")
             return
         server_url = self._get_server_url()
         email = self._get_server_email()
         password = self._get_server_password()
         if not server_url:
             self._set_account_status("请填写服务端地址", "error")
+            if callable(on_result):
+                on_result(False, "请填写服务端地址。")
             return
         if not email or not password:
             self._set_account_status("请填写账号邮箱和密码", "error")
+            if callable(on_result):
+                on_result(False, "请填写账号邮箱和密码。")
             return
         threading.Thread(
             target=self._login_and_sync_worker,
-            args=(server_url, email, password),
+            args=(server_url, email, password, on_result),
             daemon=True,
         ).start()
 
-    def _login_and_sync_worker(self, server_url: str, email: str, password: str):
+    def _login_and_sync_worker(self, server_url: str, email: str, password: str, on_result=None):
         self._server_sync_running = True
         self.after(0, lambda: self._set_account_status("正在登录服务端...", "warn"))
         try:
@@ -3406,6 +3847,7 @@ class GatewayApp(WindowBase):
             if not token:
                 raise RuntimeError("服务端未返回 sessionToken")
             self._server_session_token = token
+            self._offline_notice_sent = False
             self._server_user_email = email
             self._server_url_value = server_url
             self._server_mode = "logged_in"
@@ -3421,6 +3863,8 @@ class GatewayApp(WindowBase):
             self.after(0, self._render_account_badge)
             self.after(0, self._apply_account_visibility)
             self.after(0, lambda: self._set_account_status("登录成功，正在同步客户端...", "warn"))
+            if callable(on_result):
+                self.after(0, lambda: on_result(True, "登录成功，正在同步客户端信息..."))
             try:
                 self._sync_to_server_with_retry(server_url, max_retries=SERVER_SYNC_MAX_RETRIES, takeover=True)
                 self._save_account_session()
@@ -3432,11 +3876,13 @@ class GatewayApp(WindowBase):
                 self.after(0, lambda: self._set_light("server", "offline", "同步失败"))
         except Exception as ex:
             self._server_session_token = ""
-            self._server_mode = "unset"
+            self._server_mode = "guest"
             self.after(0, lambda: self._set_account_form_values(password=""))
             friendly = self._format_http_error(ex)
             self.after(0, lambda e=friendly: self._set_account_status(f"同步失败：{e}", "error"))
-            self.after(0, lambda: self._set_light("server", "offline", "同步失败"))
+            if callable(on_result):
+                self.after(0, lambda e=friendly: on_result(False, f"登录失败：{e}"))
+            self.after(0, lambda: self._set_light("server", "online", "本地模式"))
             self.after(0, self._render_account_badge)
             self.after(0, self._apply_account_visibility)
         finally:
@@ -3520,6 +3966,8 @@ class GatewayApp(WindowBase):
             return self._model_status.get("Wan2.1") == "完整"
         if "flux" in text:
             return self._model_status.get("Flux2") == "完整"
+        if "qwen" in text or "千问" in text:
+            return self._model_status.get("Qwen3.5") == "完整"
         return bool(workflow.get("enabled", True))
 
     def _sync_to_server(self, server_url: str = "", status: str = "", takeover: bool = False):
@@ -3570,20 +4018,21 @@ class GatewayApp(WindowBase):
 
     def _handle_remote_session_replaced(self):
         self._server_session_token = ""
-        self._server_mode = "unset"
+        self._server_mode = "guest"
         self._server_account_profile = {}
         self._server_password_var.set("")
         self._save_account_session()
         self._render_account_badge()
         self._apply_account_visibility()
         self._set_account_status("账号已在其他客户端登录，本客户端已停止同步。", "error")
-        self._set_light("server", "offline", "已被接管")
+        self._set_light("server", "online", "本地模式")
 
-    def _notify_server_offline(self):
-        if self._offline_notice_sent or not self._server_session_token:
+    def _notify_server_offline(self, server_url: str = "", token: str = ""):
+        session_token = token or self._server_session_token
+        if self._offline_notice_sent or not session_token:
             return
         self._offline_notice_sent = True
-        server_url = (self._server_url_value or "https://ai.lol-lu.site").rstrip("/")
+        server_url = (server_url or self._server_url_value or "https://ai.lol-lu.site").rstrip("/")
         if not server_url:
             return
         try:
@@ -3593,7 +4042,7 @@ class GatewayApp(WindowBase):
                 f"{server_url}/api/client/local-session/offline",
                 data=json.dumps(payload).encode("utf-8"),
                 method="POST",
-                headers=self._json_headers(server_url, self._server_session_token),
+                headers=self._json_headers(server_url, session_token),
             )
             with ur.urlopen(req, timeout=5) as resp:
                 resp.read()
@@ -3640,9 +4089,12 @@ class GatewayApp(WindowBase):
                 friendly = self._format_http_error(ex)
                 if "UNAUTHENTICATED" in friendly or "Please log in" in friendly or "HTTP 401" in friendly:
                     self._clear_account_session()
+                    self._server_mode = "guest"
+                    self._save_account_session()
                     self.after(0, self._render_account_badge)
                     self.after(0, self._apply_account_visibility)
-                    self.after(0, self._show_login_prompt)
+                    self.after(0, lambda: self._set_account_status("平台登录已过期，本地功能不受影响", "warn"))
+                    self.after(0, lambda: self._set_light("server", "online", "本地模式"))
                 else:
                     self.after(0, lambda e=friendly: self._set_account_status(f"自动同步失败：{e}", "error"))
                     self.after(0, lambda: self._set_light("server", "offline", "同步失败"))
@@ -3667,9 +4119,6 @@ class GatewayApp(WindowBase):
 
     def _open_register(self):
         self._open_server_url("/?auth=register")
-
-    def _open_recharge(self):
-        messagebox.showinfo("充值入口", "充值功能暂未开放，后续会跳转到服务端充值中心。")
 
     def _copy_ark_image_example(self):
         url = self._tunnel_url or API_BASE
@@ -3741,8 +4190,150 @@ class GatewayApp(WindowBase):
         models_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(models_dir))
 
+    def _open_runtime_dir(self):
+        runtime_dir = BASE_DIR / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(runtime_dir))
+
+    def _open_logs_dir(self):
+        log_dir = self._backend_log_dir()
+        os.startfile(str(log_dir))
+
+    def _open_runtime_config(self):
+        config_path = BASE_DIR / "runtime" / "config.local.json"
+        if config_path.exists():
+            os.startfile(str(config_path))
+        else:
+            self._open_runtime_dir()
+
+    def _start_background_model_recheck(self):
+        threading.Thread(target=self._recheck_models, daemon=True).start()
+
+    def _start_background_runtime_recheck(self):
+        """Check package, GPU and PyTorch in the background, then refresh the card."""
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
+        self._set_light("env", "loading", "检查中")
+        self._footer_label.config(text="  正在检查运行环境...")
+        threading.Thread(target=self._retry_env_check, daemon=True).start()
+
+    def _show_workflow_tutorial(self):
+        popup = tk.Toplevel(self)
+        popup.title("添加工作流教程")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.resizable(True, True)
+        popup.minsize(620, 440)
+        self._center_popup(popup, 660, 480)
+
+        panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
+        tk.Label(panel, text="三步添加自己的 ComfyUI 工作流", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=24, pady=(22, 14))
+        steps = [
+            ("1", "导出 API 工作流", "在 ComfyUI 中选择“保存（API 格式）”，得到可供程序调用的 JSON 文件。"),
+            ("2", "添加到客户端", "点击“添加工作流”，选择 JSON 文件或包含工作流文件的文件夹。"),
+            ("3", "确认输入与输出", "客户端会自动识别提示词、图片、输出节点和模型；只有识别不明确时才需要手动确认。"),
+        ]
+        for number, title, detail in steps:
+            row = tk.Frame(panel, bg=C["card"])
+            row.pack(fill="x", padx=24, pady=7)
+            tk.Label(row, text=number, font=F["bold"], fg="#fff", bg=C["primary"], width=3, pady=6).pack(side="left", padx=(0, 12))
+            text_box = tk.Frame(row, bg=C["card"])
+            text_box.pack(side="left", fill="x", expand=True)
+            tk.Label(text_box, text=title, font=F["h2"], fg=C["text"], bg=C["card"]).pack(anchor="w")
+            tk.Label(text_box, text=detail, wraplength=520, justify="left", font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", pady=(4, 0))
+
+        note = tk.Frame(panel, bg=C["hover"], highlightthickness=1, highlightbackground=C["border2"])
+        note.pack(fill="x", padx=24, pady=(12, 14))
+        tk.Label(note, text="专业用户", font=F["bold"], fg=C["primary"], bg=C["hover"]).pack(anchor="w", padx=12, pady=(9, 2))
+        tk.Label(note, text="导入后可在“查看参数”中检查英文调用名称、公开输入、输出节点和工作流结构。", font=F["small"], fg=C["text2"], bg=C["hover"]).pack(anchor="w", padx=12, pady=(0, 9))
+        self._button(panel, "开始添加工作流", lambda: (popup.destroy(), self._show_workflow_upload_dialog()), "primary", width=132).pack(anchor="e", padx=24, pady=(0, 18))
+
     def _install_runtime(self):
-        self._show_runtime_missing(allow_back=True)
+        """Compatibility entry: installation now lives in the maintenance center."""
+        self._open_runtime_maintenance()
+
+    def _show_runtime_maintenance(self):
+        """Show advanced runtime maintenance without leaving the resources page."""
+        existing = self._runtime_maintenance_popup
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            self._runtime_maintenance_popup = None
+
+        missing = missing_runtime_paths(BASE_DIR)
+        ready = not missing
+        popup = tk.Toplevel(self)
+        self._runtime_maintenance_popup = popup
+        popup.title("运行环境维护")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.resizable(False, False)
+        self._center_popup(popup, 650, 370)
+
+        def close_popup():
+            self._runtime_maintenance_popup = None
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        panel = self._card(popup, fill="both", expand=True, padx=16, pady=16)
+
+        header = tk.Frame(panel, bg=C["card"])
+        header.pack(fill="x", padx=22, pady=(20, 12))
+        header_text = tk.Frame(header, bg=C["card"])
+        header_text.pack(side="left", fill="x", expand=True)
+        tk.Label(header_text, text="运行环境维护", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w")
+        tk.Label(
+            header_text,
+            text="环境与模型分开保存；修复环境不会删除模型、工作流和生成结果。",
+            font=F["small"],
+            fg=C["text2"],
+            bg=C["card"],
+        ).pack(anchor="w", pady=(5, 0))
+        status_text = "环境文件完整" if ready else f"需要补齐 {len(missing)} 项"
+        status_fg = C["success"] if ready else C["warn"]
+        tk.Label(header, text=f"  {status_text}  ", font=F["small"], fg=status_fg,
+                 bg=C["soft_success"] if ready else C["soft_warn"], padx=5, pady=4).pack(side="right")
+
+        def maintenance_row(title, detail, actions):
+            row = tk.Frame(panel, bg=C["hover"], highlightthickness=1, highlightbackground=C["border2"])
+            row.pack(fill="x", padx=22, pady=5)
+            text_box = tk.Frame(row, bg=C["hover"])
+            text_box.pack(side="left", fill="both", expand=True, padx=14, pady=11)
+            tk.Label(text_box, text=title, font=F["bold"], fg=C["text"], bg=C["hover"]).pack(anchor="w")
+            tk.Label(text_box, text=detail, font=F["small"], fg=C["text2"], bg=C["hover"]).pack(anchor="w", pady=(4, 0))
+            action_box = tk.Frame(row, bg=C["hover"])
+            action_box.pack(side="right", padx=12)
+            for index, (label, command, variant, width) in enumerate(actions):
+                self._button(action_box, label, command, variant, width=width).pack(
+                    side="left", padx=(0 if index == 0 else 7, 0)
+                )
+
+        maintenance_row(
+            "在线安装或修复",
+            "自动下载已配置的环境包，校验后安装；完成后自动恢复后台服务。",
+            [("开始", lambda: (close_popup(), self._install_runtime_from_mirror()), "primary", 76)],
+        )
+        maintenance_row(
+            "使用本地环境包",
+            "适合已经下载好 7z 环境包，或将环境包放在客户端同目录的情况。",
+            [
+                ("选择文件", lambda: (close_popup(), self._select_runtime()), "plain", 82),
+                ("同目录查找", lambda: (close_popup(), self._install_local_runtime()), "plain", 92),
+            ],
+        )
+
+        footer = tk.Frame(panel, bg=C["card"])
+        footer.pack(fill="x", padx=22, pady=(14, 18))
+        self._button(footer, "检查环境", lambda: (close_popup(), self._start_background_runtime_recheck()), "primary", width=88).pack(side="left")
+        self._button(footer, "打开运行目录", self._open_runtime_dir, "plain", width=102).pack(side="left", padx=(8, 0))
+        self._button(footer, "查看运行日志", self._open_logs_dir, "plain", width=102).pack(side="left", padx=(8, 0))
+        self._button(footer, "关闭", close_popup, "plain", width=72).pack(side="right")
 
     def _import_models(self):
         path = filedialog.askdirectory(title="选择模型目录")
@@ -3779,10 +4370,36 @@ class GatewayApp(WindowBase):
         else:
             self.after(0, lambda: self._set_light("models", "offline", "缺失"))
         self.after(0, self._update_model_display)
+        if hasattr(self, "_dashboard_pages"):
+            self.after(0, lambda: self._dashboard_pages.refresh(self._last_health))
+
+    def _finish_runtime_recheck(self, result: dict):
+        if self._shutting_down:
+            return
+        self._environment_status = dict(result)
+        if result.get("ready"):
+            self._set_light("env", "online", "可用")
+            gpu_name = str(result.get("gpu_name") or "显卡环境正常")
+            self._footer_label.config(text=f"  运行环境检查通过：{gpu_name}")
+        elif result.get("package_ready"):
+            self._set_light("env", "offline", "需处理")
+            self._footer_label.config(text=f"  运行环境需要处理：{result.get('message') or '检查未通过'}")
+        else:
+            self._set_light("env", "offline", "未安装")
+            self._footer_label.config(text=f"  {result.get('message') or '运行环境尚未安装'}")
+        if hasattr(self, "_dashboard_pages"):
+            self._dashboard_pages.refresh(self._last_health)
 
     def _restart_backend(self):
         """重启所有后台服务"""
-        self._shutdown_backend()
+        if self._shutting_down or self._runtime_maintenance_active():
+            if not self._shutting_down:
+                self._footer_label.config(text="  正在维护运行环境，完成后会自动恢复后台服务")
+            return
+        errors = self._shutdown_backend()
+        if errors:
+            self._footer_label.config(text=f"  后台服务未能完全停止：{errors}")
+            return
         self.after(500, lambda: threading.Thread(target=self._startup_sequence, daemon=True).start())
         self._footer_label.config(text="  正在重启后台服务...")
 
@@ -3802,7 +4419,20 @@ class GatewayApp(WindowBase):
         return log_dir
 
     def _start_comfyui_service(self):
+        lock = self._runtime_maintenance_lock
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            if self._shutting_down or self._runtime_maintenance_in_progress:
+                return
+            return self._start_comfyui_service_unlocked()
+        finally:
+            lock.release()
+
+    def _start_comfyui_service_unlocked(self):
         """只启动或复检 ComfyUI，不重启 API/Tunnel。"""
+        if self._shutting_down:
+            return
         self._set_light("comfyui", "loading")
         self._comfy_starting_until = time.time() + 150
         python_exe, env = self._backend_env()
@@ -3813,10 +4443,12 @@ class GatewayApp(WindowBase):
 
         # ── ComfyUI 使用相对路径 output-directory ──
         # ComfyUI cwd = runtime/ComfyUI，相对路径 ../../outputs 指向根目录 outputs/
-        if _port_in_use(COMFY_PORT):
+        port_ready, port_error = self._process_supervisor.prepare_port(COMFY_PORT)
+        if not port_ready:
             self._comfy_proc = None
-            self._set_light("comfyui", "loading", "检测中")
-            print("[GUI] ComfyUI port already in use; reusing existing service.")
+            self._set_light("comfyui", "offline", "端口占用")
+            self._footer_label.config(text=f"  ComfyUI 无法启动：{port_error}")
+            print(f"[GUI] ComfyUI start blocked: {port_error}")
         else:
             comfy_log = open(str(log_dir / "comfyui.log"), "w")
             comfy_command = [
@@ -3827,35 +4459,61 @@ class GatewayApp(WindowBase):
                 "--output-directory", "../../outputs",
                 "--extra-model-paths-config", "extra_model_paths.yaml",
             ]
-            self._comfy_proc = subprocess.Popen(
-                comfy_command,
-                cwd=str(BASE_DIR / "runtime" / "ComfyUI"),
-                env=env,
-                stdout=comfy_log, stderr=comfy_log,
-            )
+            try:
+                self._comfy_proc = self._process_supervisor.launch(
+                    "comfyui",
+                    comfy_command,
+                    cwd=str(BASE_DIR / "runtime" / "ComfyUI"),
+                    env=env,
+                    stdout=comfy_log, stderr=comfy_log,
+                )
+            finally:
+                comfy_log.close()
             print("[GUI] ComfyUI starting (cwd=runtime/ComfyUI, output=../../outputs)...")
 
     def _start_api_service(self):
+        lock = self._runtime_maintenance_lock
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            if self._shutting_down or self._runtime_maintenance_in_progress:
+                return
+            return self._start_api_service_unlocked()
+        finally:
+            lock.release()
+
+    def _start_api_service_unlocked(self):
         """只启动 API 服务，不重启 ComfyUI。API 内部会自行启动/恢复 Tunnel。"""
+        if self._shutting_down:
+            return
         self._set_light("api", "loading")
         self._set_light("tunnel", "loading")
         python_exe, env = self._backend_env()
         log_dir = self._backend_log_dir()
-        if _port_in_use(API_PORT):
+        port_ready, port_error = self._process_supervisor.prepare_port(API_PORT)
+        if not port_ready:
             self._api_proc = None
-            self._set_light("api", "loading", "检测中")
-            print("[GUI] API port already in use; reusing existing service.")
+            self._set_light("api", "offline", "端口占用")
+            self._set_light("tunnel", "offline", "未启动")
+            self._footer_label.config(text=f"  API 无法启动：{port_error}")
+            print(f"[GUI] API start blocked: {port_error}")
             return
         api_log = open(str(log_dir / "api.log"), "w")
-        self._api_proc = subprocess.Popen(
-            [str(python_exe), str(BASE_DIR / "app" / "server.py")],
-            cwd=str(BASE_DIR), env=env,
-            stdout=api_log, stderr=api_log,
-        )
+        try:
+            self._api_proc = self._process_supervisor.launch(
+                "api",
+                [str(python_exe), str(BASE_DIR / "app" / "server.py")],
+                cwd=str(BASE_DIR), env=env,
+                stdout=api_log, stderr=api_log,
+            )
+        finally:
+            api_log.close()
         print("[GUI] API server starting...")
 
     def _start_backend(self):
         """启动 ComfyUI 引擎，然后启动 API 服务器"""
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
         self._set_light("comfyui", "loading")
         self._set_light("api", "loading")
         self._set_light("tunnel", "loading")
@@ -3915,12 +4573,16 @@ class GatewayApp(WindowBase):
             self._set_api_key(self._api_key)
 
         self._update_workflow_display(data)
+        if hasattr(self, "_dashboard_pages"):
+            self._dashboard_pages.refresh(data)
         self._refresh_saved_login_and_sync()
 
     def _on_health_update(self, data: dict):
         self._last_health = data
         self._update_status(data)
         self._update_workflow_display(data)
+        if hasattr(self, "_dashboard_pages"):
+            self._dashboard_pages.refresh(data)
 
         # 进度更新
         task = data.get("current_task")
@@ -3962,11 +4624,11 @@ class GatewayApp(WindowBase):
             if self._server_mode == "logged_in" and self._server_session_token and self._api_key:
                 threading.Thread(target=self._refresh_saved_login_and_sync, daemon=True).start()
 
-        parts = [f"本地: {API_BASE}"]
+        parts = ["公网连接已建立" if ts == "online" else "正在准备公网连接"]
         if ts == "unavailable":
             error = str(tunnel_data.get("error") or "").strip()
-            parts.append(f" | Tunnel: {error or '连接失败'}")
-        self._footer_label.config(text="  ".join(parts))
+            parts = [f"Tunnel：{error or '连接失败'}"]
+        self._footer_label.config(text="  " + "  ".join(parts))
 
     def _tunnel_error_label(self, error: str) -> str:
         text = str(error or "").strip()
@@ -4016,6 +4678,11 @@ class GatewayApp(WindowBase):
                 retry_btn.pack_forget()
 
     def _retry_component(self, key: str):
+        if self._shutting_down:
+            return
+        if self._runtime_maintenance_active() and key in {"env", "comfyui", "api", "tunnel"}:
+            self._footer_label.config(text="  正在维护运行环境，请稍候")
+            return
         if key == "models":
             threading.Thread(target=self._recheck_models, daemon=True).start()
             return
@@ -4041,27 +4708,77 @@ class GatewayApp(WindowBase):
         threading.Thread(target=self._startup_sequence, daemon=True).start()
 
     def _retry_env_check(self):
-        env = _check_runtime()
-        if env["installed"]:
-            self.after(0, lambda: self._set_light("env", "online", "已安装"))
-        else:
-            self.after(0, lambda: self._set_light("env", "offline", "未安装"))
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
+        missing = missing_runtime_paths(BASE_DIR)
+        result = {
+            "package_ready": not missing,
+            "ready": False,
+            "missing": missing,
+            "gpu_name": "",
+            "message": "",
+        }
+        if missing:
+            result["message"] = f"运行环境不完整，缺少 {len(missing)} 项"
+            if not self._shutting_down:
+                self.after(0, lambda data=result: self._finish_runtime_recheck(data))
+            return
+
+        system_info = _check_system_env(
+            lambda args, **kwargs: self._run_runtime_probe(
+                "environment-check", args, **kwargs
+            )
+        )
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
+        torch_info = _check_torch(
+            BASE_DIR / "runtime" / "python" / "python.exe",
+            lambda args, **kwargs: self._run_runtime_probe(
+                "torch-check", args, **kwargs
+            ),
+        )
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
+
+        result["gpu_name"] = str(torch_info.get("gpu_name") or system_info.get("gpu_name") or "")
+        result["ready"] = bool(system_info.get("success") and torch_info.get("success"))
+        if not result["ready"]:
+            result["message"] = str(
+                torch_info.get("error")
+                or system_info.get("error")
+                or "显卡或 PyTorch 检查未通过"
+            )
+        self.after(0, lambda data=result: self._finish_runtime_recheck(data))
 
     def _retry_comfyui_service(self):
+        if self._shutting_down:
+            return
         self.after(0, lambda: self._set_light("comfyui", "loading", "重试中"))
-        self._kill_proc(self._comfy_proc, "ComfyUI")
+        error = self._kill_proc(self._comfy_proc, "ComfyUI")
+        if error:
+            self.after(0, lambda e=error: self._set_light("comfyui", "offline", "关闭失败"))
+            self.after(0, lambda e=error: self._footer_label.config(text=f"  ComfyUI 无法重启：{e}"))
+            return
         self._comfy_proc = None
         self.after(0, self._start_comfyui_service)
         self.after(200, self._ensure_health_polling)
 
     def _retry_api_service(self):
+        if self._shutting_down:
+            return
         self.after(0, lambda: self._set_light("api", "loading", "重试中"))
-        self._kill_proc(self._api_proc, "API")
+        error = self._kill_proc(self._api_proc, "API")
+        if error:
+            self.after(0, lambda e=error: self._set_light("api", "offline", "关闭失败"))
+            self.after(0, lambda e=error: self._footer_label.config(text=f"  API 无法重启：{e}"))
+            return
         self._api_proc = None
         self.after(0, self._start_api_service)
         self.after(200, self._ensure_health_polling)
 
     def _retry_tunnel_service(self):
+        if self._shutting_down:
+            return
         self.after(0, lambda: self._set_light("tunnel", "loading", "重试中"))
         try:
             import urllib.request as ur
@@ -4104,7 +4821,11 @@ class GatewayApp(WindowBase):
 
         valid_ids = set()
         first_valid_id = ""
-        default_workflow_id = str(data.get("default_workflow_id") or "").strip() if isinstance(data, dict) else ""
+        default_workflow_id = (
+            str(data.get("default_workflow_id") or data.get("default_workflow") or "").strip()
+            if isinstance(data, dict)
+            else ""
+        )
         for workflow in workflows:
             if not isinstance(workflow, dict):
                 continue
@@ -4165,7 +4886,7 @@ class GatewayApp(WindowBase):
 
             menu = pystray.Menu(
                 pystray.MenuItem("显示窗口", self._restore_from_tray, default=True),
-                pystray.MenuItem("退出", self._on_close),
+                pystray.MenuItem("退出", lambda *_args: self.after(0, self._on_close)),
             )
             self._tray = pystray.Icon("ai_gateway", img, "灵镜造片厂", menu)
             self._tray.run()
@@ -4187,6 +4908,8 @@ class GatewayApp(WindowBase):
             self._tray = None
 
     def _on_minimize(self, event):
+        if self._shutting_down:
+            return
         if self.state() == "iconic":
             self.withdraw()
             if self._tray is None:
@@ -4214,27 +4937,9 @@ class GatewayApp(WindowBase):
     # 关闭确认 + 终止后台
     # ══════════════════════════════════════════════════════
     def _on_close(self):
-        """关闭窗口 → 弹窗确认 → 终止后台 → 验证端口 → 退出"""
+        """Close the window only after every client-owned service is stopped."""
         if self._shutting_down:
             return
-
-        self._anim_running = False
-
-        # 检查是否所有进程已退出
-        all_dead = True
-        for proc in [self._api_proc, self._comfy_proc]:
-            if proc and proc.poll() is None:
-                all_dead = False
-                break
-        if all_dead:
-            self._heartbeat_run = False
-            self._poll_run = False
-            if self._server_session_token:
-                threading.Thread(target=self._notify_server_offline, daemon=True).start()
-            self._do_destroy()
-            return
-
-        # ── 确认弹窗 ──
         confirmed = messagebox.askyesno(
             "确认退出",
             "确定要退出灵镜造片厂吗？\n\n"
@@ -4246,188 +4951,272 @@ class GatewayApp(WindowBase):
             parent=self,
         )
         if not confirmed:
-            self._anim_running = True
-            self._animate_loading()
             return
 
         self._shutting_down = True
+        self._anim_running = False
         self._heartbeat_run = False
         self._poll_run = False
         if self._server_session_token:
             threading.Thread(target=self._notify_server_offline, daemon=True).start()
 
-        # ── 关闭进度弹窗 ──
         popup = tk.Toplevel(self)
         popup.title("正在关闭")
-        popup.geometry("420x240")
         popup.configure(bg=C["surface"])
         popup.transient(self)
         popup.grab_set()
         popup.resizable(False, False)
-        self._center_popup(popup, 420, 240)
+        popup.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._center_popup(popup, 440, 315)
 
-        tk.Label(popup, text="正在关闭后台服务...", font=F["bold"],
-                 fg=C["text"], bg=C["surface"]).pack(pady=(24, 12))
+        title_label = tk.Label(
+            popup,
+            text="正在彻底关闭后台服务...",
+            font=F["bold"],
+            fg=C["text"],
+            bg=C["surface"],
+        )
+        title_label.pack(pady=(24, 12))
 
         list_frame = tk.Frame(popup, bg=C["surface"])
         list_frame.pack(fill="x", padx=30)
 
         items = {}
-        for name in ["ComfyUI", "API 服务", "Cloudflared"]:
+        for name in ["ComfyUI", "API 服务", "Tunnel", "后台操作"]:
             row = tk.Frame(list_frame, bg=C["surface"])
             row.pack(fill="x", pady=3)
-            status_lbl = tk.Label(row, text="等待...", font=F["small"],
-                                  fg=C["warn"], bg=C["surface"], width=12, anchor="w")
+            status_lbl = tk.Label(
+                row,
+                text="等待...",
+                font=F["small"],
+                fg=C["warn"],
+                bg=C["surface"],
+                width=13,
+                anchor="w",
+            )
             status_lbl.pack(side="left")
-            name_lbl = tk.Label(row, text=name, font=F["small"],
-                                fg=C["text2"], bg=C["surface"], anchor="w")
+            name_lbl = tk.Label(
+                row,
+                text=name,
+                font=F["small"],
+                fg=C["text2"],
+                bg=C["surface"],
+                anchor="w",
+            )
             name_lbl.pack(side="left", padx=(8, 0))
             items[name] = status_lbl
 
         close_btn = tk.Button(
-            popup, text="强制退出", font=F["small"], bg=C["error"], fg="#fff",
-            activebackground="#c0392b", relief="flat", bd=0, cursor="hand2",
-            command=lambda: self._force_destroy(popup), state="disabled")
-        close_btn.pack(pady=(15, 0))
+            popup,
+            text="再次强制清理并退出",
+            font=F["small"],
+            bg=C["error"],
+            fg="#fff",
+            activebackground="#c0392b",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=lambda: self._force_destroy(popup),
+            state="disabled",
+        )
+        close_btn.pack(pady=(14, 0), ipadx=10, ipady=4)
+        error_label = tk.Label(
+            popup,
+            text="",
+            font=F["tiny"],
+            fg=C["error"],
+            bg=C["surface"],
+            wraplength=380,
+            justify="left",
+        )
+        error_label.pack(fill="x", padx=30, pady=(8, 0))
+        popup._shutdown_title = title_label
+        popup._shutdown_error = error_label
+        popup._shutdown_button = close_btn
 
-        error_frame = tk.Frame(popup, bg=C["surface"])
+        def update_item(name: str, text: str, color: str):
+            label = items.get(name)
+            if label is not None:
+                label.config(text=text, fg=color)
+
+        def finish_success():
+            title_label.config(text="后台服务已全部停止", fg=C["success"])
+            self.after(250, lambda: self._finish_shutdown(popup))
 
         def _do_shutdown():
-            errors = []
+            self.after(0, lambda: update_item("ComfyUI", "关闭中...", C["warn"]))
+            err = self._process_supervisor.terminate("comfyui", timeout=8)
+            self.after(0, lambda e=err: update_item("ComfyUI", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
+            if not self._process_supervisor.is_running("comfyui"):
+                self._comfy_proc = None
 
-            # 1) ComfyUI
-            items["ComfyUI"].config(text="关闭中...", fg=C["warn"])
-            err = self._kill_proc(self._comfy_proc, "ComfyUI")
-            items["ComfyUI"].config(
-                text="已停止 ✓" if not err else f"失败: {err}",
-                fg=C["success"] if not err else C["error"])
-            if err:
-                errors.append(f"ComfyUI: {err}")
+            self.after(0, lambda: update_item("API 服务", "关闭中...", C["warn"]))
+            self.after(0, lambda: update_item("Tunnel", "关闭中...", C["warn"]))
+            api_error = self._process_supervisor.terminate("api", timeout=8)
+            self.after(0, lambda e=api_error: update_item("API 服务", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
+            self.after(0, lambda e=api_error: update_item("Tunnel", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
+            if not self._process_supervisor.is_running("api"):
+                self._api_proc = None
 
-            # 2) API
-            items["API 服务"].config(text="关闭中...", fg=C["warn"])
-            err = self._kill_proc(self._api_proc, "API")
-            items["API 服务"].config(
-                text="已停止 ✓" if not err else f"失败: {err}",
-                fg=C["success"] if not err else C["error"])
-            if err:
-                errors.append(f"API: {err}")
+            self.after(0, lambda: update_item("后台操作", "关闭中...", C["warn"]))
+            retry_results = self._process_supervisor.shutdown_all(timeout=8)
+            remaining = self._process_supervisor.remaining()
+            comfy_left = bool(remaining.get("comfyui"))
+            api_left = bool(remaining.get("api"))
+            self.after(0, lambda left=comfy_left: update_item("ComfyUI", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
+            self.after(0, lambda left=api_left: update_item("API 服务", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
+            self.after(0, lambda left=api_left: update_item("Tunnel", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
+            self.after(
+                0,
+                lambda left=remaining: update_item(
+                    "后台操作",
+                    "已停止 ✓" if not left else "需要清理",
+                    C["success"] if not left else C["error"],
+                ),
+            )
 
-            # 3) Cloudflared
-            items["Cloudflared"].config(text="关闭中...", fg=C["warn"])
-            err = self._kill_cloudflared()
-            items["Cloudflared"].config(
-                text="已停止 ✓" if not err else f"失败: {err}",
-                fg=C["success"] if not err else C["error"])
-            if err:
-                errors.append(f"Cloudflared: {err}")
-
-            # 4) 验证端口释放
-            time.sleep(1)
-            port_errors = []
-            if _port_in_use(COMFY_PORT):
-                port_errors.append(f"ComfyUI 端口仍被占用：{COMFY_PORT}")
-            if _port_in_use(API_PORT):
-                port_errors.append(f"API 端口仍被占用：{API_PORT}")
-
-            if port_errors:
-                errors.extend(port_errors)
-
-            if errors:
-                error_frame.pack(fill="x", padx=30, pady=(10, 0))
-                tk.Label(error_frame, text="关闭失败：", font=F["bold"],
-                         fg=C["error"], bg=C["surface"]).pack(anchor="w")
-                for e in errors:
-                    tk.Label(error_frame, text=f"  - {e}", font=F["small"],
-                             fg=C["error"], bg=C["surface"]).pack(anchor="w")
-                tk.Label(error_frame, text="请重试或手动结束进程", font=F["small"],
-                         fg=C["text2"], bg=C["surface"]).pack(anchor="w", pady=(4, 0))
-                close_btn.config(state="normal")
+            if remaining:
+                details = [error for error in retry_results.values() if error]
+                if not details:
+                    details = [
+                        f"{role}: PID {', '.join(map(str, pids))}"
+                        for role, pids in remaining.items()
+                    ]
+                message = "；".join(details)
+                self.after(0, lambda m=message: title_label.config(text="仍有服务需要强制清理", fg=C["error"]))
+                self.after(0, lambda m=message: error_label.config(text=m))
+                self.after(0, lambda: close_btn.config(state="normal"))
             else:
-                # 停止托盘
-                try:
-                    if self._tray:
-                        self._tray.stop()
-                except Exception:
-                    pass
-                popup.destroy()
-                self._do_destroy()
+                self.after(0, finish_success)
 
-        self.after(200, _do_shutdown)
+        threading.Thread(target=_do_shutdown, daemon=True).start()
 
     def _kill_proc(self, proc, name: str) -> str:
-        """终止进程，返回错误信息或空字符串"""
-        if not proc or proc.poll() is not None:
-            return ""
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-            return ""
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-                proc.wait(timeout=3)
-                return ""
-            except Exception as e:
-                return str(e)
-        except Exception as e:
-            try:
-                proc.kill()
-                return ""
-            except Exception:
-                return str(e)
-
-    def _is_process_not_found_message(self, text: str) -> bool:
-        text = str(text or "").lower()
-        return any(token in text for token in ("没有找到", "找不到", "not found", "not be found"))
-
-    def _kill_cloudflared(self) -> str:
-        try:
-            r = subprocess.run(
-                ["taskkill", "/f", "/im", "cloudflared.exe"],
-                capture_output=True, text=True, timeout=5)
-            output = "\n".join(part for part in (r.stdout, r.stderr) if part).strip()
-            if r.returncode != 0 and not self._is_process_not_found_message(output):
-                return output or f"taskkill exit {r.returncode}"
-            return ""
-        except Exception as ex:
-            message = str(ex)
-            return "" if self._is_process_not_found_message(message) else message
+        """Stop a registered service tree (used by component retries)."""
+        role = "comfyui" if "comfy" in str(name).lower() else "api"
+        error = self._process_supervisor.terminate(role, timeout=8)
+        if role == "comfyui":
+            self._comfy_proc = None
+        else:
+            self._api_proc = None
+        return error
 
     def _shutdown_backend(self):
         """关闭所有后台进程（用于重启）"""
         self._poll_run = False
-        for proc, name in [(self._comfy_proc, "ComfyUI"), (self._api_proc, "API")]:
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        self._kill_cloudflared()
-        # 等待端口释放
-        for _ in range(10):
-            if not _port_in_use(API_PORT) and not _port_in_use(COMFY_PORT):
-                break
-            time.sleep(0.5)
+        errors = []
+        for role in ("comfyui", "api"):
+            error = self._process_supervisor.terminate(role, timeout=8)
+            if error:
+                errors.append(f"{role}: {error}")
+        if not self._process_supervisor.is_running("comfyui"):
+            self._comfy_proc = None
+        if not self._process_supervisor.is_running("api"):
+            self._api_proc = None
+        return "；".join(errors)
 
-    def _do_destroy(self):
+    def _final_process_cleanup(self, timeout=4):
+        """Non-UI, idempotent cleanup used by every final exit path."""
+        self._heartbeat_run = False
+        self._poll_run = False
+        self._shutting_down = True
+        results = {}
+        try:
+            results = self._process_supervisor.shutdown_all(timeout=timeout)
+        except Exception as exc:
+            print(f"[Shutdown] final cleanup failed: {exc}")
+            results = {"supervisor": str(exc)}
+        remaining = self._process_supervisor.remaining()
+        for role, pids in remaining.items():
+            results[role] = results.get(role) or f"PID {', '.join(map(str, pids))} 仍在运行"
+        try:
+            RuntimeState(BASE_DIR / "runtime").set_offline()
+        except Exception as exc:
+            # Runtime state does not own a process; report it without claiming
+            # that background cleanup failed.
+            print(f"[Shutdown] failed to persist offline state: {exc}")
+        return {role: error for role, error in results.items() if error}
+
+    @staticmethod
+    def _cleanup_error_text(errors):
+        return "；".join(f"{role}: {error}" for role, error in errors.items())
+
+    def _show_shutdown_failure(self, popup, errors):
+        message = self._cleanup_error_text(errors)
+        print(f"[Shutdown] owned processes remain: {message}")
+        try:
+            if popup is not None and popup.winfo_exists():
+                popup._shutdown_title.config(text="仍有后台程序未关闭", fg=C["error"])
+                popup._shutdown_error.config(text=message)
+                popup._shutdown_button.config(text="再次强制清理并退出", state="normal")
+                return
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("暂时无法退出", f"后台程序尚未完全停止：\n{message}", parent=self)
+        except Exception:
+            pass
+
+    def _finish_shutdown(self, popup=None):
+        errors = self._final_process_cleanup(timeout=2)
+        if errors:
+            self._show_shutdown_failure(popup, errors)
+            return
+        self._complete_destroy(popup)
+
+    def _complete_destroy(self, popup=None):
+        try:
+            if hasattr(self, "_dashboard_pages"):
+                self._dashboard_pages.cancel_pending()
+        except Exception:
+            pass
+        try:
+            if self._tray:
+                self._tray.stop()
+        except Exception:
+            pass
+        self._tray = None
+        try:
+            if popup is not None and popup.winfo_exists():
+                popup.grab_release()
+                popup.destroy()
+        except Exception:
+            pass
         try:
             self.destroy()
         except Exception:
             pass
-        sys.exit(0)
+
+    def _do_destroy(self):
+        errors = self._final_process_cleanup(timeout=4)
+        if errors:
+            self._show_shutdown_failure(None, errors)
+            return False
+        self._complete_destroy()
+        return True
 
     def _force_destroy(self, popup):
+        """Force means close owned Jobs now; it never bypasses cleanup."""
         self._poll_run = False
+        self._heartbeat_run = False
+
+        def cleanup_and_finish():
+            errors = self._final_process_cleanup(timeout=6)
+            if errors:
+                self.after(0, lambda e=errors: self._show_shutdown_failure(popup, e))
+                return
+            self._comfy_proc = None
+            self._api_proc = None
+            self.after(0, lambda: self._complete_destroy(popup))
+
         try:
-            popup.destroy()
+            popup._shutdown_title.config(text="正在再次清理...", fg=C["warn"])
+            popup._shutdown_error.config(text="")
+            popup._shutdown_button.config(state="disabled")
         except Exception:
             pass
-        self._do_destroy()
+
+        threading.Thread(target=cleanup_and_finish, daemon=True).start()
 
 
 def main():
@@ -4441,9 +5230,13 @@ def main():
         )
         root.destroy()
         return
+    app = None
     try:
-        GatewayApp().mainloop()
+        app = GatewayApp()
+        app.mainloop()
     finally:
+        if app is not None:
+            app._final_process_cleanup()
         _release_instance_lock()
 
 

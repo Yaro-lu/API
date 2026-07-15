@@ -1,34 +1,93 @@
-"""Static product pages for the desktop gateway shell.
+"""Product pages around the existing desktop gateway console.
 
-The first interface pass intentionally keeps these pages presentation-only.
-Business actions remain in ``main_gateway.py`` until their contracts are fixed.
+The console itself remains in ``main_gateway.py``.  These pages deliberately
+reuse the same visual tokens while presenting only actions that already exist
+in the client.
 """
 
 from __future__ import annotations
 
+import json
 import tkinter as tk
+from pathlib import Path
+
+from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths
+
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+
+def runtime_package_status(base_dir: Path) -> tuple[str, list[str]]:
+    """Return ``ready``, ``repair`` or ``missing`` for the portable runtime."""
+    base_dir = Path(base_dir)
+    missing = missing_runtime_paths(base_dir)
+    if not missing:
+        return "ready", []
+    present_count = sum(1 for path in REQUIRED_RUNTIME_PATHS if (base_dir / path).is_file())
+    return ("repair" if present_count else "missing"), missing
 
 
 class StaticDashboardPages:
-    """Build the non-overview pages while sharing the gateway's visual tokens."""
+    """Build and refresh the three secondary product pages."""
+
+    PAGE_BUILDERS = {
+        "workflows": "_build_workflows",
+        "resources": "_build_resources",
+        "settings": "_build_settings",
+    }
 
     def __init__(self, app, colors: dict, fonts: dict):
         self.app = app
         self.c = colors
         self.f = fonts
+        self._pages: dict[str, tk.Frame] = {}
+        self._last_snapshot = ""
+        self._resource_targets: dict[str, tk.Widget] = {}
+        self._runtime_focus_job = None
 
     def build(self, parent, page_id: str) -> tk.Frame:
+        if page_id not in self.PAGE_BUILDERS:
+            raise KeyError(f"Unknown dashboard page: {page_id}")
         page = tk.Frame(parent, bg=self.c["bg"])
-        builders = {
-            "services": self._build_services,
-            "workflows": self._build_workflows,
-            "tasks": self._build_tasks,
-            "network": self._build_network,
-            "resources": self._build_resources,
-            "settings": self._build_settings,
-        }
-        builders[page_id](page)
+        self._pages[page_id] = page
+        getattr(self, self.PAGE_BUILDERS[page_id])(page)
         return page
+
+    def refresh(self, data: dict | None = None):
+        """Refresh model/workflow cards only when their source state changes."""
+        data = data if isinstance(data, dict) else {}
+        workflows = data.get("workflows") if isinstance(data.get("workflows"), list) else []
+        snapshot = json.dumps(
+            {
+                "workflows": [
+                    {
+                        "id": item.get("id"),
+                        "enabled": item.get("enabled", True),
+                        "available": item.get("available"),
+                        "missing": item.get("missing_models") or item.get("missingModels") or item.get("missing"),
+                    }
+                    for item in workflows
+                    if isinstance(item, dict)
+                ],
+                "models": getattr(self.app, "_model_status", {}),
+                "runtime": self._runtime_status(),
+                "environment_check": getattr(self.app, "_environment_status", {}),
+                "api_key": bool(getattr(self.app, "_api_key", "")),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if snapshot == self._last_snapshot:
+            return
+        self._last_snapshot = snapshot
+        for page_id in ("workflows", "resources", "settings"):
+            page = self._pages.get(page_id)
+            if page is None:
+                continue
+            for child in page.winfo_children():
+                child.destroy()
+            getattr(self, self.PAGE_BUILDERS[page_id])(page)
 
     # ── shared pieces ──────────────────────────────────────
     def _body(self, page) -> tk.Frame:
@@ -44,11 +103,13 @@ class StaticDashboardPages:
             card.grid_propagate(False)
         return card
 
-    def _section_heading(self, parent, title: str, subtitle: str = ""):
+    def _section_heading(self, parent, title: str, subtitle: str = "", actions=None):
         row = tk.Frame(parent, bg=self.c["bg"])
         row.pack(fill="x", pady=(0, 8))
+        title_box = tk.Frame(row, bg=self.c["bg"])
+        title_box.pack(side="left", fill="x", expand=True)
         tk.Label(
-            row,
+            title_box,
             text=title,
             font=self.f["title"],
             fg=self.c["text"],
@@ -56,12 +117,20 @@ class StaticDashboardPages:
         ).pack(side="left")
         if subtitle:
             tk.Label(
-                row,
+                title_box,
                 text=subtitle,
                 font=self.f["small"],
                 fg=self.c["muted"],
                 bg=self.c["bg"],
-            ).pack(side="right", pady=(3, 0))
+            ).pack(side="left", padx=(12, 0), pady=(4, 0))
+        if actions:
+            action_box = tk.Frame(row, bg=self.c["bg"])
+            action_box.pack(side="right")
+            for index, (text, command, variant) in enumerate(actions):
+                self.app._button(action_box, text, command, variant, width=112).pack(
+                    side="left", padx=(0 if index == 0 else 8, 0)
+                )
+        return row
 
     def _badge(self, parent, text: str, tone: str = "neutral"):
         palette = {
@@ -72,7 +141,7 @@ class StaticDashboardPages:
             "neutral": (self.c["hover"], self.c["text2"]),
         }
         bg, fg = palette.get(tone, palette["neutral"])
-        label = tk.Label(
+        return tk.Label(
             parent,
             text=f"  {text}  ",
             font=self.f["small"],
@@ -81,356 +150,481 @@ class StaticDashboardPages:
             padx=4,
             pady=3,
         )
-        return label
 
-    def _metric(self, parent, column: int, label: str, value: str, note: str, tone: str = "primary"):
-        card = self._card(parent, 92)
-        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
+    def _metric(
+        self,
+        parent,
+        column: int,
+        label: str,
+        value: str,
+        note: str,
+        tone: str = "primary",
+        height: int = 86,
+    ):
+        card = self._card(parent, height)
+        card.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=(0 if column == 0 else 5, 0 if column == 2 else 5),
+        )
         accent = {
             "primary": self.c["primary"],
             "success": self.c["success"],
             "warn": self.c["warn"],
         }.get(tone, self.c["primary"])
-        strip = tk.Frame(card, bg=accent, width=4)
-        strip.pack(side="left", fill="y")
+        tk.Frame(card, bg=accent, width=4).pack(side="left", fill="y")
         content = tk.Frame(card, bg=self.c["card"])
         content.pack(side="left", fill="both", expand=True, padx=13, pady=7)
         tk.Label(content, text=label, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
-        tk.Label(content, text=value, font=("Microsoft YaHei UI", 17, "bold"), fg=self.c["text"], bg=self.c["card"]).pack(anchor="w", pady=(1, 0))
+        tk.Label(content, text=value, font=("Microsoft YaHei UI", 17, "bold"), fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
         tk.Label(content, text=note, font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w")
-
-    def _disabled_action(self, parent, text: str, width: int = 12):
-        return tk.Label(
-            parent,
-            text=text,
-            font=self.f["small"],
-            fg=self.c["muted"],
-            bg=self.c["hover"],
-            width=width,
-            padx=7,
-            pady=5,
-        )
 
     def _divider(self, parent, pady=(8, 8)):
         tk.Frame(parent, bg=self.c["border2"], height=1).pack(fill="x", pady=pady)
 
-    def _key_value(self, parent, label: str, value: str, mono: bool = False, value_color: str | None = None):
-        row = tk.Frame(parent, bg=self.c["card"])
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
-        tk.Label(
-            row,
-            text=value,
-            font=self.f["mono"] if mono else self.f["small"],
-            fg=value_color or self.c["text"],
-            bg=self.c["card"],
-        ).pack(side="right")
+    def _action(self, parent, text: str, command, variant: str = "plain", width: int = 88):
+        return self.app._button(parent, text, command, variant, width=width)
 
-    # ── interface services ─────────────────────────────────
-    def _build_services(self, page):
-        body = self._body(page)
+    def _short_path(self, path: Path, limit: int = 46) -> str:
+        text = str(path)
+        if len(text) <= limit:
+            return text
+        return f"{text[:18]}...{text[-(limit - 21):]}"
 
-        metrics = tk.Frame(body, bg=self.c["bg"])
-        metrics.pack(fill="x", pady=(0, 14))
-        for col in range(3):
-            metrics.columnconfigure(col, weight=1, uniform="service_metrics")
-        self._metric(metrics, 0, "兼容协议", "3 类", "文字 · 图片 · 视频")
-        self._metric(metrics, 1, "调用方式", "异步", "统一返回 task_id", "success")
-        self._metric(metrics, 2, "访问鉴权", "URL + Key", "调用方无需安装组件", "warn")
+    # ── data helpers ───────────────────────────────────────
+    def _runtime_ready(self) -> bool:
+        return self._runtime_status()[0] == "ready"
 
-        self._section_heading(body, "对外兼容服务", "本阶段仅展示接口结构，尚未接入配置动作")
-        services = tk.Frame(body, bg=self.c["bg"])
-        services.pack(fill="x", pady=(0, 14))
-        for col in range(3):
-            services.columnconfigure(col, weight=1, uniform="service_cards")
+    def _runtime_status(self) -> tuple[str, list[str]]:
+        return runtime_package_status(BASE_DIR)
 
-        cards = [
-            ("文", "文字生成", "DeepSeek / OpenAI", "POST  /v1/chat/completions", "local-text-default", "primary"),
-            ("图", "图片生成", "即梦 / 火山兼容", "POST  /v1/images/generations", "local-image-default", "success"),
-            ("影", "视频生成", "Seedance 2.0 兼容", "POST  /v1/videos/generations", "local-video-default", "warn"),
-        ]
-        for col, (glyph, title, protocol, path, model, tone) in enumerate(cards):
-            card = self._card(services, 172)
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 2 else 5))
-            top = tk.Frame(card, bg=self.c["card"])
-            top.pack(fill="x", padx=14, pady=(13, 7))
-            icon_bg = {"primary": self.c["soft_primary"], "success": self.c["soft_success"], "warn": self.c["soft_warn"]}[tone]
-            icon_fg = {"primary": self.c["primary"], "success": self.c["success"], "warn": self.c["warn"]}[tone]
-            tk.Label(top, text=glyph, font=self.f["bold"], fg=icon_fg, bg=icon_bg, width=3, height=1, pady=6).pack(side="left")
-            title_box = tk.Frame(top, bg=self.c["card"])
-            title_box.pack(side="left", padx=(10, 0))
-            tk.Label(title_box, text=title, font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-            tk.Label(title_box, text=protocol, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
-            self._badge(top, "待接入", "neutral").pack(side="right")
-            self._divider(card, (2, 7))
-            tk.Label(card, text=path, font=self.f["mono"], fg=self.c["primary"], bg=self.c["card"]).pack(anchor="w", padx=14)
-            tk.Label(card, text=f"默认模型  {model}", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", padx=14, pady=(7, 0))
+    def _set_card_outline(self, card, color: str):
+        """Set a card outline without changing its size in CTk or fallback mode."""
+        if hasattr(card, "_outline") and hasattr(card, "_draw_bg"):
+            card._outline = color
+            card._draw_bg()
+            return
+        card.configure(border_color=color)
 
-        self._section_heading(body, "模型路由", "URL 或请求体指定英文模型名；未指定时使用单一默认模型")
-        route = self._card(body, 128)
-        route.pack(fill="x")
-        header = tk.Frame(route, bg=self.c["hover"])
-        header.pack(fill="x", padx=1, pady=(1, 0))
-        for text, width, anchor in (("类型", 10, "w"), ("公开模型标识", 28, "w"), ("执行目标", 22, "w"), ("状态", 12, "e")):
-            tk.Label(header, text=text, width=width, anchor=anchor, font=self.f["small"], fg=self.c["text2"], bg=self.c["hover"], padx=10, pady=6).pack(side="left", fill="x", expand=anchor == "w")
-        rows = [
-            ("文字", "local-text-default", "文字工作流 / 第三方适配器"),
-            ("图片", "local-image-default", "图片工作流 / 第三方适配器"),
-            ("视频", "local-video-default", "视频工作流 / 第三方适配器"),
-        ]
-        for kind, model, target in rows:
-            row = tk.Frame(route, bg=self.c["card"])
-            row.pack(fill="x", padx=10, pady=4)
-            tk.Label(row, text=kind, width=9, anchor="w", font=self.f["small"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=model, width=27, anchor="w", font=self.f["mono"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=target, anchor="w", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left", fill="x", expand=True)
-            self._badge(row, "规划中").pack(side="right")
+    def focus_runtime_maintenance(self):
+        """Briefly highlight the current runtime card after a console deep link."""
+        card = self._resource_targets.get("runtime")
+        try:
+            if card is None or not card.winfo_exists():
+                return
+            if self._runtime_focus_job is not None:
+                self.app.after_cancel(self._runtime_focus_job)
+        except Exception:
+            self._runtime_focus_job = None
+            return
 
-    # ── workflows ─────────────────────────────────────────
+        self._set_card_outline(card, self.c["primary"])
+
+        def restore(target=card):
+            self._runtime_focus_job = None
+            try:
+                if target.winfo_exists() and self._resource_targets.get("runtime") is target:
+                    self._set_card_outline(target, self.c["border2"])
+            except Exception:
+                pass
+
+        self._runtime_focus_job = self.app.after(1600, restore)
+
+    def cancel_pending(self):
+        """Cancel page-owned timers before the root window is destroyed."""
+        job, self._runtime_focus_job = self._runtime_focus_job, None
+        if job is None:
+            return
+        try:
+            self.app.after_cancel(job)
+        except Exception:
+            pass
+
+    def _workflow_records(self) -> list[dict]:
+        health = getattr(self.app, "_last_health", {})
+        workflows = health.get("workflows") if isinstance(health, dict) else None
+        if isinstance(workflows, list) and workflows:
+            return [dict(item) for item in workflows if isinstance(item, dict)]
+
+        records = []
+        workflows_dir = BASE_DIR / "workflows"
+        if not workflows_dir.exists():
+            return records
+        for folder in sorted(workflows_dir.iterdir()):
+            manifest_path = folder / "manifest.json"
+            if not folder.is_dir() or not manifest_path.exists():
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                records.append(
+                    {
+                        "id": folder.name,
+                        "name": folder.name,
+                        "enabled": False,
+                        "output_type": "",
+                        "manifest_error": True,
+                    }
+                )
+                continue
+            workflow_type = str(manifest.get("type") or "").lower()
+            if workflow_type.startswith("text"):
+                output_type = "text"
+            elif workflow_type.startswith("video"):
+                output_type = "video"
+            elif workflow_type.startswith("image"):
+                output_type = "image"
+            else:
+                output_type = str(manifest.get("output_type") or "")
+            records.append(
+                {
+                    **manifest,
+                    "id": str(manifest.get("id") or folder.name),
+                    "name": str(manifest.get("name") or folder.name),
+                    "enabled": manifest.get("enabled", True),
+                    "output_type": output_type,
+                    "workflow_json": f"{folder.name}/workflow.json" if (folder / "workflow.json").exists() else "",
+                }
+            )
+        return records
+
+    def _workflow_type_label(self, workflow: dict) -> tuple[str, str, str]:
+        text = str(workflow.get("output_type") or workflow.get("type") or "").lower()
+        if "video" in text:
+            return "影", "视频", "warn"
+        if "text" in text or "chat" in text:
+            return "文", "文字", "primary"
+        return "图", "图片", "success"
+
+    def _workflow_state(self, workflow: dict) -> tuple[str, str, str, str]:
+        if workflow.get("manifest_error") or not workflow.get("workflow_json", True):
+            return "文件异常", "danger", "工作流文件不完整", ""
+        if not workflow.get("enabled", True):
+            return "已停用", "neutral", "需要启用后才能调用", ""
+
+        model_key = ""
+        try:
+            model_key = str(self.app._workflow_model_key(workflow) or "")
+        except Exception:
+            pass
+        missing = []
+        model_status = getattr(self.app, "_model_status", {})
+        if model_key:
+            missing = list((model_status.get("missing") or {}).get(model_key) or [])
+        for key in ("missing_models", "missingModels", "missing"):
+            value = workflow.get(key)
+            if isinstance(value, (list, tuple)):
+                missing.extend(str(item) for item in value if item)
+        missing = list(dict.fromkeys(missing))
+        if missing:
+            detail = "、".join(missing[:2])
+            if len(missing) > 2:
+                detail += f" 等 {len(missing)} 个文件"
+            return f"缺少 {len(missing)} 个模型", "warn", detail, model_key
+
+        dependency_status = str(workflow.get("dependency_status") or "").lower()
+        if not model_key or dependency_status in {"unknown", "unchecked"}:
+            return "依赖未声明", "warn", "可尝试运行，建议补充模型与节点清单", ""
+
+        try:
+            available = bool(self.app._workflow_model_available(workflow))
+        except Exception:
+            available = True
+        if not available:
+            return "需要检查", "warn", "模型或依赖尚未准备完成", model_key
+        return "可以使用", "success", "输入和输出已经配置完成", model_key
+
+    # ── workflows ──────────────────────────────────────────
     def _build_workflows(self, page):
         body = self._body(page)
+        workflows = self._workflow_records()
+        states = [self._workflow_state(item) for item in workflows]
+        ready_count = sum(1 for state, *_ in states if state == "可以使用")
+        issue_count = max(0, len(workflows) - ready_count)
+
         metrics = tk.Frame(body, bg=self.c["bg"])
         metrics.pack(fill="x", pady=(0, 14))
         for col in range(3):
             metrics.columnconfigure(col, weight=1, uniform="workflow_metrics")
-        self._metric(metrics, 0, "工作流包", "3 个", "当前项目已发现", "primary")
-        self._metric(metrics, 1, "输出类型", "3 类", "文字 · 图片 · 视频", "success")
-        self._metric(metrics, 2, "安装方式", "独立包", "与环境和模型分离", "warn")
+        self._metric(metrics, 0, "工作流", f"{len(workflows)} 个", "文字、图片与视频能力")
+        self._metric(metrics, 1, "可以使用", f"{ready_count} 个", "可直接通过 URL + Key 调用", "success")
+        self._metric(metrics, 2, "需要处理", f"{issue_count} 个", "缺少模型、节点或配置", "warn")
 
-        self._section_heading(body, "已发现的工作流", "英文标识将用于接口模型路由")
-        listing = self._card(body, 224)
+        self._section_heading(
+            body,
+            "我的工作流",
+            "已识别的模型状态会自动更新",
+            actions=[
+                ("添加教程", self.app._show_workflow_tutorial, "plain"),
+                ("＋ 添加工作流", self.app._show_workflow_upload_dialog, "primary"),
+            ],
+        )
+        listing_height = max(132, min(244, 24 + len(workflows) * 66))
+        listing = self._card(body, listing_height)
         listing.pack(fill="x", pady=(0, 14))
-        workflows = [
-            ("文", "Qwen3 文字生成", "llm_qwen3_text_gen", "文字", "本地 LLM", "已发现", "primary"),
-            ("图", "Flux 2 文生图", "flux_t2i_v1", "图片", "Flux2 模型组", "已发现", "success"),
-            ("影", "Wan 2.1 首尾帧视频", "wan_flf2v_v1", "视频", "Wan2.1 模型组", "已发现", "warn"),
-        ]
-        for index, (glyph, title, wf_id, output, dependency, status, tone) in enumerate(workflows):
-            row = tk.Frame(listing, bg=self.c["card"])
-            row.pack(fill="x", padx=14, pady=(11 if index == 0 else 7, 7))
-            tone_fg = {"primary": self.c["primary"], "success": self.c["success"], "warn": self.c["warn"]}[tone]
-            tone_bg = {"primary": self.c["soft_primary"], "success": self.c["soft_success"], "warn": self.c["soft_warn"]}[tone]
-            tk.Label(row, text=glyph, font=self.f["bold"], fg=tone_fg, bg=tone_bg, width=3, pady=6).pack(side="left")
-            name_box = tk.Frame(row, bg=self.c["card"])
-            name_box.pack(side="left", padx=(11, 0), fill="x", expand=True)
-            tk.Label(name_box, text=title, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-            tk.Label(name_box, text=wf_id, font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
-            tk.Label(row, text=output, width=8, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=dependency, width=18, anchor="w", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
-            self._badge(row, status, "success").pack(side="left", padx=(4, 8))
-            self._disabled_action(row, "查看参数").pack(side="right")
-            if index < len(workflows) - 1:
-                tk.Frame(listing, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
 
-        self._section_heading(body, "导入新工作流", "后续支持 ComfyUI API JSON、工作流目录和带 manifest 的工作流包")
-        import_card = self._card(body, 112)
-        import_card.pack(fill="x")
-        left = tk.Frame(import_card, bg=self.c["card"])
-        left.pack(side="left", fill="both", expand=True, padx=16, pady=15)
-        tk.Label(left, text="＋  添加任意工作流", font=self.f["h2"], fg=self.c["primary"], bg=self.c["card"]).pack(anchor="w")
-        tk.Label(left, text="导入后声明输入结构、输出类型、模型依赖、自定义节点和版本。", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", pady=(5, 0))
-        self._disabled_action(import_card, "功能接入后可用", 18).pack(side="right", padx=16)
+        if not workflows:
+            tk.Label(listing, text="还没有工作流", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(pady=(28, 4))
+            tk.Label(listing, text="点击右上角“添加工作流”即可开始。", font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack()
+        else:
+            for index, workflow in enumerate(workflows):
+                glyph, kind, type_tone = self._workflow_type_label(workflow)
+                state, state_tone, detail, model_key = self._workflow_state(workflow)
+                tone_fg = {
+                    "primary": self.c["primary"],
+                    "success": self.c["success"],
+                    "warn": self.c["warn"],
+                }[type_tone]
+                tone_bg = {
+                    "primary": self.c["soft_primary"],
+                    "success": self.c["soft_success"],
+                    "warn": self.c["soft_warn"],
+                }[type_tone]
+                row = tk.Frame(listing, bg=self.c["card"])
+                row.pack(fill="x", padx=14, pady=(9 if index == 0 else 6, 6))
+                tk.Label(row, text=glyph, font=self.f["bold"], fg=tone_fg, bg=tone_bg, width=3, pady=6).pack(side="left")
+                name_box = tk.Frame(row, bg=self.c["card"])
+                name_box.pack(side="left", padx=(11, 0), fill="x", expand=True)
+                tk.Label(name_box, text=str(workflow.get("name") or workflow.get("id") or "未命名工作流"), font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
+                tk.Label(name_box, text=str(workflow.get("id") or ""), font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
+                tk.Label(row, text=kind, width=7, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
+                detail_box = tk.Frame(row, bg=self.c["card"], width=210, height=44)
+                detail_box.pack(side="left", padx=(4, 8))
+                detail_box.pack_propagate(False)
+                self._badge(detail_box, state, state_tone).pack(anchor="w")
+                tk.Label(detail_box, text=detail, font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"], anchor="w").pack(anchor="w", pady=(2, 0))
 
-    # ── tasks ─────────────────────────────────────────────
-    def _build_tasks(self, page):
+                if state_tone == "warn" and model_key:
+                    self._action(
+                        row,
+                        "修复",
+                        lambda key=model_key: self.app._show_model_install_help(key),
+                        "primary",
+                        72,
+                    ).pack(side="right", padx=(6, 0))
+                self._action(
+                    row,
+                    "查看参数",
+                    lambda item=dict(workflow): self.app._show_workflow_schema(item),
+                    "plain",
+                    84,
+                ).pack(side="right")
+                if index < len(workflows) - 1:
+                    tk.Frame(listing, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
+
+        guide = self._card(body, 96)
+        guide.pack(fill="x")
+        left = tk.Frame(guide, bg=self.c["card"])
+        left.pack(side="left", fill="both", expand=True, padx=16, pady=13)
+        tk.Label(left, text="第一次添加工作流？", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
+        tk.Label(
+            left,
+            text="导出 ComfyUI API 工作流 → 选择文件或文件夹 → 确认输入与输出；未声明的依赖会提示补充。",
+            font=self.f["small"],
+            fg=self.c["text2"],
+            bg=self.c["card"],
+        ).pack(anchor="w", pady=(5, 0))
+        self._action(guide, "查看完整教程", self.app._show_workflow_tutorial, "plain", 112).pack(side="right", padx=16)
+
+    # ── models and environment ─────────────────────────────
+    def _build_resources(self, page):
         body = self._body(page)
+        runtime_state, runtime_missing = self._runtime_status()
+        runtime_ok = runtime_state == "ready"
+        environment_check = getattr(self.app, "_environment_status", {})
+        model_status = getattr(self.app, "_model_status", {})
+        model_keys = ("Qwen3.5", "Flux2", "Wan2.1")
+        ready_models = sum(1 for key in model_keys if model_status.get(key) == "完整")
+        missing_count = sum(len((model_status.get("missing") or {}).get(key) or []) for key in model_keys)
+
         metrics = tk.Frame(body, bg=self.c["bg"])
         metrics.pack(fill="x", pady=(0, 14))
         for col in range(3):
-            metrics.columnconfigure(col, weight=1, uniform="task_metrics")
-        self._metric(metrics, 0, "等待队列", "0", "尚无排队任务", "primary")
-        self._metric(metrics, 1, "正在运行", "0", "执行器当前空闲", "success")
-        self._metric(metrics, 2, "需要处理", "0", "失败或中断任务", "warn")
+            metrics.columnconfigure(col, weight=1, uniform="resource_metrics")
+        runtime_metric = {
+            "ready": ("已就绪", "环境文件完整", "success"),
+            "repair": ("需要修复", f"缺少 {len(runtime_missing)} 项", "warn"),
+            "missing": ("需要安装", "首次使用先安装", "warn"),
+        }[runtime_state]
+        if runtime_state == "ready" and environment_check and not environment_check.get("ready"):
+            runtime_metric = ("需要检查", "文件完整，运行检查未通过", "warn")
+        self._metric(metrics, 0, "运行环境", *runtime_metric)
+        self._metric(metrics, 1, "模型组", f"{ready_models}/{len(model_keys)}", "按工作流自动检查", "success" if ready_models == len(model_keys) else "warn")
+        self._metric(metrics, 2, "缺少文件", f"{missing_count} 个", "只下载实际需要的内容", "warn" if missing_count else "success")
 
-        self._section_heading(body, "任务记录", "所有文字、图片和视频调用都将使用统一异步任务")
-        panel = self._card(body, 224)
-        panel.pack(fill="x", pady=(0, 14))
-        filters = tk.Frame(panel, bg=self.c["card"])
-        filters.pack(fill="x", padx=14, pady=(12, 8))
-        for index, label in enumerate(("全部", "排队中", "运行中", "已完成", "失败", "已中断")):
-            tone = "primary" if index == 0 else "neutral"
-            self._badge(filters, label, tone).pack(side="left", padx=(0, 7))
-        self._divider(panel, (0, 0))
-        empty = tk.Frame(panel, bg=self.c["card"])
-        empty.pack(fill="both", expand=True)
-        tk.Label(empty, text="◷", font=("Microsoft YaHei UI", 28), fg=self.c["border"], bg=self.c["card"]).pack(pady=(30, 4))
-        tk.Label(empty, text="暂无任务记录", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack()
-        tk.Label(empty, text="接口接入后，这里会展示 task_id、来源、进度、耗时和结果。", font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(pady=(5, 0))
+        self._section_heading(body, "运行环境维护", "安装一次，之后由客户端自动启动")
+        runtime_card = self._card(body, 78)
+        self._resource_targets["runtime"] = runtime_card
+        runtime_card.pack(fill="x", pady=(0, 14))
+        runtime_left = tk.Frame(runtime_card, bg=self.c["card"])
+        runtime_left.pack(side="left", fill="both", expand=True, padx=16, pady=12)
+        title_row = tk.Frame(runtime_left, bg=self.c["card"])
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="本地生成环境", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+        runtime_check_failed = runtime_ok and environment_check and not environment_check.get("ready")
+        badge_text = {"ready": "环境完整", "repair": "需要修复", "missing": "尚未安装"}[runtime_state]
+        if runtime_check_failed:
+            badge_text = "运行需处理"
+        self._badge(title_row, badge_text, "warn" if runtime_check_failed or not runtime_ok else "success").pack(side="left", padx=(10, 0))
+        if runtime_state == "ready" and environment_check:
+            if environment_check.get("ready"):
+                gpu_name = str(environment_check.get("gpu_name") or "显卡环境正常")
+                runtime_note = f"检查通过 · {gpu_name}"
+            else:
+                runtime_note = str(environment_check.get("message") or "环境文件完整，运行检查需要处理。")
+        elif runtime_state == "ready":
+            runtime_note = "环境文件完整；可检查显卡与 PyTorch，或执行修复更新。"
+        elif runtime_state == "repair":
+            short_missing = "、".join(Path(item).name for item in runtime_missing[:2])
+            runtime_note = f"环境不完整，缺少 {len(runtime_missing)} 项：{short_missing}{'…' if len(runtime_missing) > 2 else ''}"
+        else:
+            runtime_note = "首次使用先安装运行环境；模型文件继续单独管理，不会重复下载。"
+        tk.Label(runtime_left, text=runtime_note, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", pady=(6, 0))
 
-        self._section_heading(body, "重启恢复规则", "本地执行器与第三方任务采用不同恢复策略")
-        recovery = tk.Frame(body, bg=self.c["bg"])
-        recovery.pack(fill="x")
-        for col in range(2):
-            recovery.columnconfigure(col, weight=1, uniform="recovery_cards")
-        items = [
-            ("本地工作流", "客户端退出会同时结束 ComfyUI。运行中的任务标记为“已中断”，可选择从头重试。", "warn"),
-            ("第三方 API", "已取得供应商 task_id 的任务会持久化，客户端重启后继续查询状态和结果。", "success"),
+        runtime_actions = tk.Frame(runtime_card, bg=self.c["card"])
+        runtime_actions.pack(side="right", padx=16)
+        if runtime_ok:
+            self._action(runtime_actions, "检查环境", self.app._start_background_runtime_recheck, "primary", 88).pack(side="left")
+            self._action(runtime_actions, "修复 / 更新", self.app._show_runtime_maintenance, "plain", 94).pack(side="left", padx=(8, 0))
+            self._action(runtime_actions, "打开目录", self.app._open_runtime_dir, "plain", 82).pack(side="left", padx=(8, 0))
+        else:
+            self._action(runtime_actions, "一键安装", self.app._install_runtime_from_mirror, "primary", 88).pack(side="left")
+            self._action(runtime_actions, "本地安装包", self.app._select_runtime, "plain", 94).pack(side="left", padx=(8, 0))
+            self._action(runtime_actions, "更多方式", self.app._show_runtime_maintenance, "plain", 82).pack(side="left", padx=(8, 0))
+
+        self._section_heading(
+            body,
+            "模型维护",
+            "模型与环境分开管理，缺什么就补什么",
+            actions=[
+                ("导入已有模型", self.app._import_models, "plain"),
+                ("重新检查", lambda: self.app._start_background_model_recheck(), "primary"),
+            ],
+        )
+        models_card = self._card(body, 198)
+        models_card.pack(fill="x", pady=(0, 14))
+        labels = {
+            "Qwen3.5": ("Qwen 3.5 文字生成", "文字", "文", "primary"),
+            "Flux2": ("Flux 2 图片生成", "图片", "图", "success"),
+            "Wan2.1": ("Wan 2.1 视频生成", "视频", "影", "warn"),
+        }
+        for index, key in enumerate(model_keys):
+            title, kind, glyph, tone = labels[key]
+            missing = list((model_status.get("missing") or {}).get(key) or [])
+            ready = model_status.get(key) == "完整"
+            row = tk.Frame(models_card, bg=self.c["card"])
+            row.pack(fill="x", padx=14, pady=(9 if index == 0 else 7, 7))
+            icon_bg = {
+                "primary": self.c["soft_primary"],
+                "success": self.c["soft_success"],
+                "warn": self.c["soft_warn"],
+            }[tone]
+            icon_fg = {
+                "primary": self.c["primary"],
+                "success": self.c["success"],
+                "warn": self.c["warn"],
+            }[tone]
+            tk.Label(row, text=glyph, font=self.f["bold"], fg=icon_fg, bg=icon_bg, width=3, pady=6).pack(side="left")
+            name_box = tk.Frame(row, bg=self.c["card"])
+            name_box.pack(side="left", fill="x", expand=True, padx=(11, 0))
+            tk.Label(name_box, text=title, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
+            note = "模型完整，可以直接使用" if ready else f"缺少：{'、'.join(missing[:2])}{'…' if len(missing) > 2 else ''}"
+            tk.Label(name_box, text=note, font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w")
+            tk.Label(row, text=kind, width=7, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
+            self._badge(row, "完整" if ready else f"缺少 {len(missing)} 个", "success" if ready else "warn").pack(side="left", padx=(6, 10))
+            if not ready:
+                self._action(row, "下载缺失", lambda item=key: self.app._show_model_install_help(item), "primary", 88).pack(side="right")
+            if index < len(model_keys) - 1:
+                tk.Frame(models_card, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
+
+        storage = self._card(body, 74)
+        storage.pack(fill="x")
+        paths = [
+            ("模型", BASE_DIR / "models", self.app._open_models),
+            ("工作流", BASE_DIR / "workflows", self.app._open_workflows_dir),
+            ("生成结果", BASE_DIR / "outputs", self.app._open_outputs),
         ]
-        for col, (title, desc, tone) in enumerate(items):
-            card = self._card(recovery, 112)
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 1 else 5))
-            head = tk.Frame(card, bg=self.c["card"])
-            head.pack(fill="x", padx=14, pady=(13, 6))
-            tk.Label(head, text=title, font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            self._badge(head, "规则已确定", tone).pack(side="right")
-            tk.Label(card, text=desc, wraplength=390, justify="left", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", padx=14)
+        for index, (label, path, command) in enumerate(paths):
+            cell = tk.Frame(storage, bg=self.c["card"])
+            cell.pack(side="left", fill="both", expand=True, padx=(16 if index == 0 else 8, 8), pady=8)
+            cell_head = tk.Frame(cell, bg=self.c["card"])
+            cell_head.pack(fill="x")
+            tk.Label(cell_head, text=f"{label}位置", font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+            self._action(cell_head, "打开", command, "plain", 66).pack(side="right")
+            tk.Label(cell, text=self._short_path(path, 30), font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w", pady=(3, 0))
 
-    # ── network ───────────────────────────────────────────
-    def _build_network(self, page):
-        body = self._body(page)
-        self._section_heading(body, "访问模式", "同一套 URL + Key 调用方式，适配本机、局域网与公网环境")
-        modes = tk.Frame(body, bg=self.c["bg"])
-        modes.pack(fill="x", pady=(0, 14))
-        for col in range(3):
-            modes.columnconfigure(col, weight=1, uniform="network_modes")
-        data = [
-            ("本机访问", "127.0.0.1", "当前可用", "仅当前电脑", "success"),
-            ("局域网访问", "LAN IP", "待配置", "同一内网设备", "primary"),
-            ("公网访问", "Tunnel / 域名", "临时通道", "任何联网设备", "warn"),
-        ]
-        for col, (title, address, status, note, tone) in enumerate(data):
-            card = self._card(modes, 132)
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 2 else 5))
-            head = tk.Frame(card, bg=self.c["card"])
-            head.pack(fill="x", padx=14, pady=(13, 5))
-            tk.Label(head, text=title, font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            self._badge(head, status, tone).pack(side="right")
-            tk.Label(card, text=address, font=("Consolas", 15, "bold"), fg=self.c["primary"], bg=self.c["card"]).pack(anchor="w", padx=14, pady=(6, 1))
-            tk.Label(card, text=note, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w", padx=14)
-
-        self._section_heading(body, "连接信息", "真实公网地址和访问 Key 仍以概览页运行状态为准")
-        connection = self._card(body, 150)
-        connection.pack(fill="x", pady=(0, 14))
-        grid = tk.Frame(connection, bg=self.c["card"])
-        grid.pack(fill="both", expand=True, padx=16, pady=12)
-        left = tk.Frame(grid, bg=self.c["card"])
-        left.pack(side="left", fill="both", expand=True, padx=(0, 24))
-        right = tk.Frame(grid, bg=self.c["card"])
-        right.pack(side="left", fill="both", expand=True)
-        tk.Label(left, text="本地端点", font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-        self._key_value(left, "API Base", "http://127.0.0.1:18188", True)
-        self._key_value(left, "ComfyUI", "http://127.0.0.1:8188", True)
-        self._key_value(left, "鉴权", "Bearer API Key")
-        tk.Label(right, text="公网策略", font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-        self._key_value(right, "开发测试", "Cloudflare Quick Tunnel")
-        self._key_value(right, "正式部署", "Named Tunnel / 自有反代")
-        self._key_value(right, "大文件", "流式 + Range + 断点续传")
-
-        self._section_heading(body, "上线前检查")
-        checklist = self._card(body, 100)
-        checklist.pack(fill="x")
-        items = [
-            ("Key 鉴权", "已规划", "primary"),
-            ("访问限流", "待接入", "neutral"),
-            ("HTTPS / 固定域名", "待配置", "warn"),
-            ("大视频断点续传", "待实现", "neutral"),
-        ]
-        for index, (label, status, tone) in enumerate(items):
-            item = tk.Frame(checklist, bg=self.c["card"])
-            item.pack(side="left", fill="both", expand=True, padx=(14 if index == 0 else 7, 14 if index == len(items) - 1 else 7), pady=18)
-            tk.Label(item, text=label, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-            self._badge(item, status, tone).pack(anchor="w", pady=(8, 0))
-
-    # ── resources ─────────────────────────────────────────
-    def _build_resources(self, page):
-        body = self._body(page)
-        self._section_heading(body, "独立资源层", "项目、运行环境、模型和工作流分别安装与升级")
-        layers = tk.Frame(body, bg=self.c["bg"])
-        layers.pack(fill="x", pady=(0, 14))
-        for col in range(4):
-            layers.columnconfigure(col, weight=1, uniform="resource_layers")
-        data = [
-            ("01", "客户端程序", "Git 管理", "界面、API 与任务逻辑", "primary"),
-            ("02", "运行环境", "v1.0.0", "Python · PyTorch · ComfyUI", "success"),
-            ("03", "模型资源", "独立目录", "不进入 Git 或通用环境包", "warn"),
-            ("04", "工作流包", "3 个", "manifest · JSON · 依赖", "primary"),
-        ]
-        for col, (index, title, value, desc, tone) in enumerate(data):
-            card = self._card(layers, 148)
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0 if col == 3 else 4))
-            head = tk.Frame(card, bg=self.c["card"])
-            head.pack(fill="x", padx=13, pady=(12, 5))
-            tk.Label(head, text=index, font=self.f["mono"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
-            self._badge(head, value, tone).pack(side="right")
-            tk.Label(card, text=title, font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w", padx=13, pady=(4, 5))
-            tk.Label(card, text=desc, wraplength=190, justify="left", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", padx=13)
-
-        self._section_heading(body, "版本与维护", "当前页面只展示资源关系，安装和维护动作仍从概览进入")
-        maintenance = self._card(body, 196)
-        maintenance.pack(fill="x", pady=(0, 14))
-        rows = [
-            ("客户端程序", "当前 main", "私有 GitHub 仓库", "可通过 Git 提交回滚", "查看版本"),
-            ("运行环境", "runtime-v1.0.0", "私有 Release / 本地 7z", "已通过迁移冒烟测试", "检查环境"),
-            ("模型目录", "用户本地保留", "models/", "不上传、不随卸载删除", "打开目录"),
-        ]
-        for index, (name, version, source, status, action) in enumerate(rows):
-            row = tk.Frame(maintenance, bg=self.c["card"])
-            row.pack(fill="x", padx=14, pady=(12 if index == 0 else 8, 7))
-            tk.Label(row, text=name, width=14, anchor="w", font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=version, width=22, anchor="w", font=self.f["mono"], fg=self.c["primary"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=source, width=28, anchor="w", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
-            tk.Label(row, text=status, anchor="w", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left", fill="x", expand=True)
-            self._disabled_action(row, action).pack(side="right")
-            if index < len(rows) - 1:
-                tk.Frame(maintenance, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
-
-        note = self._card(body, 94)
-        note.pack(fill="x")
-        tk.Label(note, text="模型始终独立", font=self.f["h2"], fg=self.c["warn"], bg=self.c["card"]).pack(anchor="w", padx=15, pady=(13, 4))
-        tk.Label(note, text="公开源码或更新客户端时，不上传、不重复打包现有模型；环境修复和卸载默认保留模型与用户结果。", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w", padx=15)
-
-    # ── settings ──────────────────────────────────────────
+    # ── settings ───────────────────────────────────────────
     def _build_settings(self, page):
         body = self._body(page)
-        banner = self._card(body, 74)
-        banner.pack(fill="x", pady=(0, 14))
-        tk.Label(banner, text="设置页面预览", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left", padx=(16, 10))
-        tk.Label(banner, text="以下字段尚未保存到配置文件，仅用于确认信息结构。", font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
-        self._badge(banner, "待接入", "warn").pack(side="right", padx=16)
+        self._section_heading(body, "访问与安全", "用于其他软件调用本客户端")
+        access = self._card(body, 94)
+        access.pack(fill="x", pady=(0, 14))
+        access_left = tk.Frame(access, bg=self.c["card"])
+        access_left.pack(side="left", fill="both", expand=True, padx=16, pady=13)
+        tk.Label(access_left, text="访问密钥", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
+        key = str(getattr(self.app, "_api_key", "") or "")
+        masked = f"{key[:12]}{'•' * 12}{key[-6:]}" if len(key) > 20 else "服务启动后自动生成"
+        self.app._settings_key_label = tk.Label(access_left, text=masked, font=self.f["mono"], fg=self.c["primary"], bg=self.c["card"])
+        self.app._settings_key_label.pack(anchor="w", pady=(5, 0))
+        tk.Label(access_left, text="密钥只保存在本机；请不要发送给不信任的人。", font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w", pady=(3, 0))
+        access_actions = tk.Frame(access, bg=self.c["card"])
+        access_actions.pack(side="right", padx=16)
+        self._action(access_actions, "修改密钥", self.app._edit_api_key, "plain", 84).pack(side="left", padx=(0, 8))
+        self._action(access_actions, "复制密钥", self.app._copy_api_key, "primary", 84).pack(side="left")
 
-        grid = tk.Frame(body, bg=self.c["bg"])
-        grid.pack(fill="both", expand=True)
-        for col in range(2):
-            grid.columnconfigure(col, weight=1, uniform="settings_columns")
-        for row in range(2):
-            grid.rowconfigure(row, weight=1, uniform="settings_rows")
-
-        cards = [
-            (0, 0, "访问与安全", [
-                ("客户端访问 Key", "••••••••••••••••", True),
-                ("第三方 Key 保存", "Windows 本地加密", False),
-                ("日志敏感信息", "自动掩码", False),
-            ]),
-            (0, 1, "任务与并发", [
-                ("默认并发", "1 个任务", False),
-                ("任务超时", "由工作流单独定义", False),
-                ("重启恢复", "按执行器类型处理", False),
-            ]),
-            (1, 0, "存储与清理", [
-                ("生成结果", "outputs/", True),
-                ("任务数据", "runtime/requests/", True),
-                ("自动清理", "关闭", False),
-            ]),
-            (1, 1, "默认路由", [
-                ("文字模型", "local-text-default", True),
-                ("图片模型", "local-image-default", True),
-                ("视频模型", "local-video-default", True),
-            ]),
+        self._section_heading(body, "文件存放位置", "当前随项目保存，点击即可打开查看")
+        paths_card = self._card(body, 188)
+        paths_card.pack(fill="x", pady=(0, 14))
+        path_rows = [
+            ("模型", BASE_DIR / "models", self.app._open_models),
+            ("工作流", BASE_DIR / "workflows", self.app._open_workflows_dir),
+            ("生成结果", BASE_DIR / "outputs", self.app._open_outputs),
+            ("运行日志", BASE_DIR / "runtime" / "logs", self.app._open_logs_dir),
         ]
-        for row, col, title, values in cards:
-            card = self._card(grid, 202)
-            card.grid(row=row, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 1 else 5), pady=(0 if row == 0 else 5, 0 if row == 1 else 5))
-            head = tk.Frame(card, bg=self.c["card"])
-            head.pack(fill="x", padx=14, pady=(13, 8))
-            tk.Label(head, text=title, font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
-            self._badge(head, "静态预览").pack(side="right")
-            for label, value, mono in values:
-                field = tk.Frame(card, bg=self.c["hover"])
-                field.pack(fill="x", padx=14, pady=4)
-                tk.Label(field, text=label, width=16, anchor="w", font=self.f["small"], fg=self.c["text2"], bg=self.c["hover"], padx=9, pady=7).pack(side="left")
-                tk.Label(field, text=value, anchor="e", font=self.f["mono"] if mono else self.f["small"], fg=self.c["text"], bg=self.c["hover"], padx=9).pack(side="right", fill="x", expand=True)
+        for index, (label, path, command) in enumerate(path_rows):
+            row = tk.Frame(paths_card, bg=self.c["card"])
+            row.pack(fill="x", padx=16, pady=(9 if index == 0 else 5, 5))
+            tk.Label(row, text=label, width=10, anchor="w", font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+            tk.Label(row, text=self._short_path(path, 68), anchor="w", font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left", fill="x", expand=True)
+            self._action(row, "打开", command, "plain", 66).pack(side="right")
+            if index < len(path_rows) - 1:
+                tk.Frame(paths_card, bg=self.c["border2"], height=1).pack(fill="x", padx=16)
 
-        footer = tk.Frame(body, bg=self.c["bg"])
-        footer.pack(fill="x", pady=(14, 0))
-        tk.Label(footer, text="设置接入前不会写入任何本地配置", font=self.f["small"], fg=self.c["muted"], bg=self.c["bg"]).pack(side="left")
-        self._disabled_action(footer, "功能接入后可保存", 18).pack(side="right")
+        lower = tk.Frame(body, bg=self.c["bg"])
+        lower.pack(fill="x")
+        lower.columnconfigure(0, weight=1, uniform="settings_lower")
+        lower.columnconfigure(1, weight=1, uniform="settings_lower")
+
+        behavior = self._card(lower, 168)
+        behavior.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(behavior, text="运行方式", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w", padx=16, pady=(13, 7))
+        behavior_rows = [
+            ("关闭主窗口", "停止全部后台服务"),
+            ("最小化窗口", "继续后台运行"),
+            ("任务并发", "1 个任务"),
+            ("单实例运行", "已开启"),
+        ]
+        for label, value in behavior_rows:
+            row = tk.Frame(behavior, bg=self.c["card"])
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=label, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
+            tk.Label(row, text=value, font=self.f["small"], fg=self.c["text"], bg=self.c["card"]).pack(side="right")
+
+        advanced = self._card(lower, 168)
+        advanced.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        head = tk.Frame(advanced, bg=self.c["card"])
+        head.pack(fill="x", padx=16, pady=(13, 7))
+        tk.Label(head, text="专业配置", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+        self._badge(head, "高级", "primary").pack(side="right")
+        advanced_rows = [
+            ("API", "端口 18188"),
+            ("ComfyUI", "端口 8188"),
+            ("Tunnel", "自动建立公网连接"),
+        ]
+        for label, value in advanced_rows:
+            row = tk.Frame(advanced, bg=self.c["card"])
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=label, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
+            tk.Label(row, text=value, font=self.f["small"], fg=self.c["text"], bg=self.c["card"]).pack(side="right")
+        self._action(advanced, "打开配置文件", self.app._open_runtime_config, "plain", 106).pack(anchor="e", padx=16, pady=(7, 0))

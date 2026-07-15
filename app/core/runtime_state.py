@@ -2,15 +2,20 @@
 运行时状态管理 — session.json
 """
 import json
+import os
 import secrets
 import string
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 
 class RuntimeState:
     """全局运行时状态，管理 session.json"""
+
+    _thread_lock = threading.RLock()
 
     def __init__(self, runtime_dir: Path):
         self.runtime_dir = Path(runtime_dir)
@@ -37,33 +42,120 @@ class RuntimeState:
             "tunnel_provider": "cloudflare_quick_tunnel",
         }
 
-    def save(self):
+    @contextmanager
+    def _locked_session(self, timeout: float = 5.0):
+        """Serialize session mutations across GUI/API processes."""
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.session_path, "w", encoding="utf-8") as f:
-            json.dump(self._state, f, ensure_ascii=False, indent=2)
+        lock_path = self.runtime_dir / ".session.lock"
+        handle = open(lock_path, "a+b")
+        locked = False
+        deadline = time.time() + max(0.2, timeout)
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            if os.name == "nt":
+                import msvcrt
+
+                while time.time() < deadline:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        time.sleep(0.03)
+            else:
+                import fcntl
+
+                while time.time() < deadline:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.03)
+            if not locked:
+                raise TimeoutError("session.json 正在被其他进程更新")
+            yield
+        finally:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+
+    def _write_atomic(self, state: dict):
+        temp_path = self.session_path.with_name(
+            f"{self.session_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.session_path)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+    def _update(self, patch):
+        with self._thread_lock:
+            with self._locked_session():
+                latest = self._load()
+                patch(latest)
+                self._write_atomic(latest)
+                self._state = latest
+
+    def save(self):
+        """Persist the current snapshot; field setters are preferred."""
+        snapshot = dict(self._state)
+        self._update(lambda latest: latest.update(snapshot))
 
     def start_session(self, local_port: int = 18188):
         """启动新会话"""
-        self._state["session_id"] = self._generate_session_id()
-        self._state["local_api"] = f"http://127.0.0.1:{local_port}"
-        self._state["started_at"] = time.strftime(
-            "%Y-%m-%dT%H:%M:%S%z", time.localtime()
-        )
-        self._state["status"] = "starting"
-        if not self._state.get("api_key"):
-            self._state["api_key"] = self._generate_api_key()
-        self.save()
+        def patch(latest):
+            latest["session_id"] = self._generate_session_id()
+            latest["local_api"] = f"http://127.0.0.1:{local_port}"
+            latest["base_url"] = ""
+            latest["started_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z", time.localtime()
+            )
+            latest["status"] = "starting"
+            latest.pop("error", None)
+            if not latest.get("api_key"):
+                latest["api_key"] = self._generate_api_key()
+
+        self._update(patch)
+
+    def set_offline(self):
+        """Mark the local gateway offline without discarding its API key."""
+        self._update(lambda latest: latest.update({"status": "offline", "base_url": ""}))
+
+    def set_api_key(self, api_key: str):
+        """Persist the local access key chosen in desktop settings."""
+        value = str(api_key or "").strip()
+        self._update(lambda latest: latest.update({"api_key": value}))
 
     def set_online(self, base_url: str):
         """Tunnel 建立成功"""
-        self._state["base_url"] = base_url
-        self._state["status"] = "online"
-        self.save()
+        self._update(lambda latest: latest.update({"base_url": base_url, "status": "online"}))
 
     def set_error(self, reason: str):
-        self._state["status"] = "error"
-        self._state["error"] = reason
-        self.save()
+        self._update(lambda latest: latest.update({"status": "error", "error": reason}))
 
     @staticmethod
     def _generate_session_id() -> str:
