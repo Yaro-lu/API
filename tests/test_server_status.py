@@ -1,6 +1,8 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from app import server
@@ -21,6 +23,65 @@ FIXTURE_REQUIREMENTS = {
 
 
 class ServerStatusTests(unittest.TestCase):
+    def test_stale_public_url_is_hidden_while_tunnel_is_offline(self):
+        fake_state = SimpleNamespace(
+            base_url="https://stale.example",
+            local_api="http://127.0.0.1:18188",
+        )
+        fake_tunnel = SimpleNamespace(
+            is_online=False,
+            state=SimpleNamespace(status="retrying", base_url="", error=""),
+        )
+
+        with (
+            mock.patch.object(server, "state", fake_state),
+            mock.patch.object(server, "tunnel", fake_tunnel),
+        ):
+            self.assertEqual(server._active_public_base_url(), "")
+            self.assertEqual(server._public_base_url(), fake_state.local_api)
+
+    def test_tunnel_health_status_preserves_actionable_states(self):
+        fake_tunnel = SimpleNamespace(
+            is_online=False,
+            state=SimpleNamespace(status="offline"),
+        )
+        expected = {
+            "starting": "starting",
+            "retrying": "retrying",
+            "failed": "unavailable",
+            "offline": "offline",
+        }
+
+        with mock.patch.object(server, "tunnel", fake_tunnel):
+            for raw, published in expected.items():
+                with self.subTest(status=raw):
+                    fake_tunnel.state.status = raw
+                    self.assertEqual(server._tunnel_health_status(), published)
+
+    def test_tunnel_restart_clears_stale_state_before_manager_restart(self):
+        calls = []
+
+        class FakeState:
+            def set_offline(self):
+                calls.append("offline")
+
+        class FakeTunnel:
+            is_online = False
+            state = SimpleNamespace(status="starting", base_url="", error="")
+
+            def restart(self):
+                calls.append("restart")
+                return True
+
+        with (
+            mock.patch.object(server, "state", FakeState()),
+            mock.patch.object(server, "tunnel", FakeTunnel()),
+        ):
+            result = asyncio.run(server._restart_tunnel_manager())
+
+        self.assertEqual(calls, ["offline", "restart"])
+        self.assertTrue(result["ok"])
+
     def test_wrong_size_models_are_not_published_as_available(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

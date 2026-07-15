@@ -8,6 +8,7 @@ Local AI API Gateway — API 服务器
   GET  /v1/workflows/list            → 工作流列表
   GET  /health                       → 健康检查（免鉴权）
 """
+import asyncio
 import os
 import sys
 import json
@@ -278,12 +279,48 @@ def _models_from_workflows() -> list:
     return models
 
 
-def _public_base_url() -> str:
-    if state and state.base_url:
+def _active_public_base_url() -> str:
+    if tunnel and tunnel.is_online and state and state.base_url:
         return state.base_url.rstrip("/")
+    return ""
+
+
+def _tunnel_health_status() -> str:
+    if not tunnel:
+        return "offline"
+    if tunnel.is_online:
+        return "online"
+    status = str(getattr(tunnel.state, "status", "offline") or "offline")
+    if status == "failed":
+        return "unavailable"
+    if status in ("starting", "retrying"):
+        return status
+    return "offline"
+
+
+def _public_base_url() -> str:
+    public_url = _active_public_base_url()
+    if public_url:
+        return public_url
     if state and state.local_api:
         return state.local_api.rstrip("/")
     return "http://127.0.0.1:18188"
+
+
+async def _restart_tunnel_manager() -> dict:
+    """Clear stale publication state before restarting Tunnel off the event loop."""
+    global tunnel
+    state.set_offline()
+    if tunnel is None:
+        start_tunnel(config)
+    else:
+        await asyncio.to_thread(tunnel.restart)
+    return {
+        "ok": bool(tunnel and tunnel.state.status in ("starting", "retrying", "online")),
+        "status": tunnel.state.status if tunnel else "offline",
+        "url": tunnel.state.base_url if tunnel else "",
+        "error": tunnel.state.error if tunnel else "Tunnel manager not initialized",
+    }
 
 
 def _output_url(task_id: str, filename: str) -> str:
@@ -854,19 +891,20 @@ def create_app() -> FastAPI:
         for item in model_list:
             model_groups.setdefault(item.get("group") or _model_group_for_type(item.get("type", "")), []).append(item)
 
+        public_base_url = _active_public_base_url()
+        tunnel_status = _tunnel_health_status()
+
         return {
             "status": "ok",
             "version": "0.2.0",
             "session_id": state.session_id,
-            "base_url": state.base_url,
+            "base_url": public_base_url,
             "local_api": state.local_api,
             "api": {"status": "online", "port": config.server_port},
             "tunnel": {
                 "provider": "cloudflare_quick_tunnel",
-                "status": "online" if (tunnel and tunnel.is_online) else (
-                    "unavailable" if (tunnel and tunnel.state.status == "failed") else "offline"
-                ),
-                "url": state.base_url,
+                "status": tunnel_status,
+                "url": public_base_url,
                 "error": tunnel.state.error if tunnel else "",
             },
             "comfyui": {
@@ -926,17 +964,7 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/tunnel/restart")
     async def restart_tunnel():
-        global tunnel
-        if tunnel is None:
-            start_tunnel(config)
-        else:
-            tunnel.restart()
-        return {
-            "ok": bool(tunnel and tunnel.state.status in ("starting", "retrying", "online")),
-            "status": tunnel.state.status if tunnel else "offline",
-            "url": tunnel.state.base_url if tunnel else "",
-            "error": tunnel.state.error if tunnel else "Tunnel manager not initialized",
-        }
+        return await _restart_tunnel_manager()
 
     @app.post("/v1/workflows/run")
     @app.post("/v1/workflows/run/{workflow_id}")

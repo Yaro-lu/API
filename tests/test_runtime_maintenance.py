@@ -17,6 +17,8 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         app = object.__new__(GatewayApp)
         app._runtime_maintenance_lock = threading.RLock()
         app._runtime_maintenance_in_progress = False
+        app._backend_action_lock = threading.Lock()
+        app._backend_action_name = ""
         app._shutting_down = False
         app._last_health = {}
         return app
@@ -241,6 +243,11 @@ class RuntimeMaintenanceTests(unittest.TestCase):
 
         app._open_runtime_maintenance.assert_called_once_with()
         check_system.assert_not_called()
+        for key in ("comfyui", "api", "tunnel"):
+            self.assertIn(
+                mock.call(key, "offline", "等待安装环境"),
+                app._set_light.call_args_list,
+            )
 
     def test_maintenance_is_blocked_by_external_runtime_listener(self):
         app = self._app()

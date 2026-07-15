@@ -416,6 +416,8 @@ class GatewayApp(WindowBase):
         self._comfy_proc = None
         self._api_proc = None
         self._process_supervisor = ProcessSupervisor(BASE_DIR)
+        self._backend_action_lock = threading.Lock()
+        self._backend_action_name = ""
         self._runtime_maintenance_lock = threading.RLock()
         self._runtime_maintenance_in_progress = False
         self._model_transfer_lock = threading.RLock()
@@ -424,6 +426,8 @@ class GatewayApp(WindowBase):
         self._api_key = ""
         self._poll_run = False
         self._health_poll_thread = None
+        self._health_poll_lock = threading.Lock()
+        self._health_poll_generation = 0
         self._shutting_down = False
         self._last_health = {}
         self._server_session_token = ""
@@ -487,7 +491,7 @@ class GatewayApp(WindowBase):
         self.bind("<Unmap>", self._on_minimize)
 
         # 异步启动序列
-        threading.Thread(target=self._startup_sequence, daemon=True).start()
+        self._request_backend_start("启动后台")
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
     def center(self):
@@ -764,6 +768,63 @@ class GatewayApp(WindowBase):
         finally:
             lock.release()
 
+    def _run_ui_backend_step(self, callback, timeout: float = 20.0) -> bool:
+        """Run one Tk-bound lifecycle step and keep its action reservation."""
+        completed = threading.Event()
+        errors = []
+
+        def invoke():
+            try:
+                callback()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        try:
+            self.after(0, invoke)
+        except Exception:
+            completed.set()
+            raise
+
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while not completed.wait(0.05):
+            if self._shutting_down:
+                return False
+            if time.monotonic() >= deadline:
+                raise TimeoutError("界面未能及时执行后台服务操作")
+        if errors:
+            raise errors[0]
+        return not self._shutting_down
+
+    def _request_backend_start(self, action_name: str = "启动后台") -> bool:
+        """Start the full environment/backend sequence as one serialized action."""
+        if not self._begin_backend_action(action_name):
+            return False
+        try:
+            threading.Thread(
+                target=self._backend_start_worker,
+                args=(action_name,),
+                daemon=True,
+            ).start()
+        except Exception:
+            self._end_backend_action()
+            raise
+        return True
+
+    def _backend_start_worker(self, action_name: str):
+        try:
+            self._startup_sequence()
+        except Exception as exc:
+            self.after(
+                0,
+                lambda name=action_name, message=str(exc): self._report_backend_failure(
+                    f"{name}失败：{message}"
+                ),
+            )
+        finally:
+            self._end_backend_action()
+
     def _startup_sequence(self):
         """主启动序列（后台线程）"""
         if self._shutting_down or self._runtime_maintenance_active():
@@ -780,7 +841,13 @@ class GatewayApp(WindowBase):
                 "gpu_name": "",
                 "message": f"运行环境不完整，缺少 {len(missing)} 项",
             }
+            def mark_backend_waiting_for_install():
+                if self._shutting_down:
+                    return
+                for key in ("comfyui", "api", "tunnel"):
+                    self._set_light(key, "offline", "等待安装环境")
             self.after(0, lambda data=result: self._finish_runtime_recheck(data))
+            self.after(0, mark_backend_waiting_for_install)
             self.after(0, self._open_runtime_maintenance)
             return
 
@@ -836,7 +903,7 @@ class GatewayApp(WindowBase):
         _ensure_extra_model_paths()
 
         if environment_ready and not self._runtime_maintenance_active():
-            self.after(0, self._start_backend)
+            self._run_ui_backend_step(self._start_backend)
         elif not environment_ready:
             def mark_backend_blocked():
                 if self._shutting_down:
@@ -3058,10 +3125,12 @@ class GatewayApp(WindowBase):
     def _reload_workflows_and_sync(self):
         import urllib.request as ur
         try:
-            headers = {"content-type": "application/json"}
-            if self._api_key:
-                headers["authorization"] = f"Bearer {self._api_key}"
-            req = ur.Request(f"{API_BASE}/v1/workflows/reload", data=b"{}", method="POST", headers=headers)
+            req = ur.Request(
+                f"{API_BASE}/v1/workflows/reload",
+                data=b"{}",
+                method="POST",
+                headers=self._local_api_headers(),
+            )
             ur.urlopen(req, timeout=8).read()
         except Exception as reload_error:
             print(f"[Workflow] reload skipped/failed: {reload_error}")
@@ -3655,7 +3724,7 @@ class GatewayApp(WindowBase):
         if restart and not self._shutting_down:
             self.after(
                 500,
-                lambda: threading.Thread(target=self._startup_sequence, daemon=True).start(),
+                lambda: self._request_backend_start("恢复后台"),
             )
 
     def _stop_runtime_for_maintenance(self) -> str:
@@ -3722,6 +3791,11 @@ class GatewayApp(WindowBase):
     def _set_public_url(self, url: str):
         self._url_label.config(text=self._short_middle(url, 16, 10) if url else "等待隧道...")
 
+    def _clear_public_url(self):
+        self._tunnel_url = ""
+        self._set_public_url("")
+        self._initial_session_sync_done = False
+
     def _set_api_key(self, api_key: str):
         self._key_label.config(text=self._short_middle(api_key, 18, 10) if api_key else "—")
         settings_label = getattr(self, "_settings_key_label", None)
@@ -3783,23 +3857,54 @@ class GatewayApp(WindowBase):
             save_button.configure(state="disabled")
 
             def apply_key():
-                was_running = self._process_supervisor.is_running("api")
-                if was_running:
-                    error = self._process_supervisor.terminate("api", timeout=8)
-                    if error:
-                        self.after(0, lambda e=error: show_error(f"API 无法安全重启：{e}"))
-                        return
-                    self._api_proc = None
+                if not self._begin_backend_action("应用访问密钥"):
+                    self.after(0, lambda: show_error("其他后台操作正在进行，请稍候重试。"))
+                    return
+                was_running = False
+                saved = False
                 try:
+                    was_running = self._process_supervisor.is_running("api")
+                    if was_running:
+                        self._invalidate_health_polling()
+                        error = self._process_supervisor.terminate("api", timeout=8)
+                        if error:
+                            self._ensure_health_polling()
+                            self.after(0, lambda e=error: show_error(f"API 无法安全重启：{e}"))
+                            return
+                        self._api_proc = None
                     # Stop the old API before writing.  Its in-memory state may
                     # contain the previous key and must not overwrite this save.
                     RuntimeState(BASE_DIR / "runtime").set_api_key(value)
+                    saved = True
+                    if not self._run_ui_backend_step(
+                        lambda: finish_save(value, was_running)
+                    ):
+                        return
+                    if (
+                        was_running
+                        and not self._shutting_down
+                        and not self._runtime_maintenance_active()
+                    ):
+                        if self._run_ui_backend_step(self._start_api_service):
+                            self._ensure_health_polling()
                 except Exception as exc:
                     if was_running and not self._shutting_down:
-                        self.after(0, self._start_api_service)
-                    self.after(0, lambda e=exc: show_error(f"保存失败：{e}"))
-                    return
-                self.after(0, lambda: finish_save(value, was_running))
+                        try:
+                            if self._run_ui_backend_step(self._start_api_service):
+                                self._ensure_health_polling()
+                        except Exception as restore_error:
+                            print(f"[Settings] API restore failed: {restore_error}")
+                    if saved:
+                        self.after(
+                            0,
+                            lambda e=exc: self._report_backend_failure(
+                                f"访问密钥已保存，但 API 重启失败：{e}"
+                            ),
+                        )
+                    else:
+                        self.after(0, lambda e=exc: show_error(f"保存失败：{e}"))
+                finally:
+                    self._end_backend_action()
 
             threading.Thread(target=apply_key, daemon=True).start()
 
@@ -3822,11 +3927,10 @@ class GatewayApp(WindowBase):
                 pass
             self._footer_label.config(text="  访问密钥已保存")
             if restart_api and not self._shutting_down:
+                self._clear_public_url()
                 self._footer_label.config(text="  访问密钥已保存，正在重启 API...")
                 self._set_light("api", "loading", "重启中")
                 self._set_light("tunnel", "loading", "重连中")
-                self._start_api_service()
-                self._ensure_health_polling()
 
         regenerate_button = self._button(actions, "重新生成", regenerate, "plain", width=88)
         regenerate_button.pack(side="left")
@@ -3851,6 +3955,27 @@ class GatewayApp(WindowBase):
             headers["Referer"] = f"{server_url}/"
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _current_local_api_key(self) -> str:
+        """Read the key used by the running local API, with memory as fallback."""
+        persisted = ""
+        try:
+            persisted = str(
+                RuntimeState(BASE_DIR / "runtime").api_key or ""
+            ).strip()
+        except Exception as exc:
+            print(f"[Runtime] failed to reload local API key: {exc}")
+        api_key = persisted or str(self._api_key or "").strip()
+        if api_key and api_key != self._api_key:
+            self._api_key = api_key
+        return api_key
+
+    def _local_api_headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        api_key = self._current_local_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
     def _set_account_status(self, text: str, status: str = "warn"):
@@ -4429,11 +4554,37 @@ class GatewayApp(WindowBase):
 
     def _start_background_runtime_recheck(self):
         """Check package, GPU and PyTorch in the background, then refresh the card."""
-        if self._shutting_down or self._runtime_maintenance_active():
+        if not self._begin_backend_action("检查环境"):
             return
         self._set_light("env", "loading", "检查中")
         self._footer_label.config(text="  正在检查运行环境...")
-        threading.Thread(target=self._retry_env_check, daemon=True).start()
+        try:
+            threading.Thread(
+                target=self._environment_recheck_worker,
+                daemon=True,
+            ).start()
+        except Exception:
+            self._end_backend_action()
+            raise
+
+    def _environment_recheck_worker(self):
+        try:
+            self._retry_env_check()
+        except Exception as exc:
+            self.after(
+                0,
+                lambda message=str(exc): self._finish_runtime_recheck(
+                    {
+                        "package_ready": not missing_runtime_paths(BASE_DIR),
+                        "ready": False,
+                        "missing": missing_runtime_paths(BASE_DIR),
+                        "gpu_name": "",
+                        "message": f"环境检查失败：{message}",
+                    }
+                ),
+            )
+        finally:
+            self._end_backend_action()
 
     def _show_workflow_tutorial(self):
         popup = tk.Toplevel(self)
@@ -4675,16 +4826,84 @@ class GatewayApp(WindowBase):
 
     def _restart_backend(self):
         """重启所有后台服务"""
-        if self._shutting_down or self._runtime_maintenance_active():
-            if not self._shutting_down:
-                self._footer_label.config(text="  正在维护运行环境，完成后会自动恢复后台服务")
+        if not self._begin_backend_action("重启后台"):
             return
-        errors = self._shutdown_backend()
-        if errors:
-            self._footer_label.config(text=f"  后台服务未能完全停止：{errors}")
-            return
-        self.after(500, lambda: threading.Thread(target=self._startup_sequence, daemon=True).start())
         self._footer_label.config(text="  正在重启后台服务...")
+        self._clear_public_url()
+        for key in ("comfyui", "api", "tunnel"):
+            self._set_light(key, "loading", "重启中")
+        try:
+            threading.Thread(target=self._restart_backend_worker, daemon=True).start()
+        except Exception:
+            self._end_backend_action()
+            raise
+
+    def _restart_backend_worker(self):
+        try:
+            errors = self._shutdown_backend()
+            if errors:
+                self.after(
+                    0,
+                    lambda message=errors: self._report_backend_failure(
+                        f"后台服务未能完全停止：{message}"
+                    ),
+                )
+                return
+            if self._shutting_down or self._runtime_maintenance_active():
+                return
+            self._startup_sequence()
+        except Exception as exc:
+            self.after(
+                0,
+                lambda message=str(exc): self._report_backend_failure(
+                    f"后台重启失败：{message}"
+                ),
+            )
+        finally:
+            self._end_backend_action()
+
+    def _report_backend_failure(self, message: str):
+        if self._shutting_down:
+            return
+        for key in ("comfyui", "api", "tunnel"):
+            self._set_light(key, "offline", "重试可用")
+        self._footer_label.config(text=f"  {message}")
+        self._ensure_health_polling()
+
+    def _begin_backend_action(self, action_name: str) -> bool:
+        """Reserve one service lifecycle action without blocking the UI."""
+        if self._shutting_down:
+            return False
+        if self._runtime_maintenance_active():
+            self.after(
+                0,
+                lambda: self._footer_label.config(
+                    text="  正在维护运行环境，完成后会自动恢复后台服务"
+                ),
+            )
+            return False
+        lock = self._backend_action_lock
+        if not lock.acquire(blocking=False):
+            current = self._backend_action_name or "后台操作"
+            self.after(
+                0,
+                lambda name=current: self._footer_label.config(
+                    text=f"  {name}正在进行，请稍候"
+                ),
+            )
+            return False
+        if self._shutting_down or self._runtime_maintenance_active():
+            lock.release()
+            return False
+        self._backend_action_name = str(action_name or "后台操作")
+        return True
+
+    def _end_backend_action(self):
+        self._backend_action_name = ""
+        try:
+            self._backend_action_lock.release()
+        except RuntimeError:
+            pass
 
     # ══════════════════════════════════════════════════════
     # 后台启动 ComfyUI + API + Tunnel
@@ -4769,6 +4988,7 @@ class GatewayApp(WindowBase):
         """只启动 API 服务，不重启 ComfyUI。API 内部会自行启动/恢复 Tunnel。"""
         if self._shutting_down:
             return
+        self._clear_public_url()
         self._set_light("api", "loading")
         self._set_light("tunnel", "loading")
         python_exe, env = self._backend_env()
@@ -4806,45 +5026,146 @@ class GatewayApp(WindowBase):
 
     def _ensure_health_polling(self):
         """确保只有一条健康检查轮询线程在跑。"""
-        if self._health_poll_thread and self._health_poll_thread.is_alive():
-            self._poll_run = True
+        if self._shutting_down:
+            self._poll_run = False
             return
-        self._health_poll_thread = threading.Thread(target=self._poll_health, daemon=True)
-        self._health_poll_thread.start()
+        with self._health_poll_lock:
+            if (
+                self._poll_run
+                and self._health_poll_thread
+                and self._health_poll_thread.is_alive()
+            ):
+                return
+            self._health_poll_generation += 1
+            generation = self._health_poll_generation
+            self._poll_run = True
+            worker = threading.Thread(
+                target=self._poll_health,
+                args=(generation,),
+                daemon=True,
+            )
+            self._health_poll_thread = worker
+            try:
+                worker.start()
+            except Exception:
+                self._poll_run = False
+                raise
 
-    def _poll_health(self):
-        self._poll_run = True
+    def _invalidate_health_polling(self):
+        """Retire the current poll before an intentional API stop/restart."""
+        with self._health_poll_lock:
+            self._health_poll_generation += 1
+            self._poll_run = False
+
+    def _health_poll_active(self, generation: int) -> bool:
+        return (
+            not self._shutting_down
+            and self._poll_run
+            and generation == self._health_poll_generation
+        )
+
+    def _finish_health_poll(self, generation: int) -> bool:
+        """Stop only the current poll generation, never a replacement."""
+        with self._health_poll_lock:
+            if generation != self._health_poll_generation:
+                return False
+            self._poll_run = False
+            return True
+
+    def _deliver_health_snapshot(
+        self,
+        generation: int,
+        data: dict,
+        first: bool = False,
+    ):
+        """Discard a queued response if a newer poll generation replaced it."""
+        if not self._health_poll_active(generation):
+            return
+        if first:
+            self._on_first_health(data)
+        else:
+            self._on_health_update(data)
+
+    def _deliver_health_failure(self, generation: int):
+        """Apply failure only when no newer poll has already taken over."""
+        with self._health_poll_lock:
+            current_failure = (
+                generation == self._health_poll_generation
+                and not self._poll_run
+                and not self._shutting_down
+            )
+        if current_failure:
+            self._on_server_unreachable()
+
+    def _poll_health(self, generation: int | None = None):
+        if generation is None:
+            with self._health_poll_lock:
+                if self._shutting_down:
+                    self._poll_run = False
+                    return
+                self._health_poll_generation += 1
+                generation = self._health_poll_generation
+                self._poll_run = True
+        if not self._health_poll_active(generation):
+            return
         import urllib.request as ur
 
         connected = False
         for i in range(60):
-            if not self._poll_run:
+            if not self._health_poll_active(generation):
                 return
             try:
                 resp = ur.urlopen(f"{API_BASE}/health", timeout=5)
                 data = json.loads(resp.read().decode())
-                self.after(0, lambda d=data: self._on_first_health(d))
+                if not self._health_poll_active(generation):
+                    return
+                self.after(
+                    0,
+                    lambda g=generation, d=data: self._deliver_health_snapshot(
+                        g, d, first=True
+                    ),
+                )
                 connected = True
                 break
             except Exception:
                 time.sleep(1)
 
         if not connected:
-            self.after(0, self._on_server_unreachable)
+            if self._finish_health_poll(generation) and not self._shutting_down:
+                self.after(
+                    0,
+                    lambda g=generation: self._deliver_health_failure(g),
+                )
             return
 
         # 持续轮询（含进度）
-        while self._poll_run:
+        consecutive_failures = 0
+        while self._health_poll_active(generation):
             try:
                 resp = ur.urlopen(f"{API_BASE}/health", timeout=5)
                 data = json.loads(resp.read().decode())
-                self.after(0, lambda d=data: self._on_health_update(d))
+                if not self._health_poll_active(generation):
+                    return
+                consecutive_failures = 0
+                self.after(
+                    0,
+                    lambda g=generation, d=data: self._deliver_health_snapshot(g, d),
+                )
             except Exception:
-                pass
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    if self._finish_health_poll(generation) and not self._shutting_down:
+                        self.after(
+                            0,
+                            lambda g=generation: self._deliver_health_failure(g),
+                        )
+                    return
             time.sleep(3)
 
     def _on_first_health(self, data: dict):
         """首次获取健康状态"""
+        if self._shutting_down:
+            return
         self._last_health = data
         self._update_status(data)
 
@@ -4861,6 +5182,8 @@ class GatewayApp(WindowBase):
         self._refresh_saved_login_and_sync()
 
     def _on_health_update(self, data: dict):
+        if self._shutting_down:
+            return
         self._last_health = data
         self._update_status(data)
         self._update_workflow_display(data)
@@ -4883,8 +5206,14 @@ class GatewayApp(WindowBase):
             self._set_light("tunnel", "online")
         elif ts == "unavailable":
             self._set_light("tunnel", "offline", self._tunnel_error_label(tunnel_data.get("error", "")))
-        else:
+        elif ts in ("starting", "retrying"):
             self._set_light("tunnel", "loading")
+        else:
+            self._set_light("tunnel", "offline", "未连接")
+
+        if ts != "online" or not url:
+            if self._tunnel_url:
+                self._clear_public_url()
 
         cs = comfy_data.get("status", "offline")
         if cs == "online":
@@ -4900,17 +5229,22 @@ class GatewayApp(WindowBase):
             else:
                 self._set_light("comfyui", "offline" if cs == "offline" else "loading")
 
-        if url and url != self._tunnel_url:
+        if ts == "online" and url and url != self._tunnel_url:
             self._tunnel_url = url
             self._set_public_url(url)
             self._initial_session_sync_done = False
             if self._server_mode == "logged_in" and self._server_session_token and self._api_key:
                 threading.Thread(target=self._refresh_saved_login_and_sync, daemon=True).start()
 
-        parts = ["公网连接已建立" if ts == "online" else "正在准备公网连接"]
-        if ts == "unavailable":
+        if ts == "online":
+            parts = ["公网连接已建立"]
+        elif ts in ("starting", "retrying"):
+            parts = ["正在准备公网连接"]
+        elif ts == "unavailable":
             error = str(tunnel_data.get("error") or "").strip()
             parts = [f"Tunnel：{error or '连接失败'}"]
+        else:
+            parts = ["公网连接未建立"]
         self._footer_label.config(text="  " + "  ".join(parts))
 
     def _tunnel_error_label(self, error: str) -> str:
@@ -4970,8 +5304,7 @@ class GatewayApp(WindowBase):
             threading.Thread(target=self._recheck_models, daemon=True).start()
             return
         if key == "env":
-            self._set_light("env", "loading", "检测中")
-            threading.Thread(target=self._retry_env_check, daemon=True).start()
+            self._start_background_runtime_recheck()
             return
         if key == "comfyui":
             threading.Thread(target=self._retry_comfyui_service, daemon=True).start()
@@ -4988,7 +5321,7 @@ class GatewayApp(WindowBase):
                 daemon=True,
             ).start()
             return
-        threading.Thread(target=self._startup_sequence, daemon=True).start()
+        self._request_backend_start("启动后台")
 
     def _retry_env_check(self):
         if self._shutting_down or self._runtime_maintenance_active():
@@ -5034,50 +5367,84 @@ class GatewayApp(WindowBase):
         self.after(0, lambda data=result: self._finish_runtime_recheck(data))
 
     def _retry_comfyui_service(self):
-        if self._shutting_down:
+        if not self._begin_backend_action("ComfyUI 重试"):
             return
-        self.after(0, lambda: self._set_light("comfyui", "loading", "重试中"))
-        error = self._kill_proc(self._comfy_proc, "ComfyUI")
-        if error:
-            self.after(0, lambda e=error: self._set_light("comfyui", "offline", "关闭失败"))
-            self.after(0, lambda e=error: self._footer_label.config(text=f"  ComfyUI 无法重启：{e}"))
-            return
-        self._comfy_proc = None
-        self.after(0, self._start_comfyui_service)
-        self.after(200, self._ensure_health_polling)
+        try:
+            self.after(0, lambda: self._set_light("comfyui", "loading", "重试中"))
+            error = self._kill_proc(self._comfy_proc, "ComfyUI")
+            if error:
+                self.after(0, lambda e=error: self._set_light("comfyui", "offline", "关闭失败"))
+                self.after(0, lambda e=error: self._footer_label.config(text=f"  ComfyUI 无法重启：{e}"))
+                return
+            self._comfy_proc = None
+            if not self._shutting_down and not self._runtime_maintenance_active():
+                if self._run_ui_backend_step(self._start_comfyui_service):
+                    self._ensure_health_polling()
+        finally:
+            self._end_backend_action()
 
     def _retry_api_service(self):
-        if self._shutting_down:
+        if not self._begin_backend_action("API 重试"):
             return
-        self.after(0, lambda: self._set_light("api", "loading", "重试中"))
-        error = self._kill_proc(self._api_proc, "API")
-        if error:
-            self.after(0, lambda e=error: self._set_light("api", "offline", "关闭失败"))
-            self.after(0, lambda e=error: self._footer_label.config(text=f"  API 无法重启：{e}"))
-            return
-        self._api_proc = None
-        self.after(0, self._start_api_service)
-        self.after(200, self._ensure_health_polling)
+        try:
+            self.after(0, lambda: self._set_light("api", "loading", "重试中"))
+            self._invalidate_health_polling()
+            error = self._kill_proc(self._api_proc, "API")
+            if error:
+                self._ensure_health_polling()
+                self.after(0, lambda e=error: self._set_light("api", "offline", "关闭失败"))
+                self.after(0, lambda e=error: self._footer_label.config(text=f"  API 无法重启：{e}"))
+                return
+            self._api_proc = None
+            if not self._shutting_down and not self._runtime_maintenance_active():
+                if self._run_ui_backend_step(self._start_api_service):
+                    self._ensure_health_polling()
+        finally:
+            self._end_backend_action()
 
     def _retry_tunnel_service(self):
-        if self._shutting_down:
+        if not self._begin_backend_action("Tunnel 重试"):
             return
-        self.after(0, lambda: self._set_light("tunnel", "loading", "重试中"))
         try:
             import urllib.request as ur
-            req = ur.Request(f"{API_BASE}/v1/tunnel/restart", data=b"{}", method="POST")
-            ur.urlopen(req, timeout=8).read()
-            self.after(0, self._ensure_health_polling)
+
+            self.after(0, lambda: self._set_light("tunnel", "loading", "重试中"))
+            if not self._run_ui_backend_step(self._clear_public_url):
+                return
+            api_key = self._current_local_api_key()
+            if not api_key:
+                raise RuntimeError("本地 API Key 尚未生成，请先重试 API 服务")
+            req = ur.Request(
+                f"{API_BASE}/v1/tunnel/restart",
+                data=b"{}",
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            raw = ur.urlopen(req, timeout=20).read()
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(result, dict) or not result.get("ok"):
+                detail = result.get("error") if isinstance(result, dict) else ""
+                raise RuntimeError(str(detail or "Tunnel 未能开始重连"))
+            if not self._shutting_down:
+                self._ensure_health_polling()
         except Exception as exc:
-            self.after(0, lambda e=str(exc): self._set_light("tunnel", "offline", "重试失败"))
-            self.after(0, lambda e=str(exc): self._footer_label.config(text=f"  Tunnel 重试失败：{e}"))
+            if not self._shutting_down:
+                self.after(0, lambda e=str(exc): self._set_light("tunnel", "offline", "重试失败"))
+                self.after(0, lambda e=str(exc): self._footer_label.config(text=f"  Tunnel 重试失败：{e}"))
+        finally:
+            self._end_backend_action()
 
     def _on_server_unreachable(self):
+        if self._shutting_down:
+            return
         self._set_light("api", "offline")
         self._set_light("tunnel", "offline")
         self._set_light("comfyui", "offline")
         self._api_key = ""
-        self._tunnel_url = ""
+        self._clear_public_url()
         self._key_label.config(text="（无法连接）")
         self._url_label.config(text="API 服务启动失败")
         self._footer_label.config(text="服务启动失败 — 查看 runtime/logs/")
