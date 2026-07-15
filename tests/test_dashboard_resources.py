@@ -29,6 +29,18 @@ class RuntimePackageStatusTests(unittest.TestCase):
             self.assertEqual(state, "ready")
             self.assertEqual(missing, [])
 
+    def test_empty_runtime_file_is_reported_as_repair_not_fresh_install(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            target = base / REQUIRED_RUNTIME_PATHS[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+
+            state, missing = runtime_package_status(base)
+
+            self.assertEqual(state, "repair")
+            self.assertIn(REQUIRED_RUNTIME_PATHS[0].as_posix(), missing)
+
 
 if __name__ == "__main__":
     unittest.main()

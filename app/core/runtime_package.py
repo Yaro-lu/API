@@ -25,10 +25,22 @@ REQUIRED_RUNTIME_PATHS = (
 )
 
 
+def runtime_path_ready(path: Path) -> bool:
+    """Reject missing and empty core files when reporting runtime readiness."""
+    try:
+        return Path(path).is_file() and Path(path).stat().st_size > 0
+    except OSError:
+        return False
+
+
 def missing_runtime_paths(base_dir: Path) -> list[str]:
     """Return required package paths missing below ``base_dir``."""
     base_dir = Path(base_dir)
-    return [path.as_posix() for path in REQUIRED_RUNTIME_PATHS if not (base_dir / path).is_file()]
+    return [
+        path.as_posix()
+        for path in REQUIRED_RUNTIME_PATHS
+        if not runtime_path_ready(base_dir / path)
+    ]
 
 
 def _normalise_member(name: str) -> str:

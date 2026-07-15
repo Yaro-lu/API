@@ -46,6 +46,13 @@ from app.core.runtime_package import (
     verify_sha256,
 )
 from app.core.process_supervisor import ProcessSupervisor
+from app.core.model_maintenance import (
+    MODEL_REQUIREMENTS,
+    check_model_groups,
+    cleanup_incomplete_imports,
+    import_model_directory,
+    model_file_ready,
+)
 from app.core.runtime_state import RuntimeState
 from app.gui.dashboard_pages import StaticDashboardPages
 
@@ -115,55 +122,6 @@ COMFY_PORT = 8188
 API_BASE = f"http://127.0.0.1:{API_PORT}"
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
 SERVER_SYNC_MAX_RETRIES = 3
-MODEL_REQUIREMENTS = {
-    "Qwen3.5": {
-        "title": "Qwen3.5 文字模型",
-        "items": [
-            {
-                "path": "text_encoders/qwen3.5_4b_bf16.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/text_encoders/qwen3.5_4b_bf16.safetensors",
-            },
-        ],
-    },
-    "Flux2": {
-        "title": "Flux2 图片模型",
-        "items": [
-            {
-                "path": "diffusion_models/flux-2-klein-9b-fp8.safetensors",
-                "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors",
-            },
-            {
-                "path": "text_encoders/qwen_3_8b_fp8mixed.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
-            },
-            {
-                "path": "vae/full_encoder_small_decoder.safetensors",
-                "url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors",
-            },
-        ],
-    },
-    "Wan2.1": {
-        "title": "Wan2.1 视频模型",
-        "items": [
-            {
-                "path": "diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
-            },
-            {
-                "path": "vae/wan_2.1_vae.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
-            },
-            {
-                "path": "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-            },
-            {
-                "path": "clip_vision/clip_vision_h.safetensors",
-                "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors",
-            },
-        ],
-    },
-}
 
 
 # ══════════════════════════════════════════════════════
@@ -283,57 +241,18 @@ def _runtime_has_package_files() -> bool:
     return any((BASE_DIR / path).is_file() for path in REQUIRED_RUNTIME_PATHS)
 
 
-def _model_file_ready(path: Path) -> bool:
-    """Reject missing and empty placeholders when reporting model readiness."""
-    try:
-        path = Path(path)
-        return path.is_file() and path.stat().st_size > 0
-    except OSError:
-        return False
+def _model_file_ready(path: Path, expected_size: int | None = None) -> bool:
+    """Compatibility wrapper around the shared model validator."""
+    return model_file_ready(path, expected_size)
 
 
 def _check_models_status() -> dict:
     """Check every model group used by the bundled workflows."""
-    result = {
-        "Qwen3.5": "缺失",
-        "Flux2": "缺失",
-        "Wan2.1": "缺失",
-        "all_ok": False,
-        "missing": {"Qwen3.5": [], "Flux2": [], "Wan2.1": []},
-    }
-    models_dir = BASE_DIR / "models"
+    return check_model_groups(BASE_DIR / "models", MODEL_REQUIREMENTS)
 
-    qwen_files = ["text_encoders/qwen3.5_4b_bf16.safetensors"]
-    qwen_missing = [Path(f).name for f in qwen_files if not _model_file_ready(models_dir / f)]
-    qwen_ok = not qwen_missing
-    result["Qwen3.5"] = "完整" if qwen_ok else "缺失"
-    result["missing"]["Qwen3.5"] = qwen_missing
 
-    # Flux2 检查
-    flux_files = [
-        "diffusion_models/flux-2-klein-9b-fp8.safetensors",
-        "text_encoders/qwen_3_8b_fp8mixed.safetensors",
-        "vae/full_encoder_small_decoder.safetensors",
-    ]
-    flux_missing = [Path(f).name for f in flux_files if not _model_file_ready(models_dir / f)]
-    flux_ok = not flux_missing
-    result["Flux2"] = "完整" if flux_ok else "缺失"
-    result["missing"]["Flux2"] = flux_missing
-
-    # Wan2.1 检查
-    wan_files = [
-        "diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
-        "vae/wan_2.1_vae.safetensors",
-        "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-        "clip_vision/clip_vision_h.safetensors",
-    ]
-    wan_missing = [Path(f).name for f in wan_files if not _model_file_ready(models_dir / f)]
-    wan_ok = not wan_missing
-    result["Wan2.1"] = "完整" if wan_ok else "缺失"
-    result["missing"]["Wan2.1"] = wan_missing
-
-    result["all_ok"] = qwen_ok and flux_ok and wan_ok
-    return result
+def _model_download_active(control: dict) -> bool:
+    return str(control.get("state") or "") in {"downloading", "resuming", "abandoning"}
 
 
 def _check_torch(python_path: Path, run_command=subprocess.run) -> dict:
@@ -499,6 +418,8 @@ class GatewayApp(WindowBase):
         self._process_supervisor = ProcessSupervisor(BASE_DIR)
         self._runtime_maintenance_lock = threading.RLock()
         self._runtime_maintenance_in_progress = False
+        self._model_transfer_lock = threading.RLock()
+        self._active_model_transfers = {}
         self._tunnel_url = ""
         self._api_key = ""
         self._poll_run = False
@@ -519,6 +440,7 @@ class GatewayApp(WindowBase):
         self._login_prompt_shown = False
         self._login_popup = None
         self._runtime_maintenance_popup = None
+        self._model_import_in_progress = False
         self._account_status_text = ""
         self._initial_session_sync_done = False
         self._comfy_starting_until = 0
@@ -538,6 +460,7 @@ class GatewayApp(WindowBase):
         self._tray_thread = None
 
         # 状态缓存
+        cleanup_incomplete_imports(BASE_DIR / "models")
         self._model_status = _check_models_status()
         self._environment_status = {}
         self._current_task_text = "无任务"
@@ -845,54 +768,62 @@ class GatewayApp(WindowBase):
         """主启动序列（后台线程）"""
         if self._shutting_down or self._runtime_maintenance_active():
             return
-        # 1. GUI 已启动
 
-        # 2. 检查系统环境
-        self.after(0, lambda: self._set_light("env", "loading"))
-        env = _check_system_env(
+        # Check the package first so first-time users land in the single
+        # environment maintenance center instead of the legacy install page.
+        missing = missing_runtime_paths(BASE_DIR)
+        if missing:
+            result = {
+                "package_ready": False,
+                "ready": False,
+                "missing": missing,
+                "gpu_name": "",
+                "message": f"运行环境不完整，缺少 {len(missing)} 项",
+            }
+            self.after(0, lambda data=result: self._finish_runtime_recheck(data))
+            self.after(0, self._open_runtime_maintenance)
+            return
+
+        self.after(0, lambda: self._set_light("env", "loading", "检查中"))
+        system_info = _check_system_env(
             lambda args, **kwargs: self._run_runtime_probe(
                 "environment-check", args, **kwargs
             )
         )
         if self._shutting_down or self._runtime_maintenance_active():
             return
-        time.sleep(0.3)
-        if env.get("success"):
-            self.after(0, lambda: self._set_light("env", "online", f"已安装 ({env.get('gpu_name','')})"))
-        else:
-            self.after(0, lambda: self._set_light("env", "offline", "异常"))
-            print(f"[Startup] 系统环境异常: {env.get('error')}")
 
-        # 3-4. 检查 runtime
-        runtime_ok = _check_runtime_exists()
-        if not runtime_ok:
-            self.after(0, self._show_runtime_missing)
-            self.after(0, lambda: self._set_light("env", "offline", "未安装"))
-            return
-
-        self.after(0, lambda: self._set_light("env", "online", "已安装"))
-
-        # 5. 检查 PyTorch / CUDA
         python_exe = BASE_DIR / "runtime" / "python" / "python.exe"
-        torch_ok = False
-        if python_exe.exists():
-            torch_info = _check_torch(
-                python_exe,
-                lambda args, **kwargs: self._run_runtime_probe(
-                    "torch-check", args, **kwargs
-                ),
-            )
-            if self._shutting_down or self._runtime_maintenance_active():
-                return
-            torch_ok = torch_info.get("success", False)
-            if not torch_ok:
-                print(f"[Startup] PyTorch 异常: {torch_info.get('error')}")
-        else:
-            print("[Startup] runtime/python 缺失")
-            self.after(0, self._show_runtime_missing)
+        torch_info = _check_torch(
+            python_exe,
+            lambda args, **kwargs: self._run_runtime_probe(
+                "torch-check", args, **kwargs
+            ),
+        )
+        if self._shutting_down or self._runtime_maintenance_active():
             return
 
-        # 6. 检查模型
+        environment_ready = bool(system_info.get("success") and torch_info.get("success"))
+        if not system_info.get("success"):
+            message = str(system_info.get("error") or "NVIDIA 显卡环境检查未通过")
+            print(f"[Startup] 系统环境异常: {message}")
+        elif not torch_info.get("success"):
+            message = str(torch_info.get("error") or "PyTorch / CUDA 检查未通过")
+            print(f"[Startup] PyTorch 异常: {message}")
+        else:
+            message = ""
+        environment_result = {
+            "package_ready": True,
+            "ready": environment_ready,
+            "missing": [],
+            "gpu_name": str(torch_info.get("gpu_name") or system_info.get("gpu_name") or ""),
+            "message": message,
+        }
+        self.after(0, lambda data=environment_result: self._finish_runtime_recheck(data))
+
+        if self._shutting_down or self._runtime_maintenance_active():
+            return
+
         self.after(0, lambda: self._set_light("models", "loading"))
         self._model_status = _check_models_status()
         if self._model_status["all_ok"]:
@@ -904,9 +835,15 @@ class GatewayApp(WindowBase):
         # 确保模型路径配置
         _ensure_extra_model_paths()
 
-        # 7-11. 启动服务
-        if not self._runtime_maintenance_active():
+        if environment_ready and not self._runtime_maintenance_active():
             self.after(0, self._start_backend)
+        elif not environment_ready:
+            def mark_backend_blocked():
+                if self._shutting_down:
+                    return
+                for key in ("comfyui", "api", "tunnel"):
+                    self._set_light(key, "offline", "等待环境修复")
+            self.after(0, mark_backend_blocked)
 
     # ══════════════════════════════════════════════════════
     # 应用外壳：侧栏 + 页面容器
@@ -2047,7 +1984,7 @@ class GatewayApp(WindowBase):
         models_dir = BASE_DIR / "models"
         for item in spec.get("items", []):
             rel_path = item.get("path", "")
-            if rel_path and not _model_file_ready(models_dir / rel_path):
+            if rel_path and not _model_file_ready(models_dir / rel_path, item.get("size_bytes")):
                 items.append(item)
         return items
 
@@ -2087,6 +2024,7 @@ class GatewayApp(WindowBase):
             canvas.bind("<Configure>", lambda event: canvas.itemconfig(canvas_window, width=event.width))
 
         download_controls = []
+        abandon_started = False
         if not missing:
             empty = self._card(rows)
             empty.pack(fill="x", pady=(0, 10))
@@ -2095,19 +2033,59 @@ class GatewayApp(WindowBase):
             control = self._build_model_download_row(rows, model_key, item, index)
             download_controls.append(control)
 
+        def abandon_paused_and_close():
+            nonlocal abandon_started
+            paused = [control for control in download_controls if control.get("state") == "paused"]
+            if not paused:
+                if not any(control.get("state") == "abandoning" for control in download_controls):
+                    popup.destroy()
+                return
+            if abandon_started:
+                return
+            abandon_started = True
+            try:
+                popup.grab_release()
+            except Exception:
+                pass
+            popup.withdraw()
+            remaining = {id(control) for control in paused}
+
+            def one_finished(control):
+                remaining.discard(id(control))
+                if not remaining:
+                    try:
+                        popup.destroy()
+                    except Exception:
+                        pass
+
+            for control in paused:
+                self._abandon_paused_model_download(
+                    control,
+                    lambda item=control: one_finished(item),
+                )
+
         def cleanup_hidden_popup():
             try:
                 if not popup.winfo_exists():
                     return
-                if any(control.get("state") == "downloading" for control in download_controls):
+                if any(
+                    control.get("state") in {"downloading", "resuming"}
+                    for control in download_controls
+                ):
                     popup.after(600, cleanup_hidden_popup)
+                    return
+                if any(control.get("state") in {"paused", "abandoning"} for control in download_controls):
+                    abandon_paused_and_close()
                     return
                 popup.destroy()
             except Exception:
                 pass
 
         def close_popup():
-            if any(control.get("state") == "downloading" for control in download_controls):
+            if any(
+                control.get("state") in {"downloading", "resuming"}
+                for control in download_controls
+            ):
                 try:
                     popup.grab_release()
                 except Exception:
@@ -2115,6 +2093,9 @@ class GatewayApp(WindowBase):
                 popup.withdraw()
                 self._footer_label.config(text="  模型继续在后台下载，完成后会自动重新检查")
                 popup.after(600, cleanup_hidden_popup)
+                return
+            if any(control.get("state") in {"paused", "abandoning"} for control in download_controls):
+                abandon_paused_and_close()
                 return
             popup.destroy()
 
@@ -2195,28 +2176,124 @@ class GatewayApp(WindowBase):
         button.pack(side="left")
         control["button"] = button
         control["pause_button"] = pause_button
+        if self._model_transfer_active(target):
+            control["state"] = "attached"
+            control["status_var"].set("此模型已在另一个窗口后台下载")
+            button.configure(state="disabled", text="后台下载中")
+            pause_button.configure(state="disabled")
         return control
 
-    def _start_model_download(self, control: dict):
-        if control.get("state") == "downloading":
+    def _model_transfer_key(self, target: Path) -> str:
+        try:
+            return os.path.normcase(str(Path(target).resolve()))
+        except OSError:
+            return os.path.normcase(str(Path(target).absolute()))
+
+    def _model_transfer_state(self):
+        lock = self.__dict__.get("_model_transfer_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__["_model_transfer_lock"] = lock
+        transfers = self.__dict__.setdefault("_active_model_transfers", {})
+        return lock, transfers
+
+    def _model_transfer_active(self, target: Path) -> bool:
+        lock, transfers = self._model_transfer_state()
+        with lock:
+            return self._model_transfer_key(target) in transfers
+
+    def _claim_model_transfer(self, control: dict) -> bool:
+        lock, transfers = self._model_transfer_state()
+        key = self._model_transfer_key(control["target"])
+        with lock:
+            if self.__dict__.get("_model_import_in_progress", False):
+                return False
+            owner = transfers.get(key)
+            if owner is not None and owner is not control:
+                return False
+            transfers[key] = control
+            return True
+
+    def _release_model_transfer(self, control: dict):
+        target = control.get("target")
+        if target is None:
             return
-        if control.get("state") == "paused":
-            pause_event = control.get("pause_event")
-            if pause_event:
-                pause_event.clear()
-            control["state"] = "downloading"
+        lock, transfers = self._model_transfer_state()
+        key = self._model_transfer_key(target)
+        with lock:
+            if transfers.get(key) is control:
+                transfers.pop(key, None)
+
+    def _abandon_paused_model_download(self, control: dict, on_done=None):
+        """Release a paused target only after its writer thread has exited."""
+        if control.get("state") != "paused":
+            if control.get("state") != "abandoning" and on_done:
+                on_done()
+            return
+        control["state"] = "abandoning"
+        control["status_var"].set("正在安全结束暂停任务...")
+        button = control.get("button")
+        pause_button = control.get("pause_button")
+        if button:
+            button.configure(state="disabled", text="结束中")
+        if pause_button:
+            pause_button.configure(state="disabled")
+        worker = control.get("worker")
+
+        def wait_for_writer():
+            try:
+                if worker and worker.is_alive():
+                    worker.join()
+            finally:
+                def finish_abandon():
+                    self._release_model_transfer(control)
+                    if control.get("state") == "abandoning":
+                        control["state"] = "abandoned"
+                    if on_done:
+                        on_done()
+
+                if self._shutting_down:
+                    self._release_model_transfer(control)
+                else:
+                    self.after(0, finish_abandon)
+
+        threading.Thread(target=wait_for_writer, daemon=True).start()
+
+    def _has_active_model_transfers(self) -> bool:
+        lock, transfers = self._model_transfer_state()
+        with lock:
+            return bool(transfers)
+
+    def _start_model_download(self, control: dict):
+        if control.get("state") in {"downloading", "resuming", "abandoning", "attached"}:
+            return
+        if not self._claim_model_transfer(control):
+            control["status_var"].set("另一个模型维护任务正在运行，请稍候")
             button = control.get("button")
             pause_button = control.get("pause_button")
             if button:
-                button.configure(state="disabled", text="下载中")
+                button.configure(state="normal", text="稍后重试")
             if pause_button:
-                pause_button.configure(state="normal", text="暂停")
-            control["status_var"].set("继续下载...")
-            worker = control.get("worker")
-            if not worker or not worker.is_alive():
-                worker = threading.Thread(target=lambda: self._download_model_file(control), daemon=True)
-                control["worker"] = worker
-                worker.start()
+                pause_button.configure(state="disabled")
+            return
+        if control.get("state") == "paused":
+            control["state"] = "resuming"
+            button = control.get("button")
+            pause_button = control.get("pause_button")
+            if button:
+                button.configure(state="disabled", text="恢复中")
+            if pause_button:
+                pause_button.configure(state="disabled", text="暂停")
+            control["status_var"].set("正在安全恢复下载...")
+            previous_worker = control.get("worker")
+
+            def wait_then_resume():
+                if previous_worker and previous_worker.is_alive():
+                    previous_worker.join()
+                if not self._shutting_down:
+                    self.after(0, lambda: self._resume_model_download(control))
+
+            threading.Thread(target=wait_then_resume, daemon=True).start()
             return
         control["state"] = "downloading"
         pause_event = control.get("pause_event")
@@ -2232,6 +2309,25 @@ class GatewayApp(WindowBase):
         if pause_button:
             pause_button.configure(state="normal", text="暂停")
         control["status_var"].set("准备下载...")
+        worker = threading.Thread(target=lambda: self._download_model_file(control), daemon=True)
+        control["worker"] = worker
+        worker.start()
+
+    def _resume_model_download(self, control: dict):
+        """Start a fresh worker only after the paused worker has fully exited."""
+        if self._shutting_down or control.get("state") != "resuming":
+            return
+        pause_event = control.get("pause_event")
+        if pause_event:
+            pause_event.clear()
+        control["state"] = "downloading"
+        button = control.get("button")
+        pause_button = control.get("pause_button")
+        if button:
+            button.configure(state="disabled", text="下载中")
+        if pause_button:
+            pause_button.configure(state="normal", text="暂停")
+        control["status_var"].set("继续下载...")
         worker = threading.Thread(target=lambda: self._download_model_file(control), daemon=True)
         control["worker"] = worker
         worker.start()
@@ -2256,9 +2352,69 @@ class GatewayApp(WindowBase):
         url = control["url"]
         target: Path = control["target"]
         part_path = target.with_suffix(target.suffix + ".part")
+        meta_path = part_path.with_suffix(part_path.suffix + ".json")
+        expected_size = int((control.get("item") or {}).get("size_bytes") or 0)
         max_retries = 3
+
+        def discard_partial():
+            part_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+
+        def load_resume_metadata() -> dict:
+            if not part_path.is_file() or not meta_path.is_file():
+                return {}
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            if not isinstance(data, dict):
+                return {}
+            try:
+                valid = (
+                    str(data.get("url") or "") == url
+                    and int(data.get("expected_size") or 0) == expected_size
+                    and bool(str(data.get("validator") or "").strip())
+                )
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                return {}
+            return data
+
+        def response_validator(headers) -> str:
+            etag = str(headers.get("ETag") or "").strip()
+            if etag and not etag.startswith("W/"):
+                return etag
+            return str(headers.get("Last-Modified") or "").strip()
+
+        def save_resume_metadata(validator: str):
+            if not validator:
+                meta_path.unlink(missing_ok=True)
+                return
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "url": url,
+                        "expected_size": expected_size,
+                        "validator": validator,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
+            resume_metadata = load_resume_metadata()
+            if part_path.exists() and not resume_metadata:
+                discard_partial()
+            if expected_size and resume_metadata and model_file_ready(part_path, expected_size):
+                os.replace(part_path, target)
+                meta_path.unlink(missing_ok=True)
+                self.after(0, lambda: self._finish_model_download(control))
+                return
+            if expected_size and part_path.exists() and part_path.stat().st_size > expected_size:
+                discard_partial()
             attempt = 0
             while True:
                 pause_event = control.get("pause_event")
@@ -2266,19 +2422,54 @@ class GatewayApp(WindowBase):
                     self.after(0, lambda: control["status_var"].set("已暂停，点击继续可断点续传"))
                     return
 
+                resume_metadata = load_resume_metadata()
+                if part_path.exists() and not resume_metadata:
+                    discard_partial()
                 resume_from = part_path.stat().st_size if part_path.exists() else 0
                 headers = {"User-Agent": "lingjing-model-downloader/1.0"}
                 if resume_from:
                     headers["Range"] = f"bytes={resume_from}-"
+                    headers["If-Range"] = str(resume_metadata["validator"])
                 req = ur.Request(url, headers=headers)
                 try:
                     with ur.urlopen(req, timeout=30) as resp:
-                        status_code = getattr(resp, "status", 200)
+                        status_code = int(getattr(resp, "status", 200) or 200)
+                        validator = response_validator(resp.headers)
                         if resume_from and status_code == 200:
+                            discard_partial()
                             resume_from = 0
-                            part_path.write_bytes(b"")
                         content_length = int(resp.headers.get("Content-Length") or 0)
-                        total = resume_from + content_length if content_length else 0
+                        if status_code == 206:
+                            content_range = str(resp.headers.get("Content-Range") or "").strip()
+                            match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range)
+                            if not resume_from or not match:
+                                discard_partial()
+                                raise IOError("服务器返回了无效的断点续传范围")
+                            start, end = int(match.group(1)), int(match.group(2))
+                            total_value = match.group(3)
+                            if start != resume_from or end < start:
+                                discard_partial()
+                                raise IOError("服务器返回的断点位置与本地文件不一致")
+                            if content_length and content_length != end - start + 1:
+                                discard_partial()
+                                raise IOError("服务器返回的分段长度无效")
+                            if expected_size and (
+                                total_value == "*" or int(total_value) != expected_size
+                            ):
+                                discard_partial()
+                                raise IOError("服务器返回的模型总大小与清单不一致")
+                            if validator and validator != str(resume_metadata.get("validator") or ""):
+                                discard_partial()
+                                raise IOError("下载源文件已发生变化，正在重新下载")
+                            total = int(total_value) if total_value != "*" else 0
+                        else:
+                            if expected_size and content_length and content_length != expected_size:
+                                discard_partial()
+                                raise IOError(
+                                    f"模型文件大小不匹配（应为 {expected_size} 字节，服务器返回 {content_length} 字节）"
+                                )
+                            total = content_length
+                            save_resume_metadata(validator)
                         done = resume_from
                         mode = "ab" if resume_from else "wb"
                         with open(part_path, mode) as f:
@@ -2297,6 +2488,14 @@ class GatewayApp(WindowBase):
                                     self.after(0, lambda p=percent, d=done, t=total: self._update_model_download_progress(control, p, d, t))
                                 else:
                                     self.after(0, lambda d=done: control["status_var"].set(f"已下载 {d / 1024 / 1024:.1f} MB"))
+                        if total and done != total:
+                            raise IOError(f"下载不完整（应接收 {total} 字节，实际 {done} 字节）")
+                        if expected_size and done != expected_size:
+                            if status_code == 200 or done > expected_size:
+                                discard_partial()
+                            raise IOError(
+                                f"模型文件大小不匹配（应为 {expected_size} 字节，实际 {done} 字节）"
+                            )
                     break
                 except Exception:
                     attempt += 1
@@ -2304,9 +2503,10 @@ class GatewayApp(WindowBase):
                         raise
                     self.after(0, lambda n=attempt: control["status_var"].set(f"网络中断，正在重连 {n}/{max_retries}..."))
                     time.sleep(min(2 * attempt, 6))
-            if target.exists():
-                target.unlink()
-            part_path.replace(target)
+            if not model_file_ready(part_path, expected_size or None):
+                raise IOError("模型文件校验未通过，已保留断点文件")
+            os.replace(part_path, target)
+            meta_path.unlink(missing_ok=True)
             self.after(0, lambda: self._finish_model_download(control))
         except Exception as exc:
             self.after(0, lambda e=str(exc): self._fail_model_download(control, e))
@@ -2316,6 +2516,7 @@ class GatewayApp(WindowBase):
         control["status_var"].set(f"{percent:.0f}%  {done / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB")
 
     def _finish_model_download(self, control: dict):
+        self._release_model_transfer(control)
         control["state"] = "done"
         control["progress_var"].set(100)
         control["status_var"].set("下载完成，已放入模型目录")
@@ -2329,6 +2530,7 @@ class GatewayApp(WindowBase):
         threading.Thread(target=self._recheck_models, daemon=True).start()
 
     def _fail_model_download(self, control: dict, error: str):
+        self._release_model_transfer(control)
         control["state"] = "failed"
         control["status_var"].set(f"下载失败，已保留断点：{error}")
         button = control.get("button")
@@ -3418,8 +3620,12 @@ class GatewayApp(WindowBase):
         lock = self.__dict__.get("_runtime_maintenance_lock")
         if lock is None:
             return bool(self.__dict__.get("_runtime_maintenance_in_progress", False))
-        with lock:
+        if not lock.acquire(blocking=False):
+            return True
+        try:
             return bool(self._runtime_maintenance_in_progress)
+        finally:
+            lock.release()
 
     def _begin_runtime_maintenance(self) -> tuple[bool, set[str], str]:
         """Reserve runtime replacement and stop services without a launch race."""
@@ -3434,7 +3640,13 @@ class GatewayApp(WindowBase):
                 for role in ("comfyui", "api")
                 if self._process_supervisor.is_running(role)
             }
-            return True, running_before, self._stop_runtime_for_maintenance()
+        try:
+            error = self._stop_runtime_for_maintenance()
+        except Exception as exc:
+            with self._runtime_maintenance_lock:
+                self._runtime_maintenance_in_progress = False
+            return False, running_before, f"停止后台服务失败：{exc}"
+        return True, running_before, error
 
     def _end_runtime_maintenance(self, restart: bool):
         """Release the maintenance guard and optionally restore backend services."""
@@ -3458,6 +3670,12 @@ class GatewayApp(WindowBase):
             self._comfy_proc = None
         if not self._process_supervisor.is_running("api"):
             self._api_proc = None
+        for name, port in (("ComfyUI", COMFY_PORT), ("API", API_PORT)):
+            port_ready, port_error = self._process_supervisor.prepare_port(port)
+            if not port_ready:
+                errors.append(
+                    f"{name} 仍被其他程序占用：{port_error}。请先手动关闭该程序"
+                )
         return "；".join(errors)
 
     def _open_install_guide(self):
@@ -4336,29 +4554,94 @@ class GatewayApp(WindowBase):
         self._button(footer, "关闭", close_popup, "plain", width=72).pack(side="right")
 
     def _import_models(self):
+        if self._model_import_in_progress:
+            self._footer_label.config(text="  已有模型导入任务正在运行，请稍候")
+            return
+        if self._has_active_model_transfers():
+            self._footer_label.config(text="  模型正在下载，完成后再导入已有模型")
+            messagebox.showinfo(
+                "模型下载进行中",
+                "请等待当前模型下载完成后再导入，避免两个任务同时写入同一个模型文件。",
+                parent=self,
+            )
+            return
         path = filedialog.askdirectory(title="选择模型目录")
         if not path:
             return
         src = Path(path)
         models_dir = BASE_DIR / "models"
+        transfer_lock, transfers = self._model_transfer_state()
+        with transfer_lock:
+            if transfers or self._model_import_in_progress:
+                self._footer_label.config(text="  另一个模型维护任务已开始，请稍候")
+                return
+            self._model_import_in_progress = True
 
-        # 复制模型文件
+        def report_progress(index: int, total: int, filename: str):
+            if not self._shutting_down:
+                self.after(
+                    0,
+                    lambda: self._footer_label.config(
+                        text=f"  正在导入模型 {index}/{total}：{filename}"
+                    ),
+                )
+
+        def finish(result: dict):
+            with self._model_transfer_state()[0]:
+                self._model_import_in_progress = False
+            if self._shutting_down:
+                return
+            self._model_status = _check_models_status()
+            self._set_light(
+                "models",
+                "online" if self._model_status.get("all_ok") else "offline",
+                "完整" if self._model_status.get("all_ok") else "缺失",
+            )
+            self._update_model_display()
+            if hasattr(self, "_dashboard_pages"):
+                self._dashboard_pages.refresh(self._last_health)
+
+            summary = (
+                f"已导入 {result.get('imported', 0)} 个，"
+                f"跳过 {result.get('skipped', 0)} 个，失败 {result.get('failed', 0)} 个"
+            )
+            if not result.get("found"):
+                self._footer_label.config(text="  未找到支持的模型文件")
+                messagebox.showwarning(
+                    "未找到模型",
+                    "所选目录中没有找到 safetensors、GGUF、PT、PTH、BIN 或 CKPT 模型文件。",
+                    parent=self,
+                )
+            elif result.get("failed"):
+                self._footer_label.config(text=f"  模型导入完成：{summary}")
+                detail = "\n".join((result.get("errors") or [])[:5])
+                messagebox.showwarning(
+                    "部分模型导入失败",
+                    f"{summary}\n\n{detail}",
+                    parent=self,
+                )
+            else:
+                self._footer_label.config(text=f"  模型导入完成：{summary}")
+
+        def fail(message: str):
+            with self._model_transfer_state()[0]:
+                self._model_import_in_progress = False
+            if self._shutting_down:
+                return
+            self._footer_label.config(text=f"  模型导入失败：{message}")
+            messagebox.showerror("模型导入失败", message, parent=self)
+
         def _do_copy():
-            count = 0
-            for ext in ["*.safetensors", "*.pt", "*.pth", "*.bin", "*.ckpt"]:
-                for f in src.rglob(ext):
-                    rel = f.relative_to(src)
-                    dest = models_dir / rel
-                    if not dest.exists():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        import shutil
-                        shutil.copy2(f, dest)
-                        count += 1
-            self.after(0, lambda: self._footer_label.config(text=f"  已导入 {count} 个模型文件"))
-            # 重新检查模型状态
-            self.after(500, lambda: threading.Thread(target=self._recheck_models, daemon=True).start())
+            try:
+                result = import_model_directory(src, models_dir, on_progress=report_progress)
+            except Exception as exc:
+                if not self._shutting_down:
+                    self.after(0, lambda error=str(exc): fail(error))
+                return
+            if not self._shutting_down:
+                self.after(0, lambda data=result: finish(data))
 
-        self._footer_label.config(text="  正在导入模型...")
+        self._footer_label.config(text="  正在扫描并导入模型...")
         threading.Thread(target=_do_copy, daemon=True).start()
 
     def _recheck_models(self):

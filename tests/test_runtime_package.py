@@ -30,8 +30,21 @@ class RuntimePackageContractTests(unittest.TestCase):
             for relative in REQUIRED_RUNTIME_PATHS[:-1]:
                 target = base / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.touch()
+                target.write_bytes(b"fixture")
             self.assertEqual(missing_runtime_paths(base), ["bin/cloudflared.exe"])
+
+    def test_runtime_layout_rejects_empty_core_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for relative in REQUIRED_RUNTIME_PATHS:
+                target = base / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
+
+            self.assertEqual(
+                set(missing_runtime_paths(base)),
+                {path.as_posix() for path in REQUIRED_RUNTIME_PATHS},
+            )
 
     def test_archive_rejects_traversal_and_project_or_user_data(self):
         members = [

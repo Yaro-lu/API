@@ -31,6 +31,8 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from app.config import Config
+from app.core.model_maintenance import MODEL_REQUIREMENTS, check_model_groups
+from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths
 from app.core.runtime_state import RuntimeState
 from app.workflow_registry import WorkflowRegistry
 from app.tunnel.cloudflared_manager import CloudflaredManager
@@ -211,24 +213,29 @@ def _model_group_for_type(model_type: str) -> str:
     return "image"
 
 
-def _local_model_status() -> dict:
-    models_dir = BASE_DIR / "models"
-    qwen_files = ["text_encoders/qwen3.5_4b_bf16.safetensors"]
-    flux_files = [
-        "diffusion_models/flux-2-klein-9b-fp8.safetensors",
-        "text_encoders/qwen_3_8b_fp8mixed.safetensors",
-        "vae/full_encoder_small_decoder.safetensors",
-    ]
-    wan_files = [
-        "diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
-        "vae/wan_2.1_vae.safetensors",
-        "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-        "clip_vision/clip_vision_h.safetensors",
-    ]
+def _local_model_status(base_dir: Path | None = None, requirements: dict | None = None) -> dict:
+    groups = check_model_groups(
+        Path(base_dir or BASE_DIR) / "models",
+        requirements or MODEL_REQUIREMENTS,
+    )
     return {
-        "qwen35": all((models_dir / f).exists() for f in qwen_files),
-        "flux2": all((models_dir / f).exists() for f in flux_files),
-        "wan21": all((models_dir / f).exists() for f in wan_files),
+        "qwen35": groups.get("Qwen3.5") == "完整",
+        "flux2": groups.get("Flux2") == "完整",
+        "wan21": groups.get("Wan2.1") == "完整",
+    }
+
+
+def _local_runtime_status(base_dir: Path | None = None) -> dict:
+    base_dir = Path(base_dir or BASE_DIR)
+    missing = missing_runtime_paths(base_dir)
+    missing_set = set(missing)
+    python_path = REQUIRED_RUNTIME_PATHS[0].as_posix()
+    comfyui_path = REQUIRED_RUNTIME_PATHS[1].as_posix()
+    return {
+        "status": "installed" if not missing else "missing",
+        "python": python_path not in missing_set,
+        "comfyui": comfyui_path not in missing_set,
+        "missing": missing,
     }
 
 
@@ -829,9 +836,7 @@ def create_app() -> FastAPI:
             pass
 
         # 运行时环境检查
-        runtime_python = BASE_DIR / "runtime" / "python" / "python.exe"
-        runtime_comfy = BASE_DIR / "runtime" / "ComfyUI" / "main.py"
-        runtime_exists = runtime_python.exists() and runtime_comfy.exists()
+        runtime_status = _local_runtime_status()
 
         # 模型完整性检查
         model_status = _local_model_status()
@@ -868,11 +873,7 @@ def create_app() -> FastAPI:
                 "url": comfyui_url,
                 "status": comfyui_status,
             },
-            "runtime": {
-                "status": "installed" if runtime_exists else "missing",
-                "python": runtime_python.exists(),
-                "comfyui": runtime_comfy.exists(),
-            },
+            "runtime": runtime_status,
             "models": {
                 "status": "complete" if models_all_ok else "incomplete",
                 "Flux2": "complete" if flux2_ok else "missing",

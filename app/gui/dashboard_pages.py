@@ -11,7 +11,10 @@ import json
 import tkinter as tk
 from pathlib import Path
 
-from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths
+from app.core.runtime_package import (
+    REQUIRED_RUNTIME_PATHS,
+    missing_runtime_paths,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
