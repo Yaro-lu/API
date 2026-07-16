@@ -23,7 +23,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from app.core.workflow_dependencies import normalize_workflow_dependencies
 from app.core.workflow_import import ensure_safe_workflows_root

@@ -1,8 +1,12 @@
+import json
+import tempfile
 import threading
 import tkinter as tk
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from app.gui import main_gateway
 from app.gui.dashboard_pages import StaticDashboardPages
 from app.gui.main_gateway import C, GatewayApp
 
@@ -197,6 +201,78 @@ class DashboardShellTests(unittest.TestCase):
 
         self.assertEqual(results, [(False, "请填写服务端地址。")])
         app._set_account_status.assert_called_once_with("请填写服务端地址", "error")
+
+    def test_login_rejects_nonlocal_plain_http_server(self):
+        app = object.__new__(GatewayApp)
+        app._server_sync_running = False
+        app._get_server_url = lambda: "http://api.example.com"
+        app._get_server_email = lambda: "user@example.com"
+        app._get_server_password = lambda: "password"
+        app._set_account_status = mock.Mock()
+        results = []
+
+        app._login_and_sync(on_result=lambda success, message: results.append((success, message)))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0][0])
+        self.assertIn("HTTPS", results[0][1])
+        app._set_account_status.assert_called_once()
+
+    def test_account_session_token_is_protected_at_rest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(main_gateway, "BASE_DIR", Path(temp_dir)):
+                app = object.__new__(GatewayApp)
+                app._server_mode = "logged_in"
+                app._server_url_value = "https://api.example.com"
+                app._server_user_email = "user@example.com"
+                app._server_session_token = "private-session-token"
+                app._server_account_profile = {}
+
+                app._save_account_session()
+                saved = json.loads(app._account_session_path().read_text(encoding="utf-8"))
+
+                self.assertNotIn("session_token", saved)
+                self.assertNotIn("private-session-token", json.dumps(saved))
+                restored = object.__new__(GatewayApp)
+                restored._server_mode = "unset"
+                restored._server_url_value = "https://ai.lol-lu.site"
+                restored._server_user_email = ""
+                restored._server_session_token = ""
+                restored._server_account_profile = {}
+                restored._load_account_session_state()
+                self.assertEqual(restored._server_session_token, "private-session-token")
+
+    def test_legacy_account_session_token_is_migrated_when_loaded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(main_gateway, "BASE_DIR", Path(temp_dir)):
+                path = Path(temp_dir) / "runtime" / "account_session.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "mode": "logged_in",
+                            "server_url": "https://api.example.com",
+                            "email": "user@example.com",
+                            "session_token": "legacy-plaintext-token",
+                            "profile": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                restored = object.__new__(GatewayApp)
+                restored._server_mode = "unset"
+                restored._server_url_value = "https://ai.lol-lu.site"
+                restored._server_user_email = ""
+                restored._server_session_token = ""
+                restored._server_account_profile = {}
+
+                restored._load_account_session_state()
+                saved = json.loads(path.read_text(encoding="utf-8"))
+
+                self.assertEqual(restored._server_session_token, "legacy-plaintext-token")
+                self.assertNotIn("session_token", saved)
+                self.assertNotIn("legacy-plaintext-token", json.dumps(saved))
+                self.assertTrue(saved["session_token_protected"].startswith("dpapi:"))
 
     def test_local_mode_does_not_start_platform_session_refresh(self):
         app = object.__new__(GatewayApp)

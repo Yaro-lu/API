@@ -1,7 +1,6 @@
 import json
 import re
 import requests
-import time
 from pathlib import Path
 from typing import Dict, Optional, Any
 import logging
@@ -16,9 +15,9 @@ class ComfyUIClient:
 
     def get_history(self, prompt_id: Optional[str] = None) -> Dict:
         if prompt_id:
-            response = requests.get(f"{self.url}/history/{prompt_id}")
+            response = requests.get(f"{self.url}/history/{prompt_id}", timeout=30)
         else:
-            response = requests.get(f"{self.url}/history")
+            response = requests.get(f"{self.url}/history", timeout=30)
         return response.json()
 
     def queue_prompt(self, workflow: Dict[str, Any]) -> str:
@@ -36,7 +35,7 @@ class ComfyUIClient:
 
     def get_queue_status(self) -> Dict:
         """获取 ComfyUI 队列状态，含当前执行进度"""
-        response = requests.get(f"{self.url}/queue")
+        response = requests.get(f"{self.url}/queue", timeout=30)
         return response.json()
 
     @staticmethod
@@ -151,15 +150,6 @@ class ComfyUIClient:
 
         return None  # 不存在
 
-    def wait_for_completion(self, prompt_id: str, timeout: int = 3600) -> Optional[Dict]:
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            history = self.get_history(prompt_id)
-            if prompt_id in history:
-                return history[prompt_id]
-            time.sleep(2)
-        return None
-
     def get_output_files(self, history_item: Dict) -> list:
         outputs = history_item.get("outputs", {})
         files = []
@@ -207,19 +197,3 @@ class ComfyUIClient:
                             "type": type_,
                         })
         return files
-
-    def execute_workflow(self, workflow: Dict[str, Any], task_id: str, logs_dir: Path) -> list:
-        workflows_log_dir = logs_dir / "workflows"
-        workflows_log_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(workflows_log_dir / f"{task_id}.json", "w", encoding="utf-8") as f:
-            json.dump(workflow, f, ensure_ascii=False, indent=2)
-
-        prompt_id = self.queue_prompt(workflow)
-        self.logger.info(f"Queued workflow with prompt_id: {prompt_id}")
-
-        history = self.wait_for_completion(prompt_id)
-        if not history:
-            raise Exception("Workflow timeout")
-
-        return self.get_output_files(history)

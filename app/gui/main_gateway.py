@@ -15,12 +15,12 @@ import json
 import os
 import re
 import shutil
-import socket
 import tempfile
 import webbrowser
 import msvcrt
 import uuid
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 try:
     import customtkinter as ctk
@@ -29,10 +29,11 @@ except Exception:
 
 BASE_DIR = Path(__file__).parent.parent.parent
 GUI_ASSET_DIR = Path(__file__).parent / "assets"
+MIN_NVIDIA_DRIVER_MAJOR = 580
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from app.core.runtime_package import (
+from app.core.runtime_package import (  # noqa: E402
     REQUIRED_RUNTIME_PATHS,
     RUNTIME_PACKAGE_NAME,
     RUNTIME_RELEASE_URL,
@@ -43,23 +44,28 @@ from app.core.runtime_package import (
     missing_archive_entries,
     missing_runtime_paths,
     parse_archive_members,
-    verify_sha256,
+    install_staged_runtime,
+    validate_staged_runtime,
+    verify_runtime_package,
 )
-from app.core.process_supervisor import ProcessSupervisor
-from app.core.model_maintenance import (
+from app.core.process_supervisor import ProcessSupervisor  # noqa: E402
+from app.core.model_maintenance import (  # noqa: E402
     MODEL_REQUIREMENTS,
     check_model_groups,
     cleanup_incomplete_imports,
     import_model_directory,
     model_file_ready,
+    model_file_sha256_matches,
+    unsafe_model_files,
 )
-from app.core.runtime_state import RuntimeState
-from app.core.workflow_dependencies import (
+from app.core.runtime_state import RuntimeState  # noqa: E402
+from app.core.secret_store import protect_text, unprotect_text  # noqa: E402
+from app.core.workflow_dependencies import (  # noqa: E402
     clear_model_index_cache,
     normalize_workflow_dependencies,
     workflow_dependency_report,
 )
-from app.core.workflow_import import (
+from app.core.workflow_import import (  # noqa: E402
     cleanup_stale_workflow_imports,
     copy_workflow_assets,
     create_import_workspace,
@@ -67,8 +73,8 @@ from app.core.workflow_import import (
     effective_workflow_root,
     extract_zip_safely,
 )
-from app.gui.dashboard_pages import StaticDashboardPages
-from app.workflow_registry import WorkflowRegistry
+from app.gui.dashboard_pages import StaticDashboardPages  # noqa: E402
+from app.workflow_registry import WorkflowRegistry  # noqa: E402
 
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
@@ -136,6 +142,7 @@ COMFY_PORT = 8188
 API_BASE = f"http://127.0.0.1:{API_PORT}"
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
 SERVER_SYNC_MAX_RETRIES = 3
+_LOOPBACK_SERVER_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 # ══════════════════════════════════════════════════════
@@ -190,14 +197,55 @@ def _comfy_vram_args():
     return []
 
 
-def _port_in_use(port: int) -> bool:
-    """检查端口是否被占用"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return False
-        except OSError:
-            return True
+def _platform_server_url_error(value: str) -> str:
+    """Return a user-facing error for unsafe platform endpoints."""
+    text = str(value or "").strip()
+    if not text:
+        return "请填写服务端地址。"
+    if any(ord(char) < 32 for char in text):
+        return "服务端地址包含无效字符。"
+    try:
+        parsed = urlsplit(text)
+        _ = parsed.port
+    except ValueError:
+        return "服务端地址格式无效。"
+    if parsed.username or parsed.password:
+        return "服务端地址不能包含账号或密码。"
+    if parsed.query or parsed.fragment:
+        return "服务端地址不能包含查询参数或片段。"
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and hostname:
+        return ""
+    if parsed.scheme == "http" and hostname in _LOOPBACK_SERVER_HOSTS:
+        return ""
+    return "正式服务端必须使用 HTTPS；HTTP 仅允许本机开发地址。"
+
+
+def _open_platform_request(request, timeout: float):
+    """Open one platform request without allowing credential-bearing redirects."""
+    import urllib.error as ue
+    import urllib.request as ur
+
+    original = urlsplit(request.full_url)
+    error = _platform_server_url_error(request.full_url)
+    if error:
+        raise ValueError(error)
+
+    def origin(parts):
+        default_port = 443 if parts.scheme == "https" else 80
+        return parts.scheme, (parts.hostname or "").lower(), parts.port or default_port
+
+    original_origin = origin(original)
+
+    class SameOriginRedirectHandler(ur.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            resolved = urljoin(req.full_url, newurl)
+            target = urlsplit(resolved)
+            if _platform_server_url_error(resolved) or origin(target) != original_origin:
+                raise ue.URLError("已阻止服务端跨域或降级重定向")
+            return super().redirect_request(req, fp, code, msg, headers, resolved)
+
+    return ur.build_opener(SameOriginRedirectHandler()).open(request, timeout=timeout)
 
 
 def _acquire_instance_lock() -> bool:
@@ -327,6 +375,19 @@ def _check_system_env(run_command=subprocess.run) -> dict:
         gpu_name = parts[0]
         driver = parts[1]
         vram_mb = int(parts[2])
+        match = re.match(r"^(\d+)", driver)
+        driver_major = int(match.group(1)) if match else 0
+        if driver_major < MIN_NVIDIA_DRIVER_MAJOR:
+            return {
+                "success": False,
+                "error": (
+                    f"NVIDIA 驱动 {driver} 过旧；CUDA 13 运行环境需要 "
+                    f"R{MIN_NVIDIA_DRIVER_MAJOR} 或更高版本"
+                ),
+                "gpu_name": gpu_name,
+                "driver_version": driver,
+                "vram_gb": vram_mb // 1024,
+            }
         return {
             "success": True,
             "gpu_name": gpu_name,
@@ -414,8 +475,36 @@ WindowBase = ctk.CTk if CTK_AVAILABLE else tk.Tk
 
 
 class GatewayApp(WindowBase):
+    def after(self, ms, func=None, *args):
+        """Ignore late worker callbacks once the Tk interpreter is closing."""
+        if getattr(self, "_tk_destroyed", False):
+            return ""
+        try:
+            return super().after(ms, func, *args)
+        except (RuntimeError, tk.TclError):
+            return ""
+
+    def destroy(self):
+        if getattr(self, "_tk_destroyed", False):
+            return
+        self._tk_destroyed = True
+        try:
+            pending = self.tk.call("after", "info")
+            for callback_id in pending:
+                try:
+                    self.after_cancel(callback_id)
+                except (RuntimeError, tk.TclError):
+                    pass
+        except (RuntimeError, tk.TclError):
+            pass
+        try:
+            return super().destroy()
+        except (RuntimeError, tk.TclError):
+            return None
+
     def __init__(self):
         super().__init__()
+        self._tk_destroyed = False
         self.title("灵镜造片厂")
         self.geometry(f"{LAYOUT['window_w']}x{LAYOUT['window_h']}")
         self.minsize(LAYOUT["min_w"], LAYOUT["min_h"])
@@ -560,9 +649,23 @@ class GatewayApp(WindowBase):
             self._server_mode = mode
             self._server_url_value = str(data.get("server_url") or self._server_url_value).strip() or self._server_url_value
             self._server_user_email = str(data.get("email") or "").strip()
-            self._server_session_token = str(data.get("session_token") or "").strip() if mode == "logged_in" else ""
+            protected_token = str(data.get("session_token_protected") or "").strip()
+            legacy_token = str(data.get("session_token") or "").strip()
+            self._server_session_token = (
+                unprotect_text(protected_token or legacy_token)
+                if mode == "logged_in"
+                else ""
+            )
+            if _platform_server_url_error(self._server_url_value):
+                self._server_mode = "guest"
+                self._server_session_token = ""
             profile = data.get("profile")
             self._server_account_profile = profile if isinstance(profile, dict) else {}
+            if "session_token" in data:
+                # Migrate legacy plaintext immediately.  Waiting for a later
+                # successful server sync can leave the token exposed forever
+                # on an offline machine.
+                self._save_account_session()
         except Exception as ex:
             print(f"[Account] load session failed: {ex}")
 
@@ -620,7 +723,11 @@ class GatewayApp(WindowBase):
                 "mode": self._server_mode,
                 "server_url": self._server_url_value,
                 "email": self._server_user_email,
-                "session_token": self._server_session_token if self._server_mode == "logged_in" else "",
+                "session_token_protected": (
+                    protect_text(self._server_session_token)
+                    if self._server_mode == "logged_in" and self._server_session_token
+                    else ""
+                ),
                 "profile": self._server_account_profile if isinstance(self._server_account_profile, dict) else {},
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
@@ -1688,7 +1795,6 @@ class GatewayApp(WindowBase):
             # 显示进度面板
             self._show_progress_panel()
 
-            status = task.get("status", "")
             wf_id = task.get("workflow_id", task.get("workflow_name", ""))
             phase = str(task.get("progress_label") or task.get("phase") or "").strip()
             prog = self._as_number(task.get("progress"), 0)
@@ -2491,6 +2597,7 @@ class GatewayApp(WindowBase):
         part_path = target.with_suffix(target.suffix + ".part")
         meta_path = part_path.with_suffix(part_path.suffix + ".json")
         expected_size = int((control.get("item") or {}).get("size_bytes") or 0)
+        expected_sha256 = str((control.get("item") or {}).get("sha256") or "").strip()
         max_retries = 3
 
         def discard_partial():
@@ -2510,6 +2617,7 @@ class GatewayApp(WindowBase):
                 valid = (
                     str(data.get("url") or "") == url
                     and int(data.get("expected_size") or 0) == expected_size
+                    and str(data.get("expected_sha256") or "") == expected_sha256
                     and bool(str(data.get("validator") or "").strip())
                 )
             except (TypeError, ValueError):
@@ -2533,6 +2641,7 @@ class GatewayApp(WindowBase):
                     {
                         "url": url,
                         "expected_size": expected_size,
+                        "expected_sha256": expected_sha256,
                         "validator": validator,
                     },
                     ensure_ascii=False,
@@ -2546,10 +2655,13 @@ class GatewayApp(WindowBase):
             if part_path.exists() and not resume_metadata:
                 discard_partial()
             if expected_size and resume_metadata and model_file_ready(part_path, expected_size):
-                os.replace(part_path, target)
-                meta_path.unlink(missing_ok=True)
-                self.after(0, lambda: self._finish_model_download(control))
-                return
+                self.after(0, lambda: control["status_var"].set("下载完成，正在校验 SHA256..."))
+                if not expected_sha256 or model_file_sha256_matches(part_path, expected_sha256):
+                    os.replace(part_path, target)
+                    meta_path.unlink(missing_ok=True)
+                    self.after(0, lambda: self._finish_model_download(control))
+                    return
+                discard_partial()
             if expected_size and part_path.exists() and part_path.stat().st_size > expected_size:
                 discard_partial()
             attempt = 0
@@ -2642,6 +2754,11 @@ class GatewayApp(WindowBase):
                     time.sleep(min(2 * attempt, 6))
             if not model_file_ready(part_path, expected_size or None):
                 raise IOError("模型文件校验未通过，已保留断点文件")
+            if expected_sha256:
+                self.after(0, lambda: control["status_var"].set("下载完成，正在校验 SHA256..."))
+                if not model_file_sha256_matches(part_path, expected_sha256):
+                    discard_partial()
+                    raise IOError("模型 SHA256 与可信清单不一致，已删除无效下载")
             os.replace(part_path, target)
             meta_path.unlink(missing_ok=True)
             self.after(0, lambda: self._finish_model_download(control))
@@ -3295,7 +3412,7 @@ class GatewayApp(WindowBase):
                 f"{API_BASE}/v1/workflows/reload",
                 data=b"{}",
                 method="POST",
-                headers=self._local_api_headers(),
+                headers=self._local_admin_headers(),
             )
             ur.urlopen(req, timeout=8).read()
         except Exception as reload_error:
@@ -3304,7 +3421,12 @@ class GatewayApp(WindowBase):
         if self._shutting_down:
             return
         try:
-            resp = ur.urlopen(f"{API_BASE}/health", timeout=8)
+            req = ur.Request(
+                f"{API_BASE}/v1/status",
+                method="GET",
+                headers=self._local_api_headers(),
+            )
+            resp = ur.urlopen(req, timeout=8)
             data = json.loads(resp.read().decode("utf-8"))
             self._post_to_ui(lambda d=data: self._on_health_update(d))
         except Exception as health_error:
@@ -3842,7 +3964,7 @@ class GatewayApp(WindowBase):
                 sidecar = Path(f"{target}.sha256")
 
                 resume_at = partial.stat().st_size if partial.exists() else 0
-                headers = {"User-Agent": "LingJing-Desktop/0.1.0"}
+                headers = {"User-Agent": "LingJing-Desktop/0.2.0"}
                 if resume_at:
                     headers["Range"] = f"bytes={resume_at}-"
                 request = ur.Request(url, headers=headers)
@@ -3871,7 +3993,7 @@ class GatewayApp(WindowBase):
 
                 self.after(0, lambda: progress_lbl.config(text="正在下载校验文件..."))
                 try:
-                    checksum_request = ur.Request(f"{url}.sha256", headers={"User-Agent": "LingJing-Desktop/0.1.0"})
+                    checksum_request = ur.Request(f"{url}.sha256", headers={"User-Agent": "LingJing-Desktop/0.2.0"})
                     with ur.urlopen(checksum_request, timeout=30) as response:
                         sidecar.write_bytes(response.read())
                 except Exception:
@@ -3943,19 +4065,22 @@ class GatewayApp(WindowBase):
         def _do_extract():
             maintenance_started = False
             running_before: set[str] = set()
+            staging_dir = BASE_DIR / f".runtime-install-staging-{uuid.uuid4().hex}"
             try:
                 package = Path(pkg_path)
                 if not package.is_file():
                     raise FileNotFoundError(f"环境包不存在: {package}")
 
                 sidecar = Path(f"{package}.sha256")
-                if sidecar.is_file():
-                    self.after(0, lambda: progress_lbl.config(text="正在校验 SHA256..."))
-                    valid, expected, actual = verify_sha256(package, sidecar)
-                    if not valid:
-                        raise RuntimeError(
-                            f"SHA256 校验失败（期望 {expected[:12]}...，实际 {actual[:12]}...）"
-                        )
+                self.after(0, lambda: progress_lbl.config(text="正在校验可信 SHA256..."))
+                valid, expected, actual = verify_runtime_package(
+                    package,
+                    sidecar if sidecar.is_file() else None,
+                )
+                if not valid:
+                    raise RuntimeError(
+                        f"SHA256 校验失败（期望 {expected[:12]}...，实际 {actual[:12]}...）"
+                    )
 
                 extractor = find_extractor(BASE_DIR)
                 if not extractor:
@@ -3982,17 +4107,11 @@ class GatewayApp(WindowBase):
                 if self._shutting_down:
                     return
 
-                self.after(0, lambda: progress_lbl.config(text="正在暂停后台服务..."))
-                maintenance_started, running_before, stop_error = self._begin_runtime_maintenance()
-                if not maintenance_started:
-                    raise RuntimeError(stop_error or "无法开始运行环境维护")
-                if stop_error:
-                    raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
-
-                self.after(0, lambda: progress_lbl.config(text="正在解压..."))
+                staging_dir.mkdir(parents=True, exist_ok=False)
+                self.after(0, lambda: progress_lbl.config(text="正在隔离解压并安全检查..."))
                 result = self._process_supervisor.run(
                     "runtime-install",
-                    archive_extract_command(extractor, package, BASE_DIR),
+                    archive_extract_command(extractor, package, staging_dir),
                     cwd=str(BASE_DIR),
                     capture_output=True,
                     text=True,
@@ -4000,10 +4119,17 @@ class GatewayApp(WindowBase):
                 )
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "环境包解压失败")
+                validate_staged_runtime(staging_dir)
 
-                missing_after_install = missing_runtime_paths(BASE_DIR)
-                if missing_after_install:
-                    raise RuntimeError(f"安装后环境仍不完整，缺少: {', '.join(missing_after_install)}")
+                self.after(0, lambda: progress_lbl.config(text="正在暂停后台服务..."))
+                maintenance_started, running_before, stop_error = self._begin_runtime_maintenance()
+                if not maintenance_started:
+                    raise RuntimeError(stop_error or "无法开始运行环境维护")
+                if stop_error:
+                    raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
+
+                self.after(0, lambda: progress_lbl.config(text="正在事务更新运行环境..."))
+                install_staged_runtime(staging_dir, BASE_DIR)
 
                 if not self._shutting_down:
                     self._end_runtime_maintenance(restart=True)
@@ -4033,6 +4159,8 @@ class GatewayApp(WindowBase):
                 if maintenance_started:
                     can_restore = bool(running_before) and _check_runtime_exists()
                     self._end_runtime_maintenance(restart=can_restore)
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
 
         threading.Thread(target=_do_extract, daemon=True).start()
 
@@ -4329,6 +4457,17 @@ class GatewayApp(WindowBase):
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    def _local_admin_headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        try:
+            admin_key = str(RuntimeState(BASE_DIR / "runtime").admin_key or "").strip()
+        except Exception as exc:
+            raise RuntimeError(f"无法读取本机管理凭据：{exc}") from exc
+        if not admin_key:
+            raise RuntimeError("本机管理凭据尚未生成，请先重启 API 服务")
+        headers["Authorization"] = f"Bearer {admin_key}"
+        return headers
+
     def _set_account_status(self, text: str, status: str = "warn"):
         color = C["success"] if status == "success" else C["error"] if status == "error" else C["warn"]
         self._account_status_text = text
@@ -4345,7 +4484,7 @@ class GatewayApp(WindowBase):
             method="GET",
             headers=self._json_headers(server_url, token),
         )
-        with ur.urlopen(req, timeout=15) as resp:
+        with _open_platform_request(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data if isinstance(data, dict) else {}
 
@@ -4511,6 +4650,12 @@ class GatewayApp(WindowBase):
             if callable(on_result):
                 on_result(False, "请填写服务端地址。")
             return
+        url_error = _platform_server_url_error(server_url)
+        if url_error:
+            self._set_account_status(url_error.rstrip("。"), "error")
+            if callable(on_result):
+                on_result(False, url_error)
+            return
         if not email or not password:
             self._set_account_status("请填写账号邮箱和密码", "error")
             if callable(on_result):
@@ -4535,7 +4680,7 @@ class GatewayApp(WindowBase):
                 method="POST",
                 headers=self._json_headers(server_url),
             )
-            with ur.urlopen(req, timeout=20) as resp:
+            with _open_platform_request(req, timeout=20) as resp:
                 login_data = json.loads(resp.read().decode("utf-8"))
             token = login_data.get("sessionToken", "")
             if not token:
@@ -4686,7 +4831,7 @@ class GatewayApp(WindowBase):
             method="POST",
             headers=self._json_headers(server_url, self._server_session_token),
         )
-        with ur.urlopen(req, timeout=20) as resp:
+        with _open_platform_request(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def _sync_to_server_with_retry(self, server_url: str = "", status: str = "", max_retries: int = SERVER_SYNC_MAX_RETRIES, takeover: bool = False):
@@ -4754,7 +4899,7 @@ class GatewayApp(WindowBase):
                 method="POST",
                 headers=self._json_headers(server_url, session_token),
             )
-            with ur.urlopen(req, timeout=5) as resp:
+            with _open_platform_request(req, timeout=5) as resp:
                 resp.read()
         except Exception as ex:
             print(f"[Account] offline notify failed: {ex}")
@@ -5087,6 +5232,21 @@ class GatewayApp(WindowBase):
         if not path:
             return
         src = Path(path)
+        unsafe_files = unsafe_model_files(src)
+        allow_unsafe = False
+        if unsafe_files:
+            examples = "\n".join(f"• {item.name}" for item in unsafe_files[:5])
+            extra = "" if len(unsafe_files) <= 5 else f"\n另有 {len(unsafe_files) - 5} 个文件"
+            allow_unsafe = messagebox.askyesno(
+                "检测到高风险模型格式",
+                "PT、PTH、BIN 和 CKPT 可能在加载时执行其中携带的代码。\n"
+                "只有在确认文件来源可信时才应继续。\n\n"
+                f"{examples}{extra}\n\n仍要导入这些文件吗？",
+                parent=self,
+            )
+            if not allow_unsafe:
+                self._footer_label.config(text="  已取消高风险模型导入")
+                return
         models_dir = BASE_DIR / "models"
         transfer_lock, transfers = self._model_transfer_state()
         with transfer_lock:
@@ -5151,7 +5311,12 @@ class GatewayApp(WindowBase):
 
         def _do_copy():
             try:
-                result = import_model_directory(src, models_dir, on_progress=report_progress)
+                result = import_model_directory(
+                    src,
+                    models_dir,
+                    on_progress=report_progress,
+                    allow_unsafe=allow_unsafe,
+                )
             except Exception as exc:
                 if not self._shutting_down:
                     self.after(0, lambda error=str(exc): fail(error))
@@ -5487,7 +5652,12 @@ class GatewayApp(WindowBase):
             if not self._health_poll_active(generation):
                 return
             try:
-                resp = ur.urlopen(f"{API_BASE}/health", timeout=5)
+                req = ur.Request(
+                    f"{API_BASE}/v1/status",
+                    method="GET",
+                    headers=self._local_api_headers(),
+                )
+                resp = ur.urlopen(req, timeout=5)
                 data = json.loads(resp.read().decode())
                 if not self._health_poll_active(generation):
                     return
@@ -5514,7 +5684,12 @@ class GatewayApp(WindowBase):
         consecutive_failures = 0
         while self._health_poll_active(generation):
             try:
-                resp = ur.urlopen(f"{API_BASE}/health", timeout=5)
+                req = ur.Request(
+                    f"{API_BASE}/v1/status",
+                    method="GET",
+                    headers=self._local_api_headers(),
+                )
+                resp = ur.urlopen(req, timeout=5)
                 data = json.loads(resp.read().decode())
                 if not self._health_poll_active(generation):
                     return
@@ -5541,12 +5716,8 @@ class GatewayApp(WindowBase):
         self._last_health = data
         self._update_status(data)
 
-        sess = BASE_DIR / "runtime" / "session.json"
-        if sess.exists():
-            with open(sess, "r", encoding="utf-8") as f:
-                session = json.load(f)
-            self._api_key = session.get("api_key", "")
-            self._set_api_key(self._api_key)
+        self._api_key = self._current_local_api_key()
+        self._set_api_key(self._api_key)
 
         self._update_workflow_display(data)
         if hasattr(self, "_dashboard_pages"):
@@ -5783,17 +5954,11 @@ class GatewayApp(WindowBase):
             self.after(0, lambda: self._set_light("tunnel", "loading", "重试中"))
             if not self._run_ui_backend_step(self._clear_public_url):
                 return
-            api_key = self._current_local_api_key()
-            if not api_key:
-                raise RuntimeError("本地 API Key 尚未生成，请先重试 API 服务")
             req = ur.Request(
                 f"{API_BASE}/v1/tunnel/restart",
                 data=b"{}",
                 method="POST",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=self._local_admin_headers(),
             )
             raw = ur.urlopen(req, timeout=20).read()
             result = json.loads(raw.decode("utf-8")) if raw else {}

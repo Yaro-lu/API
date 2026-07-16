@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from app.core.secret_store import protect_text, unprotect_text
 
 
 class RuntimeState:
@@ -35,7 +35,8 @@ class RuntimeState:
         return {
             "session_id": "",
             "base_url": "",
-            "api_key": "",
+            "api_key_protected": "",
+            "admin_key_protected": "",
             "local_api": "http://127.0.0.1:18188",
             "started_at": "",
             "status": "offline",
@@ -117,12 +118,26 @@ class RuntimeState:
             with self._locked_session():
                 latest = self._load()
                 patch(latest)
+                for name in ("api_key", "admin_key"):
+                    value = self._secret_value(latest, name)
+                    self._store_secret(latest, name, value)
                 self._write_atomic(latest)
                 self._state = latest
 
     def save(self):
         """Persist the current snapshot; field setters are preferred."""
-        snapshot = dict(self._state)
+        # A long-lived process may hold an older protected key.  ``save`` must
+        # never copy that stale credential over a key rotated by another
+        # process; secret setters are the only methods allowed to change keys.
+        secret_fields = {
+            "api_key",
+            "api_key_protected",
+            "admin_key",
+            "admin_key_protected",
+        }
+        snapshot = {
+            key: value for key, value in self._state.items() if key not in secret_fields
+        }
         self._update(lambda latest: latest.update(snapshot))
 
     def start_session(self, local_port: int = 18188):
@@ -136,8 +151,10 @@ class RuntimeState:
             )
             latest["status"] = "starting"
             latest.pop("error", None)
-            if not latest.get("api_key"):
-                latest["api_key"] = self._generate_api_key()
+            if not self._secret_value(latest, "api_key"):
+                self._store_secret(latest, "api_key", self._generate_api_key())
+            if not self._secret_value(latest, "admin_key"):
+                self._store_secret(latest, "admin_key", self._generate_admin_key())
 
         self._update(patch)
 
@@ -148,7 +165,12 @@ class RuntimeState:
     def set_api_key(self, api_key: str):
         """Persist the local access key chosen in desktop settings."""
         value = str(api_key or "").strip()
-        self._update(lambda latest: latest.update({"api_key": value}))
+        self._update(lambda latest: self._store_secret(latest, "api_key", value))
+
+    def set_admin_key(self, admin_key: str):
+        """Persist the private key used only by the local desktop UI."""
+        value = str(admin_key or "").strip()
+        self._update(lambda latest: self._store_secret(latest, "admin_key", value))
 
     def set_online(self, base_url: str):
         """Tunnel 建立成功"""
@@ -168,10 +190,34 @@ class RuntimeState:
         rand = "".join(secrets.choice(chars) for _ in range(40))
         return f"sk-local-{rand}"
 
+    @staticmethod
+    def _generate_admin_key() -> str:
+        return f"sk-admin-{secrets.token_urlsafe(40)}"
+
+    @staticmethod
+    def _secret_value(data: dict, name: str) -> str:
+        protected = str(data.get(f"{name}_protected") or "").strip()
+        if protected:
+            return unprotect_text(protected)
+        return str(data.get(name) or "").strip()
+
+    @staticmethod
+    def _store_secret(data: dict, name: str, value: str):
+        data.pop(name, None)
+        protected_name = f"{name}_protected"
+        if value:
+            data[protected_name] = protect_text(value)
+        else:
+            data.pop(protected_name, None)
+
     # ── Properties ──────────────────────────────────────
     @property
     def api_key(self) -> str:
-        return self._state.get("api_key", "")
+        return self._secret_value(self._state, "api_key")
+
+    @property
+    def admin_key(self) -> str:
+        return self._secret_value(self._state, "admin_key")
 
     @property
     def base_url(self) -> str:
@@ -190,4 +236,8 @@ class RuntimeState:
         return self._state.get("session_id", "")
 
     def to_dict(self) -> dict:
-        return dict(self._state)
+        return {
+            key: value
+            for key, value in self._state.items()
+            if key not in {"api_key", "api_key_protected", "admin_key", "admin_key_protected"}
+        }

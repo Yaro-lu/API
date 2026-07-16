@@ -16,6 +16,9 @@ logs/
 tasks/
 temp/
 __pycache__/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
 *.pyc
 *.pyo
 .DS_Store
@@ -30,4 +33,5 @@ build/
 *.tar
 *.tar.gz
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json

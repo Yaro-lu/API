@@ -23,6 +23,7 @@ class ConsoleServiceTests(unittest.TestCase):
         app._poll_run = False
         app._ensure_health_polling = mock.Mock()
         app._tunnel_url = ""
+        app._api_key = "sk-local-test"
         app._initial_session_sync_done = False
         app._set_public_url = mock.Mock()
         app.after = lambda _delay, callback: callback()
@@ -37,7 +38,7 @@ class ConsoleServiceTests(unittest.TestCase):
             time.sleep(0.01)
         return bool(predicate())
 
-    def test_tunnel_retry_uses_local_api_key(self):
+    def test_tunnel_retry_uses_private_admin_key(self):
         app = self._app()
         app._api_key = "sk-local-console-test"
         response = mock.Mock()
@@ -47,17 +48,17 @@ class ConsoleServiceTests(unittest.TestCase):
             mock.patch("app.gui.main_gateway.RuntimeState") as runtime_state,
             mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
         ):
-            runtime_state.return_value.api_key = ""
+            runtime_state.return_value.admin_key = "sk-admin-console-test"
             app._retry_tunnel_service()
 
         request = urlopen.call_args.args[0]
         self.assertEqual(
             request.get_header("Authorization"),
-            "Bearer sk-local-console-test",
+            "Bearer sk-admin-console-test",
         )
         app._ensure_health_polling.assert_called_once()
 
-    def test_tunnel_retry_can_reload_persisted_key(self):
+    def test_tunnel_retry_can_reload_persisted_admin_key(self):
         app = self._app()
         app._api_key = "sk-local-stale-test"
         response = mock.Mock()
@@ -67,15 +68,14 @@ class ConsoleServiceTests(unittest.TestCase):
             mock.patch("app.gui.main_gateway.RuntimeState") as runtime_state,
             mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
         ):
-            runtime_state.return_value.api_key = "sk-local-persisted-test"
+            runtime_state.return_value.admin_key = "sk-admin-persisted-test"
             app._retry_tunnel_service()
 
         request = urlopen.call_args.args[0]
         self.assertEqual(
             request.get_header("Authorization"),
-            "Bearer sk-local-persisted-test",
+            "Bearer sk-admin-persisted-test",
         )
-        self.assertEqual(app._api_key, "sk-local-persisted-test")
 
     def test_tunnel_retry_without_any_key_fails_without_sending_request(self):
         app = self._app()
@@ -85,7 +85,7 @@ class ConsoleServiceTests(unittest.TestCase):
             mock.patch("app.gui.main_gateway.RuntimeState") as runtime_state,
             mock.patch("urllib.request.urlopen") as urlopen,
         ):
-            runtime_state.return_value.api_key = ""
+            runtime_state.return_value.admin_key = ""
             app._retry_tunnel_service()
 
         urlopen.assert_not_called()
@@ -103,7 +103,7 @@ class ConsoleServiceTests(unittest.TestCase):
             mock.patch("app.gui.main_gateway.RuntimeState") as runtime_state,
             mock.patch("urllib.request.urlopen", return_value=response),
         ):
-            runtime_state.return_value.api_key = "sk-local-console-test"
+            runtime_state.return_value.admin_key = "sk-admin-console-test"
             app._retry_tunnel_service()
 
         app._ensure_health_polling.assert_not_called()
@@ -138,7 +138,7 @@ class ConsoleServiceTests(unittest.TestCase):
             mock.patch("app.gui.main_gateway.RuntimeState") as runtime_state,
             mock.patch("urllib.request.urlopen", side_effect=slow_urlopen),
         ):
-            runtime_state.return_value.api_key = "sk-local-console-test"
+            runtime_state.return_value.admin_key = "sk-admin-console-test"
             worker = threading.Thread(target=run_retry, daemon=True)
             worker.start()
             self.assertTrue(request_started.wait(0.5))

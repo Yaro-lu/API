@@ -8,6 +8,7 @@ from app.core.model_maintenance import (
     cleanup_incomplete_imports,
     import_model_directory,
     model_file_ready,
+    model_file_sha256_matches,
 )
 
 
@@ -25,6 +26,24 @@ FIXTURE_REQUIREMENTS = {
 
 
 class ModelMaintenanceTests(unittest.TestCase):
+    def test_sha256_verification_rejects_changed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "model.safetensors"
+            target.write_bytes(b"model")
+
+            self.assertTrue(
+                model_file_sha256_matches(
+                    target,
+                    "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+                )
+            )
+            target.write_bytes(b"tampered")
+            self.assertFalse(
+                model_file_sha256_matches(
+                    target,
+                    "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+                )
+            )
     def test_cleanup_removes_only_interrupted_import_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             models = Path(tmp)
@@ -117,7 +136,7 @@ class ModelMaintenanceTests(unittest.TestCase):
             self.assertEqual(result["imported"], 1)
             self.assertEqual((models / "loras" / "custom.safetensors").read_bytes(), b"lora")
 
-    def test_explicit_models_root_keeps_custom_node_categories(self):
+    def test_unsafe_checkpoint_requires_explicit_confirmation(self):
         with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as target_tmp:
             source = Path(source_tmp)
             models = Path(target_tmp)
@@ -126,6 +145,17 @@ class ModelMaintenanceTests(unittest.TestCase):
             custom.write_bytes(b"adapter")
 
             result = import_model_directory(source, models, FIXTURE_REQUIREMENTS)
+
+            self.assertEqual(result["imported"], 0)
+            self.assertEqual(result["failed"], 1)
+            self.assertFalse((models / "ipadapter" / "adapter.bin").exists())
+
+            result = import_model_directory(
+                source,
+                models,
+                FIXTURE_REQUIREMENTS,
+                allow_unsafe=True,
+            )
 
             self.assertEqual(result["imported"], 1)
             self.assertEqual((models / "ipadapter" / "adapter.bin").read_bytes(), b"adapter")

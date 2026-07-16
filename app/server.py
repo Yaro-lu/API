@@ -11,10 +11,11 @@ Local AI API Gateway — API 服务器
   GET  /health                       → 健康检查（免鉴权）
 """
 import asyncio
-import os
 import sys
 import json
 import random
+import re
+import secrets
 import threading
 import time
 import uuid
@@ -33,14 +34,14 @@ BASE_DIR = Path(__file__).parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from app.config import Config
-from app.core.model_maintenance import MODEL_REQUIREMENTS, check_model_groups
-from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths
-from app.core.runtime_state import RuntimeState
-from app.core.workflow_dependencies import workflow_dependency_report
-from app.workflow_registry import WorkflowRegistry
-from app.tunnel.cloudflared_manager import CloudflaredManager
-from app.engines.comfyui_client import ComfyUIClient
+from app.config import Config  # noqa: E402
+from app.core.model_maintenance import MODEL_REQUIREMENTS, check_model_groups  # noqa: E402
+from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths  # noqa: E402
+from app.core.runtime_state import RuntimeState  # noqa: E402
+from app.core.workflow_dependencies import workflow_dependency_report  # noqa: E402
+from app.workflow_registry import WorkflowRegistry  # noqa: E402
+from app.tunnel.cloudflared_manager import CloudflaredManager  # noqa: E402
+from app.engines.comfyui_client import ComfyUIClient  # noqa: E402
 
 # ── 全局 ──────────────────────────────────────────────
 config: Optional[Config] = None
@@ -53,6 +54,17 @@ current_task: dict = {}
 task_records: dict = {}
 
 PUBLIC_PATHS = {"/health", "/openapi.json", "/docs", "/redoc"}
+PUBLIC_PATHS.add("/healthz")
+MANAGEMENT_PATHS = {
+    "/v1/workflows/reload",
+    "/v1/workflows/rescan",
+    "/v1/tunnel/restart",
+}
+MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+MAX_PROMPT_CHARS = 100_000
+MAX_TASK_RECORDS = 200
+MAX_REQUEST_RECORDS = 200
+REQUEST_RECORD_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 # mutex for current_task
 _task_lock = threading.Lock()
@@ -403,10 +415,6 @@ def _output_download_path(task_id: str, filename: str) -> str:
     return f"/v1/files/{safe_task_id}/{safe_filename}"
 
 
-def _output_url(task_id: str, filename: str) -> str:
-    return f"{_public_base_url()}{_output_download_path(task_id, filename)}"
-
-
 def _with_output_urls(task_id: str, outputs: list) -> list:
     normalized = []
     for item in outputs or []:
@@ -507,6 +515,8 @@ def _task_text_output(record: dict) -> str:
 
 def _task_api_response(record: dict) -> dict:
     payload = dict(record or {})
+    for private_field in ("prompt", "log_offset", "started_at_ts"):
+        payload.pop(private_field, None)
     task_id = payload.get("task_id") or payload.get("id") or ""
     payload["id"] = task_id
     payload["task_id"] = task_id
@@ -539,8 +549,46 @@ def _set_task_record(task_id: str, patch: dict):
         record.update(patch)
         record["updated_at"] = time.time()
         task_records[task_id] = record
+        _prune_task_records_locked()
         if current_task.get("task_id") == task_id:
             current_task.update(record)
+
+
+def _prune_task_records_locked(max_records: int = MAX_TASK_RECORDS):
+    """Bound in-memory history without discarding the currently running task."""
+    overflow = len(task_records) - max(1, int(max_records))
+    if overflow <= 0:
+        return
+    current_id = str(current_task.get("task_id") or "")
+    candidates = sorted(
+        (
+            (task_id, float(record.get("updated_at") or record.get("started_at_ts") or 0))
+            for task_id, record in task_records.items()
+            if task_id != current_id
+        ),
+        key=lambda item: item[1],
+    )
+    for task_id, _updated_at in candidates[:overflow]:
+        task_records.pop(task_id, None)
+
+
+def _cleanup_request_records(requests_dir: Path):
+    """Remove old request metadata only; generated user outputs are never touched."""
+    try:
+        files = sorted(
+            Path(requests_dir).glob("task_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    cutoff = time.time() - REQUEST_RECORD_MAX_AGE_SECONDS
+    for index, path in enumerate(files):
+        try:
+            if index >= MAX_REQUEST_RECORDS or path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
 
 
 def _clean_task_text(value, limit: int = 180) -> str:
@@ -579,6 +627,68 @@ def _size_to_dimensions(body: dict) -> tuple[int, int]:
     if compact == "4K":
         return 4096, 4096
     return 1024, 1024
+
+
+def _bounded_integer(value, *, name: str, default: int, minimum: int, maximum: int) -> int:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        raise HTTPException(422, detail=f"{name} 必须是整数")
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(422, detail=f"{name} 必须是整数") from None
+    if result < minimum or result > maximum:
+        raise HTTPException(422, detail=f"{name} 必须在 {minimum} 到 {maximum} 之间")
+    return result
+
+
+def _validated_generation_body(body: dict) -> dict:
+    """Return a bounded copy before values reach ComfyUI or local persistence."""
+    if not isinstance(body, dict):
+        raise HTTPException(422, detail="请求正文必须是 JSON 对象")
+    result = dict(body)
+    prompt = str(result.get("prompt") or "")
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(422, detail=f"prompt 最多允许 {MAX_PROMPT_CHARS} 个字符")
+    result["prompt"] = prompt
+    negative_prompt = str(result.get("negative_prompt") or result.get("negativePrompt") or "")
+    if len(negative_prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(422, detail=f"negative_prompt 最多允许 {MAX_PROMPT_CHARS} 个字符")
+    if "negative_prompt" in result or "negativePrompt" in result:
+        result["negative_prompt"] = negative_prompt
+    raw_width = result.get("width")
+    raw_height = result.get("height")
+    if raw_width not in (None, "") or raw_height not in (None, ""):
+        if raw_width in (None, "") or raw_height in (None, ""):
+            raise HTTPException(422, detail="width 和 height 必须同时提供")
+        width = _bounded_integer(
+            raw_width, name="width", default=1024, minimum=64, maximum=8192
+        )
+        height = _bounded_integer(
+            raw_height, name="height", default=1024, minimum=64, maximum=8192
+        )
+    else:
+        size_text = str(result.get("size") or "").strip()
+        compact_size = size_text.replace(" ", "").upper()
+        if size_text and not (
+            compact_size in {"1K", "2K", "4K"}
+            or re.fullmatch(r"\d{2,5}[xX]\d{2,5}", compact_size)
+        ):
+            raise HTTPException(422, detail="size 必须是 WIDTHxHEIGHT、1K、2K 或 4K")
+        width, height = _size_to_dimensions(result)
+        width = _bounded_integer(width, name="width", default=1024, minimum=64, maximum=8192)
+        height = _bounded_integer(height, name="height", default=1024, minimum=64, maximum=8192)
+    if width * height > 33_554_432:
+        raise HTTPException(422, detail="图片总像素不能超过 33554432")
+    result["width"] = width
+    result["height"] = height
+    result["steps"] = _bounded_integer(
+        result.get("steps"), name="steps", default=20, minimum=1, maximum=200
+    )
+    if "seed" in result:
+        result["seed"] = _normalize_seed(result.get("seed"))
+    return result
 
 
 def _image_workflow_from_model(model: str) -> str:
@@ -683,11 +793,106 @@ def _guess_media_type(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
-# ── 鉴权中间件 ────────────────────────────────────────
+# ── 请求边界与鉴权中间件 ──────────────────────────────
+async def _send_json_response(send, status: int, payload: dict, headers=None):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    response_headers = [
+        (b"content-type", b"application/json; charset=utf-8"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    response_headers.extend(headers or [])
+    await send({"type": "http.response.start", "status": status, "headers": response_headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app, max_bytes: int = MAX_REQUEST_BODY_BYTES):
+        self.app = app
+        self.max_bytes = int(max_bytes)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        content_length = None
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    content_length = int(value.decode("ascii"))
+                except (UnicodeDecodeError, ValueError):
+                    await _send_json_response(
+                        send, 400, {"error": {"code": "invalid_content_length", "message": "Content-Length 无效"}}
+                    )
+                    return
+                if content_length < 0:
+                    await _send_json_response(
+                        send, 400, {"error": {"code": "invalid_content_length", "message": "Content-Length 无效"}}
+                    )
+                    return
+                break
+        if content_length is not None and content_length > self.max_bytes:
+            await _send_json_response(
+                send, 413, {"error": {"code": "request_too_large", "message": "请求正文过大"}}
+            )
+            return
+
+        consumed = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal consumed
+            message = await receive()
+            if message.get("type") == "http.request":
+                consumed += len(message.get("body", b""))
+                if consumed > self.max_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _RequestBodyTooLarge:
+            if not response_started:
+                await _send_json_response(
+                    send, 413, {"error": {"code": "request_too_large", "message": "请求正文过大"}}
+                )
+
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def secure_send(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.extend(
+                    [
+                        (b"x-content-type-options", b"nosniff"),
+                        (b"referrer-policy", b"no-referrer"),
+                        (b"cache-control", b"no-store"),
+                    ]
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, secure_send)
+
+
 class AuthMiddleware:
     """纯 ASGI 中间件 — Bearer API Key 鉴权"""
     def __init__(self, app):
         self.app = app
+        self._rate_windows = {}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -695,6 +900,9 @@ class AuthMiddleware:
             return
 
         path = scope["path"]
+        if str(scope.get("method") or "").upper() == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
         if path in PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
@@ -702,33 +910,68 @@ class AuthMiddleware:
         auth = ""
         for header in scope.get("headers", []):
             if header[0] == b"authorization":
-                auth = header[1].decode()
+                # ASGI headers are arbitrary bytes.  Latin-1 is lossless and
+                # guarantees malformed unauthenticated input becomes a clean
+                # 401 instead of escaping as UnicodeDecodeError/500.
+                auth = header[1].decode("latin-1")
                 break
 
         if not auth.startswith("Bearer "):
-            await self._unauthorized(send, "Missing Authorization header")
+            await self._error(send, 401, "unauthorized", "Missing Authorization header")
             return
 
-        token = auth[7:]
-        if token != state.api_key:
-            await self._unauthorized(send, "Invalid API key")
+        token = auth[7:].strip()
+        api_key = str(getattr(state, "api_key", "") or "")
+        admin_key = str(getattr(state, "admin_key", "") or "")
+        management = path in MANAGEMENT_PATHS
+        expected = admin_key if management else api_key
+        token_bytes = token.encode("utf-8")
+        expected_bytes = expected.encode("utf-8")
+        if not expected or not secrets.compare_digest(token_bytes, expected_bytes):
+            if (
+                management
+                and api_key
+                and secrets.compare_digest(token_bytes, api_key.encode("utf-8"))
+            ):
+                await self._error(send, 403, "forbidden", "Management credential required")
+            else:
+                await self._error(send, 401, "unauthorized", "Invalid API key")
+            return
+
+        if not self._within_rate_limit(token, path, str(scope.get("method") or "GET")):
+            await self._error(
+                send,
+                429,
+                "rate_limit_exceeded",
+                "请求过于频繁，请稍后重试",
+                headers=[(b"retry-after", b"60")],
+            )
             return
 
         await self.app(scope, receive, send)
 
-    async def _unauthorized(self, send, msg: str):
-        body = json.dumps({
-            "error": {"code": "unauthorized", "message": msg}
-        }).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": body,
-        })
+    def _within_rate_limit(self, token: str, path: str, method: str) -> bool:
+        now = time.monotonic()
+        is_management = path in MANAGEMENT_PATHS
+        is_generation = method.upper() == "POST" and not is_management
+        limit = 10 if is_management else 30 if is_generation else 300
+        category = "admin" if is_management else "generation" if is_generation else "read"
+        key = (token, category)
+        window = [stamp for stamp in self._rate_windows.get(key, []) if now - stamp < 60]
+        if len(window) >= limit:
+            self._rate_windows[key] = window
+            return False
+        window.append(now)
+        self._rate_windows[key] = window
+        return True
+
+    async def _error(self, send, status: int, code: str, msg: str, headers=None):
+        await _send_json_response(
+            send,
+            status,
+            {"error": {"code": code, "message": msg}},
+            headers=headers,
+        )
 
 
 # ── 创建应用 ──────────────────────────────────────────
@@ -761,10 +1004,15 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Local AI API Gateway", version="0.2.0", lifespan=lifespan)
     app.add_middleware(AuthMiddleware)
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"], allow_credentials=True,
-        allow_methods=["*"], allow_headers=["*"],
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Prefer", "Accept", "Range"],
+        expose_headers=["Location", "Retry-After", "Preference-Applied", "Content-Range", "Accept-Ranges"],
     )
 
     def _inject_workflow_params(workflow_data: dict, body: dict):
@@ -830,40 +1078,56 @@ def create_app() -> FastAPI:
         wf = registry.resolve(workflow_id)
         if wf is None:
             raise HTTPException(404, detail=f"Workflow not found: {workflow_id or '(default)'}")
-
-        with _task_lock:
-            if current_task and current_task.get("status") in ("running", "pending", "submitted"):
-                raise HTTPException(429, detail="已有任务正在执行，请稍后重试")
-
+        body = _validated_generation_body(body)
         task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        reservation = {
+            "id": task_id,
+            "task_id": task_id,
+            "workflow_id": wf.id,
+            "workflow_name": wf.name,
+            "status": "reserving",
+            "phase": "正在提交",
+            "progress_label": "正在提交",
+            "progress_percent": 0,
+            "started_at_ts": time.time(),
+        }
+        with _task_lock:
+            if current_task and current_task.get("status") in (
+                "reserving", "running", "pending", "submitted"
+            ):
+                raise HTTPException(429, detail="已有任务正在执行，请稍后重试")
+            current_task.clear()
+            current_task.update(reservation)
+            task_records[task_id] = dict(reservation)
+            _prune_task_records_locked()
+
         wf_json_path = wf.folder / "workflow.json"
-        if not wf_json_path.exists():
-            raise HTTPException(500, detail="Workflow JSON 文件不存在")
-
-        with open(wf_json_path, "r", encoding="utf-8") as f:
-            workflow_data = json.load(f)
-
-        _inject_workflow_params(workflow_data, body)
-
-        req_dir = config.requests_dir
-        with open(req_dir / f"{task_id}.json", "w", encoding="utf-8") as f:
-            json.dump({
-                "task_id": task_id,
-                "workflow_id": wf.id,
-                "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "body": body,
-            }, f, ensure_ascii=False, indent=2)
-
-        comfy_log_path = config.logs_dir / "comfyui.log"
         try:
-            log_offset = comfy_log_path.stat().st_size
-        except Exception:
-            log_offset = 0
-        client = ComfyUIClient(config.comfyui_url, log_path=comfy_log_path)
-        try:
+            if not wf_json_path.exists():
+                raise HTTPException(500, detail="Workflow JSON 文件不存在")
+            with open(wf_json_path, "r", encoding="utf-8") as f:
+                workflow_data = json.load(f)
+            _inject_workflow_params(workflow_data, body)
+            comfy_log_path = config.logs_dir / "comfyui.log"
+            try:
+                log_offset = comfy_log_path.stat().st_size
+            except OSError:
+                log_offset = 0
+            client = ComfyUIClient(config.comfyui_url, log_path=comfy_log_path)
             prompt_id = client.queue_prompt(workflow_data)
-        except Exception as e:
-            raise HTTPException(502, detail=f"ComfyUI 连接失败: {e}")
+        except HTTPException:
+            with _task_lock:
+                task_records.pop(task_id, None)
+                if current_task.get("task_id") == task_id:
+                    current_task.clear()
+            raise
+        except Exception as exc:
+            print(f"[API] ComfyUI queue failed ({type(exc).__name__}): {exc}")
+            with _task_lock:
+                task_records.pop(task_id, None)
+                if current_task.get("task_id") == task_id:
+                    current_task.clear()
+            raise HTTPException(502, detail="ComfyUI 暂不可用，请稍后重试") from None
 
         steps = int(body.get("steps") or 20)
         task_title = _task_title_from_body(body, wf.id)
@@ -874,7 +1138,6 @@ def create_app() -> FastAPI:
             "prompt_id": prompt_id,
             "workflow_id": wf.id,
             "workflow_name": wf.name,
-            "prompt": body.get("prompt", ""),
             "prompt_summary": prompt_summary,
             "title": task_title,
             "phase": "排队中",
@@ -894,6 +1157,25 @@ def create_app() -> FastAPI:
             current_task.clear()
             current_task.update(task_info)
             task_records[task_id] = dict(task_info)
+
+        req_dir = config.requests_dir
+        try:
+            req_dir.mkdir(parents=True, exist_ok=True)
+            request_metadata = {
+                "task_id": task_id,
+                "workflow_id": wf.id,
+                "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "parameters": {
+                    key: body.get(key)
+                    for key in ("model", "width", "height", "steps", "seed", "size")
+                    if body.get(key) not in (None, "")
+                },
+            }
+            with open(req_dir / f"{task_id}.json", "w", encoding="utf-8") as f:
+                json.dump(request_metadata, f, ensure_ascii=False, indent=2)
+            _cleanup_request_records(req_dir)
+        except OSError as exc:
+            print(f"[API] request metadata was not persisted: {exc}")
 
         def _bg_execute():
             try:
@@ -956,9 +1238,10 @@ def create_app() -> FastAPI:
                 })
 
             except Exception as ex:
+                print(f"[API] task {task_id} failed ({type(ex).__name__}): {ex}")
                 _set_task_record(task_id, {
                     "status": "failed",
-                    "error": str(ex),
+                    "error": "任务执行失败，请查看本地日志",
                 })
 
         threading.Thread(target=_bg_execute, daemon=True).start()
@@ -983,18 +1266,25 @@ def create_app() -> FastAPI:
             return None
         with _task_lock:
             record = dict(task_records.get(task_id, {}))
+        if not record or str(record.get("task_id") or record.get("id") or "") != task_id:
+            return None
         candidates = []
+        matched = False
         for item in record.get("outputs") or []:
             if Path(str(item.get("filename", ""))).name != safe_name:
                 continue
+            matched = True
             subfolder = str(item.get("subfolder") or "").strip().replace("\\", "/")
             if subfolder and ".." not in subfolder.split("/"):
                 candidates.append(BASE_DIR / "outputs" / subfolder / safe_name)
-        candidates.extend([
-            BASE_DIR / "outputs" / safe_name,
-            BASE_DIR / "outputs" / task_id / safe_name,
-            BASE_DIR / "runtime" / "outputs" / task_id / safe_name,
-        ])
+            elif not subfolder:
+                candidates.extend([
+                    BASE_DIR / "outputs" / safe_name,
+                    BASE_DIR / "outputs" / task_id / safe_name,
+                    BASE_DIR / "runtime" / "outputs" / task_id / safe_name,
+                ])
+        if not matched:
+            return None
         for candidate in candidates:
             try:
                 resolved = candidate.resolve()
@@ -1012,7 +1302,12 @@ def create_app() -> FastAPI:
 
     # ── 路由 ──
     @app.get("/health")
-    async def health():
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok", "version": "0.2.0"}
+
+    @app.get("/v1/status")
+    def status():
         # ComfyUI 连通性检测
         comfyui_status = "offline"
         comfyui_url = config.comfyui_url
@@ -1052,6 +1347,8 @@ def create_app() -> FastAPI:
         # 当前任务进度
         with _task_lock:
             task_copy = dict(current_task)
+        for private_field in ("prompt", "log_offset", "started_at_ts"):
+            task_copy.pop(private_field, None)
 
         model_list = _models_from_workflows()
         model_groups = {"image": [], "video": [], "text": []}
@@ -1141,7 +1438,7 @@ def create_app() -> FastAPI:
             body = await request.json()
         except Exception:
             body = {}
-        task_info = _start_workflow_task(workflow_id, body)
+        task_info = await asyncio.to_thread(_start_workflow_task, workflow_id, body)
         return {
             "id": task_info["task_id"],
             "task_id": task_info["task_id"],
@@ -1150,7 +1447,7 @@ def create_app() -> FastAPI:
             "workflow_id": task_info["workflow_id"],
             "workflow_name": task_info["workflow_name"],
             "prompt_id": task_info["prompt_id"],
-            "message": f"任务已提交，通过 /health 查看进度",
+            "message": f"任务已提交，通过 /v1/tasks/{task_info['task_id']} 查询进度",
         }
 
     def _resolve_short_workflow(workflow_alias: Optional[str]):
@@ -1216,7 +1513,8 @@ def create_app() -> FastAPI:
         if not isinstance(body, dict):
             body = {}
 
-        submitted = _start_workflow_task(
+        submitted = await asyncio.to_thread(
+            _start_workflow_task,
             workflow.id,
             _short_workflow_body(workflow, body),
         )
@@ -1322,8 +1620,16 @@ def create_app() -> FastAPI:
             "response_format": body.get("response_format") or {"type": "json_object"},
         }
         try:
-            submitted = _start_workflow_task(workflow_id, workflow_body)
-            timeout_sec = int(body.get("timeout") or body.get("timeout_sec") or 1800)
+            submitted = await asyncio.to_thread(
+                _start_workflow_task, workflow_id, workflow_body
+            )
+            timeout_sec = _bounded_integer(
+                body.get("timeout") or body.get("timeout_sec"),
+                name="timeout",
+                default=1800,
+                minimum=1,
+                maximum=3600,
+            )
             completed = await asyncio.to_thread(
                 _wait_for_task,
                 submitted["task_id"],
@@ -1359,10 +1665,11 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as ex:
+            print(f"[API] text response failed ({type(ex).__name__}): {ex}")
             return JSONResponse(status_code=500, content={
                 "error": {
                     "code": "local_client_text_generation_failed",
-                    "message": str(ex),
+                    "message": "本地文字生成失败，请查看客户端日志。",
                 }
             })
 
@@ -1437,7 +1744,9 @@ def create_app() -> FastAPI:
         }
 
         try:
-            submitted = _start_workflow_task(workflow_id, workflow_body)
+            submitted = await asyncio.to_thread(
+                _start_workflow_task, workflow_id, workflow_body
+            )
             if _prefers_async_image_response(body, request.headers.get("prefer", "")):
                 status_path = f"/v1/tasks/{quote(submitted['task_id'], safe='')}"
                 return JSONResponse(
@@ -1478,10 +1787,11 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as ex:
+            print(f"[API] image response failed ({type(ex).__name__}): {ex}")
             return JSONResponse(status_code=500, content={
                 "error": {
                     "code": "local_client_generation_failed",
-                    "message": str(ex),
+                    "message": "本地图片生成失败，请查看客户端日志。",
                 }
             })
 
@@ -1535,7 +1845,7 @@ def main():
 
         app = create_app()
         print(f"[API] Listening on http://{host}:{port}")
-        print(f"[API] API Key: {state.api_key}")
+        print("[API] Authentication is enabled; access keys are not written to logs")
         uvicorn.run(app, host=host, port=port, log_level="info")
     finally:
         if tunnel is not None:

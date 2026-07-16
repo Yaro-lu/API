@@ -24,6 +24,7 @@ async def asgi_request(app, method, path, *, headers=None, json_body=None):
     if json_body is not None:
         body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
         request_headers.setdefault("content-type", "application/json")
+        request_headers.setdefault("content-length", str(len(body)))
 
     scope = {
         "type": "http",
@@ -79,6 +80,9 @@ class FakeRegistry:
     def scan_folder(self):
         return []
 
+    def load(self):
+        return None
+
     @property
     def enabled_workflows(self):
         return [workflow for workflow in self.workflows if getattr(workflow, "enabled", True)]
@@ -95,11 +99,20 @@ class FakeRegistry:
 class FakeComfyUIClient:
     release = threading.Event()
     started = threading.Event()
+    queue_entered = threading.Event()
+    queue_release = threading.Event()
+    block_queue = False
+    fail_queue = False
 
     def __init__(self, *args, **kwargs):
         pass
 
     def queue_prompt(self, workflow_data):
+        self.queue_entered.set()
+        if self.block_queue:
+            self.queue_release.wait(timeout=5)
+        if self.fail_queue:
+            raise OSError("fixture queue unavailable")
         if any(
             node.get("class_type") == "TextOutput"
             for node in workflow_data.values()
@@ -153,6 +166,8 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             name="flux2",
             folder=workflow_dir,
             output_type="image",
+            enabled=True,
+            description="",
         )
         text_workflow_dir = self.base / "workflows" / "llm_qwen3_text_gen"
         text_workflow_dir.mkdir(parents=True)
@@ -172,12 +187,20 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             name="qwen3.5",
             folder=text_workflow_dir,
             output_type="text",
+            enabled=True,
+            description="",
         )
         FakeRegistry.workflow_defs = [image_workflow, text_workflow]
         FakeComfyUIClient.release.clear()
         FakeComfyUIClient.started.clear()
+        FakeComfyUIClient.queue_entered.clear()
+        FakeComfyUIClient.queue_release.clear()
+        FakeComfyUIClient.block_queue = False
+        FakeComfyUIClient.fail_queue = False
         self.fake_state = SimpleNamespace(
             api_key="sk-test-image",
+            admin_key="sk-admin-test",
+            session_id="session-test",
             base_url="https://client.example",
             local_api="http://127.0.0.1:18188",
             set_offline=lambda: None,
@@ -202,15 +225,25 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         with server._task_lock:
             server.current_task.clear()
             server.task_records.clear()
+        with server._comfy_nodes_lock:
+            server._comfy_nodes_cache.update(
+                {"url": "", "checked_at": 0.0, "nodes": None}
+            )
         self.app = server.create_app()
         self.auth = {"authorization": "Bearer sk-test-image"}
+        self.admin_auth = {"authorization": "Bearer sk-admin-test"}
 
     async def asyncTearDown(self):
         FakeComfyUIClient.release.set()
+        FakeComfyUIClient.queue_release.set()
         await asyncio.sleep(0.05)
         with server._task_lock:
             server.current_task.clear()
             server.task_records.clear()
+        with server._comfy_nodes_lock:
+            server._comfy_nodes_cache.update(
+                {"url": "", "checked_at": 0.0, "nodes": None}
+            )
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.temp_dir.cleanup()
@@ -287,8 +320,134 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         request_files = list(self.fake_config.requests_dir.glob("task_*.json"))
         self.assertEqual(len(request_files), 1)
         saved_request = json.loads(request_files[0].read_text(encoding="utf-8"))
-        self.assertEqual(saved_request["body"]["width"], 1024)
-        self.assertEqual(saved_request["body"]["height"], 1024)
+        self.assertNotIn("body", saved_request)
+        self.assertEqual(saved_request["parameters"]["width"], 1024)
+        self.assertEqual(saved_request["parameters"]["height"], 1024)
+        self.assertNotIn("一枚紫色水晶立方体", json.dumps(saved_request, ensure_ascii=False))
+
+    async def test_public_health_is_minimal_and_private_status_requires_key(self):
+        health_status, _headers, health_body = await asgi_request(
+            self.app, "GET", "/health"
+        )
+        private_status, _headers, _body = await asgi_request(
+            self.app, "GET", "/v1/status"
+        )
+        health = json.loads(health_body)
+
+        self.assertEqual(health_status, 200)
+        self.assertEqual(set(health), {"status", "version"})
+        self.assertNotIn("session_id", health)
+        self.assertNotIn("current_task", health)
+        self.assertEqual(private_status, 401)
+
+    async def test_generation_key_cannot_call_management_endpoint(self):
+        forbidden_status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/reload",
+            headers=self.auth,
+            json_body={},
+        )
+        admin_status, _headers, admin_body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/reload",
+            headers=self.admin_auth,
+            json_body={},
+        )
+
+        self.assertEqual(forbidden_status, 403)
+        self.assertEqual(admin_status, 200)
+        self.assertTrue(json.loads(admin_body)["ok"])
+
+    async def test_malformed_authorization_bytes_return_401_instead_of_500(self):
+        status, _headers, body = await asgi_request(
+            self.app,
+            "GET",
+            "/v1/models",
+            headers={"authorization": "Bearer ÿ"},
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"]["code"], "unauthorized")
+
+    async def test_negative_content_length_is_rejected(self):
+        status, _headers, body = await asgi_request(
+            self.app,
+            "GET",
+            "/v1/models",
+            headers={**self.auth, "content-length": "-1"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "invalid_content_length")
+
+    async def test_oversized_body_and_invalid_generation_parameters_are_rejected(self):
+        too_large_status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/",
+            headers={
+                **self.auth,
+                "content-length": str(server.MAX_REQUEST_BODY_BYTES + 1),
+            },
+            json_body={"prompt": "small"},
+        )
+        invalid_status, _headers, invalid_body = await asgi_request(
+            self.app,
+            "POST",
+            "/",
+            headers=self.auth,
+            json_body=self._image_body(width=16384, height=16384, steps=999),
+        )
+
+        self.assertEqual(too_large_status, 413)
+        self.assertEqual(invalid_status, 422)
+        self.assertIn("detail", json.loads(invalid_body))
+
+    async def test_queue_failure_releases_task_slot_without_writing_request(self):
+        FakeComfyUIClient.fail_queue = True
+
+        status, _headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/",
+            headers=self.auth,
+            json_body=self._image_body(),
+        )
+
+        self.assertEqual(status, 502)
+        self.assertNotIn("fixture queue unavailable", body.decode("utf-8"))
+        self.assertEqual(list(self.fake_config.requests_dir.glob("task_*.json")), [])
+        with server._task_lock:
+            self.assertEqual(server.current_task, {})
+
+    async def test_concurrent_requests_cannot_both_pass_task_reservation(self):
+        FakeComfyUIClient.block_queue = True
+        first = asyncio.create_task(
+            asgi_request(
+                self.app,
+                "POST",
+                "/",
+                headers=self.auth,
+                json_body=self._image_body(**{"async": True}),
+            )
+        )
+        entered = await asyncio.to_thread(FakeComfyUIClient.queue_entered.wait, 2)
+        self.assertTrue(entered)
+
+        second_status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/",
+            headers=self.auth,
+            json_body=self._image_body(**{"async": True}),
+        )
+        FakeComfyUIClient.queue_release.set()
+        first_status, _headers, _body = await asyncio.wait_for(first, timeout=2)
+
+        self.assertEqual(first_status, 202)
+        self.assertEqual(second_status, 429)
 
     async def test_named_short_url_resolves_case_insensitive_workflow_name(self):
         status, _headers, body = await asgi_request(
@@ -479,7 +638,8 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(preflight_status, 200)
-        self.assertEqual(preflight_headers["access-control-allow-origin"], origin)
+        self.assertEqual(preflight_headers["access-control-allow-origin"], "*")
+        self.assertNotIn("access-control-allow-credentials", preflight_headers)
         self.assertEqual(unauth_status, 401)
         self.assertEqual(auth_status, 200)
         self.assertEqual(auth_headers["content-type"], "image/png")
@@ -491,6 +651,19 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(server._path_is_within(sibling, outputs))
         self.assertTrue(server._path_is_within(outputs / "safe.png", outputs))
+
+    async def test_output_download_requires_filename_owned_by_real_task(self):
+        output = self.base / "outputs" / "unguarded.png"
+        output.write_bytes(PNG_BYTES)
+
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "GET",
+            "/v1/files/not-a-task/unguarded.png",
+            headers=self.auth,
+        )
+
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

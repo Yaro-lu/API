@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import shutil
 from pathlib import Path
 from typing import Callable, Iterable
 
 
-MODEL_EXTENSIONS = (".safetensors", ".gguf", ".pt", ".pth", ".bin", ".ckpt")
+SAFE_MODEL_EXTENSIONS = (".safetensors", ".gguf")
+UNSAFE_MODEL_EXTENSIONS = (".pt", ".pth", ".bin", ".ckpt")
+MODEL_EXTENSIONS = SAFE_MODEL_EXTENSIONS + UNSAFE_MODEL_EXTENSIONS
 COMFY_MODEL_FOLDERS = {
     "audio_encoders",
     "checkpoints",
@@ -43,6 +47,7 @@ MODEL_REQUIREMENTS = {
                 "path": "text_encoders/qwen3.5_4b_bf16.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/Qwen3.5/resolve/main/text_encoders/qwen3.5_4b_bf16.safetensors",
                 "size_bytes": 9_319_828_320,
+                "sha256": "9fb3ae42003750fe2d16350259a3ec07761d6d13a8e2b244a6e22fa9d8050841",
             },
         ],
     },
@@ -53,16 +58,19 @@ MODEL_REQUIREMENTS = {
                 "path": "diffusion_models/flux-2-klein-9b-fp8.safetensors",
                 "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors",
                 "size_bytes": 9_433_061_528,
+                "sha256": "865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee",
             },
             {
                 "path": "text_encoders/qwen_3_8b_fp8mixed.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
                 "size_bytes": 8_664_848_742,
+                "sha256": "abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6",
             },
             {
                 "path": "vae/full_encoder_small_decoder.safetensors",
                 "url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors",
                 "size_bytes": 249_519_092,
+                "sha256": "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62",
             },
         ],
     },
@@ -73,21 +81,25 @@ MODEL_REQUIREMENTS = {
                 "path": "diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_flf2v_720p_14B_fp16.safetensors",
                 "size_bytes": 32_792_693_440,
+                "sha256": "bf4ac25667d00f53f49df02c5771f5aa7801c1dcb9b3ccade1407687c426d030",
             },
             {
                 "path": "vae/wan_2.1_vae.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
                 "size_bytes": 253_815_318,
+                "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
             },
             {
                 "path": "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
                 "size_bytes": 6_735_906_897,
+                "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
             },
             {
                 "path": "clip_vision/clip_vision_h.safetensors",
                 "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors",
                 "size_bytes": 1_264_219_396,
+                "sha256": "64a7ef761bfccbadbaa3da77366aac4185a6c58fa5de5f589b42a65bcc21f161",
             },
         ],
     },
@@ -106,6 +118,25 @@ def model_file_ready(path: Path, expected_size: int | None = None) -> bool:
     if size <= 0:
         return False
     return not expected_size or size == int(expected_size)
+
+
+def model_file_sha256_matches(
+    path: Path,
+    expected_sha256: str,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> bool:
+    """Stream a model once and compare it with a trusted manifest digest."""
+    expected = str(expected_sha256 or "").strip().lower()
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        return False
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return hmac.compare_digest(digest.hexdigest(), expected)
 
 
 def cleanup_incomplete_imports(models_dir: Path) -> int:
@@ -148,13 +179,19 @@ def check_model_groups(
     return result
 
 
-def _known_destinations(requirements: dict) -> dict[str, tuple[Path, int | None]]:
-    destinations: dict[str, tuple[Path, int | None]] = {}
+def _known_destinations(
+    requirements: dict,
+) -> dict[str, tuple[Path, int | None, str]]:
+    destinations: dict[str, tuple[Path, int | None, str]] = {}
     for spec in requirements.values():
         for item in spec.get("items", []):
             relative = Path(str(item.get("path") or ""))
             if relative.name:
-                destinations[relative.name.lower()] = (relative, item.get("size_bytes"))
+                destinations[relative.name.lower()] = (
+                    relative,
+                    item.get("size_bytes"),
+                    str(item.get("sha256") or ""),
+                )
     return destinations
 
 
@@ -162,6 +199,18 @@ def _candidate_files(source: Path) -> Iterable[Path]:
     for path in source.rglob("*"):
         if path.is_file() and path.suffix.lower() in MODEL_EXTENSIONS:
             yield path
+
+
+def unsafe_model_files(source: Path) -> list[Path]:
+    """List pickle-compatible model files that require an explicit warning."""
+    source = Path(source)
+    if not source.is_dir():
+        return []
+    return [
+        path
+        for path in source.rglob("*")
+        if path.is_file() and path.suffix.lower() in UNSAFE_MODEL_EXTENSIONS
+    ]
 
 
 def _unknown_model_destination(source: Path, relative: Path) -> Path:
@@ -188,6 +237,7 @@ def import_model_directory(
     models_dir: Path,
     requirements: dict = MODEL_REQUIREMENTS,
     on_progress: Callable[[int, int, str], None] | None = None,
+    allow_unsafe: bool = False,
 ) -> dict:
     """Copy model files safely and return imported/skipped/failed counters.
 
@@ -215,16 +265,24 @@ def import_model_directory(
             on_progress(index, len(candidates), source_file.name)
 
         try:
+            if source_file.suffix.lower() in UNSAFE_MODEL_EXTENSIONS and not allow_unsafe:
+                raise ValueError(
+                    "该格式可能包含可执行反序列化内容；仅在确认来源可信后显式允许导入"
+                )
             relative = source_file.relative_to(source)
             expected = known.get(source_file.name.lower())
             if expected:
-                relative, expected_size = expected
+                relative, expected_size, expected_sha256 = expected
             else:
                 expected_size = None
+                expected_sha256 = ""
                 relative = _unknown_model_destination(source, relative)
             destination = models_dir / relative
             if source_file.resolve() == destination.resolve():
-                if model_file_ready(source_file, expected_size):
+                if model_file_ready(source_file, expected_size) and (
+                    not expected_sha256
+                    or model_file_sha256_matches(source_file, expected_sha256)
+                ):
                     result["skipped"] += 1
                     continue
                 raise ValueError("文件已在目标目录，但完整性校验未通过")
@@ -235,7 +293,14 @@ def import_model_directory(
                 raise ValueError(
                     f"文件大小不匹配（应为 {int(expected_size)} 字节，实际 {source_size} 字节）"
                 )
-            if model_file_ready(destination, expected_size):
+            if expected_sha256 and not model_file_sha256_matches(
+                source_file, expected_sha256
+            ):
+                raise ValueError("SHA256 与可信模型清单不一致")
+            if model_file_ready(destination, expected_size) and (
+                not expected_sha256
+                or model_file_sha256_matches(destination, expected_sha256)
+            ):
                 result["skipped"] += 1
                 continue
 
@@ -246,6 +311,10 @@ def import_model_directory(
                 shutil.copy2(source_file, temporary)
                 if temporary.stat().st_size != source_size:
                     raise IOError("复制后的文件大小与源文件不一致")
+                if expected_sha256 and not model_file_sha256_matches(
+                    temporary, expected_sha256
+                ):
+                    raise IOError("复制后的文件 SHA256 校验失败")
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)

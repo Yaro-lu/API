@@ -23,6 +23,29 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         app._last_health = {}
         return app
 
+    def test_system_environment_rejects_pre_cuda_13_driver(self):
+        result = main_gateway._check_system_env(
+            lambda *args, **kwargs: mock.Mock(
+                returncode=0,
+                stdout="NVIDIA RTX 4090, 576.80, 24564\n",
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("R580", result["error"])
+        self.assertEqual(result["driver_version"], "576.80")
+
+    def test_system_environment_accepts_cuda_13_driver(self):
+        result = main_gateway._check_system_env(
+            lambda *args, **kwargs: mock.Mock(
+                returncode=0,
+                stdout="NVIDIA RTX 4090, 580.88, 24564\n",
+            )
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["driver_version"], "580.88")
+
     def test_maintenance_guard_records_and_releases_owned_services(self):
         app = self._app()
         app._process_supervisor = mock.Mock()
