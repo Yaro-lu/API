@@ -467,6 +467,7 @@ class GatewayApp(WindowBase):
         self._client_instance_id = self._load_client_instance_id()
         self._last_completed_outputs = []
         self._last_completed_task_id = ""
+        self._last_terminal_task_signature = ""
         self._task_history = []
         self._task_history_ids = set()
         self._workflow_mode = tk.StringVar(value="default")
@@ -1678,6 +1679,7 @@ class GatewayApp(WindowBase):
     def _update_task_display(self, task: dict = None):
         """更新任务状态显示"""
         if task and task.get("status") in ("running", "pending", "submitted"):
+            self._last_terminal_task_signature = ""
             context_text = self._task_context_text(task)
             self._current_task_text = f"正在生成：{context_text}"
             self._last_completed_outputs = []
@@ -1707,6 +1709,20 @@ class GatewayApp(WindowBase):
             self._prog_detail.config(text=f"耗时：{elapsed}s")
 
         elif task and task.get("status") == "completed":
+            terminal_signature = json.dumps(
+                {
+                    "status": "completed",
+                    "task_id": task.get("task_id") or task.get("id"),
+                    "outputs": task.get("outputs") or [],
+                    "elapsed": task.get("elapsed_seconds", task.get("elapsed", 0)),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if terminal_signature == self.__dict__.get("_last_terminal_task_signature", ""):
+                return
+            self._last_terminal_task_signature = terminal_signature
             self._current_task_text = "已完成"
             self._show_progress_panel()
             self._last_completed_outputs = task.get("outputs") or []
@@ -1992,13 +2008,35 @@ class GatewayApp(WindowBase):
             return "可用"
         key = self._workflow_model_key(workflow)
         missing_count = len(self._missing_model_items(key)) if key else 0
-        return f"缺失 {missing_count} 个模型" if missing_count else "缺失模型"
+        reported_missing_models = sum(
+            len(workflow.get(field) or [])
+            for field in ("missing_models", "missingModels")
+            if isinstance(workflow.get(field), (list, tuple, set))
+        )
+        reported_missing_nodes = sum(
+            len(workflow.get(field) or [])
+            for field in ("missing_nodes", "missingNodes")
+            if isinstance(workflow.get(field), (list, tuple, set))
+        )
+        if missing_count or reported_missing_models:
+            return f"缺失 {missing_count or reported_missing_models} 个模型"
+        if reported_missing_nodes:
+            return f"缺失 {reported_missing_nodes} 个节点"
+        dependency_status = str(
+            workflow.get("dependency_status") or workflow.get("validation_status") or ""
+        ).lower()
+        if dependency_status in {"", "unknown", "unchecked", "unverified"} or workflow.get("nodes_verified") is False:
+            return "加载中"
+        return "需要检查"
 
     def _add_workflow_row(self, parent_box, workflow: dict, group: str):
         wf_id = str(workflow.get("id") or "").strip()
         title = self._workflow_display_name(workflow)
         available = workflow.get("enabled", True) and self._workflow_model_available(workflow)
         model_key = self._workflow_model_key(workflow)
+        status_text = self._workflow_status_text(workflow, available)
+        loading = status_text == "加载中"
+        status_color = C["success"] if available else C["warn"] if loading else C["error"]
 
         row = tk.Frame(parent_box, bg=C["card"])
         row.pack(fill="x", pady=4)
@@ -2045,14 +2083,13 @@ class GatewayApp(WindowBase):
 
         dot = tk.Canvas(row, width=9, height=9, bg=C["card"], highlightthickness=0)
         dot.grid(row=0, column=1, padx=(3, 6), pady=(7, 0), sticky="w")
-        dot.create_oval(1, 1, 8, 8, fill=C["success"] if available else C["error"], outline="")
+        dot.create_oval(1, 1, 8, 8, fill=status_color, outline="")
 
-        status_text = self._workflow_status_text(workflow, available)
         status_lbl = tk.Label(
             row,
             text=status_text,
             font=F["small"],
-            fg=C["success"] if available else C["error"],
+            fg=status_color,
             bg=C["card"],
             anchor="e",
             justify="right",
@@ -2063,7 +2100,7 @@ class GatewayApp(WindowBase):
             params_btn = self._button(row, "查看参数", lambda wf=dict(workflow): self._show_workflow_schema(wf), "plain", width=70)
             params_btn.grid(row=0, column=2, padx=(4, 6), sticky="e")
 
-        if not available and model_key:
+        if not available and not loading and model_key:
             help_btn = self._button(row, "查看", lambda key=model_key: self._show_model_install_help(key), "plain", width=54)
             help_btn.grid(row=0, column=2, padx=(4, 6), sticky="e")
 

@@ -169,7 +169,7 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         text_workflow = SimpleNamespace(
             id="llm_qwen3_text_gen",
-            name="Text Test",
+            name="qwen3.5",
             folder=text_workflow_dir,
             output_type="text",
         )
@@ -303,6 +303,20 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["workflow_id"], "flux_t2i_v1")
         self.assertEqual(payload["requested_workflow"], "FLUX2")
+
+    async def test_qwen_short_url_uses_english_workflow_name(self):
+        status, _headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/qwen3.5",
+            headers=self.auth,
+            json_body={"prompt": "写一段测试文本"},
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["workflow_id"], "llm_qwen3_text_gen")
+        self.assertEqual(payload["workflow_name"], "qwen3.5")
 
     async def test_unknown_short_url_returns_not_found(self):
         status, _headers, body = await asgi_request(

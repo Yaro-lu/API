@@ -383,8 +383,8 @@ class StaticDashboardPages:
                 detail += f" 等 {len(missing_nodes)} 个节点"
             return f"缺少 {len(missing_nodes)} 个节点", "danger", detail, ""
 
-        if dependency_status in {"unknown", "unchecked", "unverified", ""}:
-            return "依赖待确认", "warn", "模型已扫描；节点将在 ComfyUI 启动后核对", ""
+        if dependency_status in {"unknown", "unchecked", "unverified", ""} or workflow.get("nodes_verified") is False:
+            return "加载中", "neutral", "正在检查模型和 ComfyUI 节点", ""
 
         try:
             available = bool(self.app._workflow_model_available(workflow))
@@ -401,7 +401,7 @@ class StaticDashboardPages:
         states = [self._workflow_state(item) for item in workflows]
         ready_count = sum(1 for state, *_ in states if state == "可以使用")
         issue_count = sum(
-            1 for state, *_ in states if state not in {"可以使用", "已停用"}
+            1 for state, *_ in states if state not in {"可以使用", "已停用", "加载中"}
         )
 
         metrics = tk.Frame(body, bg=self.c["bg"])

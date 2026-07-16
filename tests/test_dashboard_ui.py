@@ -3,6 +3,7 @@ import tkinter as tk
 import unittest
 from unittest import mock
 
+from app.gui.dashboard_pages import StaticDashboardPages
 from app.gui.main_gateway import C, GatewayApp
 
 
@@ -294,6 +295,62 @@ class DashboardShellTests(unittest.TestCase):
             finally:
                 app._dashboard_pages.cancel_pending()
                 app.destroy()
+
+    def test_unverified_workflow_is_loading_instead_of_missing(self):
+        app = object.__new__(GatewayApp)
+        app._missing_model_items = mock.Mock(return_value=[])
+        workflow = {
+            "id": "llm_qwen3_text_gen",
+            "name": "qwen3.5",
+            "enabled": True,
+            "available": False,
+            "dependency_status": "unverified",
+            "nodes_verified": False,
+            "missing_models": [],
+            "missing_nodes": [],
+        }
+
+        self.assertEqual(app._workflow_status_text(workflow, False), "加载中")
+
+        pages = object.__new__(StaticDashboardPages)
+        pages.app = app
+        app._model_status = {"missing": {"Qwen3.5": []}}
+        app._workflow_model_available = mock.Mock(return_value=False)
+        self.assertEqual(
+            pages._workflow_state(workflow),
+            ("加载中", "neutral", "正在检查模型和 ComfyUI 节点", ""),
+        )
+
+    def test_repeated_completed_task_does_not_redraw_progress(self):
+        app = object.__new__(GatewayApp)
+        app._current_task_text = "无任务"
+        app._last_completed_outputs = []
+        app._last_completed_task_id = ""
+        app._task_status_label = mock.Mock()
+        app._prog_info = mock.Mock()
+        app._workflow_info = mock.Mock()
+        app._prog_detail = mock.Mock()
+        app._preview_output_btn = mock.Mock()
+        app._preview_output_btn.winfo_ismapped.return_value = False
+        app._show_progress_panel = mock.Mock()
+        app._task_context_text = mock.Mock(return_value="测试任务")
+        app._set_progress_bar = mock.Mock()
+        app._remember_task_history = mock.Mock()
+        app.after = mock.Mock()
+        task = {
+            "task_id": "task-completed-1",
+            "status": "completed",
+            "workflow_id": "flux_t2i_v1",
+            "progress_percent": 100,
+            "elapsed_seconds": 12,
+            "outputs": [],
+        }
+
+        app._update_task_display(task)
+        app._update_task_display(dict(task))
+
+        app._set_progress_bar.assert_called_once_with(100, "已完成 · 100%")
+        app.after.assert_called_once_with(15000, app._hide_progress)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "id": "llm_qwen3_text_gen",
-  "name": "千问3.5",
+  "name": "qwen3.5",
   "type": "text.chat",
   "engine": "comfyui",
   "version": "1.0.0",
