@@ -16,8 +16,8 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 import webbrowser
-import zipfile
 import msvcrt
 import uuid
 from pathlib import Path
@@ -54,7 +54,21 @@ from app.core.model_maintenance import (
     model_file_ready,
 )
 from app.core.runtime_state import RuntimeState
+from app.core.workflow_dependencies import (
+    clear_model_index_cache,
+    normalize_workflow_dependencies,
+    workflow_dependency_report,
+)
+from app.core.workflow_import import (
+    cleanup_stale_workflow_imports,
+    copy_workflow_assets,
+    create_import_workspace,
+    ensure_safe_workflows_root,
+    effective_workflow_root,
+    extract_zip_safely,
+)
 from app.gui.dashboard_pages import StaticDashboardPages
+from app.workflow_registry import WorkflowRegistry
 
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
@@ -422,6 +436,8 @@ class GatewayApp(WindowBase):
         self._runtime_maintenance_in_progress = False
         self._model_transfer_lock = threading.RLock()
         self._active_model_transfers = {}
+        self._workflow_management_lock = threading.Lock()
+        self._workflow_operation_name = ""
         self._tunnel_url = ""
         self._api_key = ""
         self._poll_run = False
@@ -465,6 +481,7 @@ class GatewayApp(WindowBase):
 
         # 状态缓存
         cleanup_incomplete_imports(BASE_DIR / "models")
+        cleanup_stale_workflow_imports(BASE_DIR / "workflows", BASE_DIR / "runtime")
         self._model_status = _check_models_status()
         self._environment_status = {}
         self._current_task_text = "无任务"
@@ -708,7 +725,8 @@ class GatewayApp(WindowBase):
             activeforeground=fg,
             relief="flat",
             bd=0,
-            width=width,
+            # CTk uses pixels while classic Tk uses character cells.
+            width=max(4, int(round(width / 9))) if width else None,
             cursor="hand2",
             command=command,
             highlightthickness=1,
@@ -796,6 +814,21 @@ class GatewayApp(WindowBase):
         if errors:
             raise errors[0]
         return not self._shutting_down
+
+    def _post_to_ui(self, callback, delay: int = 0) -> bool:
+        """Queue a short UI callback unless shutdown has already begun."""
+        if self._shutting_down:
+            return False
+
+        def invoke():
+            if not self._shutting_down:
+                callback()
+
+        try:
+            self.after(max(0, int(delay)), invoke)
+            return True
+        except (RuntimeError, tk.TclError):
+            return False
 
     def _request_backend_start(self, action_name: str = "启动后台") -> bool:
         """Start the full environment/backend sequence as one serialized action."""
@@ -2615,10 +2648,10 @@ class GatewayApp(WindowBase):
 
     def _workflow_slug(self, value: str) -> str:
         text = str(value or "").strip().lower()
-        text = re.sub(r"[^a-z0-9_\-\u4e00-\u9fff]+", "_", text)
-        text = re.sub(r"_+", "_", text).strip("_-")
+        text = re.sub(r"[^a-z0-9._-]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("._-")
         if not text:
-            text = f"workflow_{int(time.time())}"
+            text = f"workflow_{uuid.uuid4().hex[:8]}"
         return text[:64]
 
     def _unique_workflow_id(self, base_id: str) -> str:
@@ -2764,6 +2797,17 @@ class GatewayApp(WindowBase):
     def _format_workflow_schema_text(self, workflow: dict) -> str:
         schema = self._workflow_schema_for_display(workflow)
         output_type = str(workflow.get("output_type") or workflow.get("type") or "image").lower()
+        dependency_report = workflow_dependency_report(
+            workflow.get("dependencies") or {},
+            BASE_DIR / "models",
+        )
+        required_models = list(workflow.get("required_models") or dependency_report["required_models"])
+        missing_models = set(workflow.get("missing_models") or dependency_report["missing_models"])
+        unverified_models = set(
+            workflow.get("unverified_models") or dependency_report.get("unverified_models") or []
+        )
+        required_nodes = list(workflow.get("required_nodes") or dependency_report["required_nodes"])
+        missing_nodes = set(workflow.get("missing_nodes") or [])
         lines = [
             f"工作流：{self._workflow_display_name(workflow)}",
             f"ID：{workflow.get('id') or '-'}",
@@ -2786,6 +2830,21 @@ class GatewayApp(WindowBase):
                 default = item.get("default", None)
                 suffix = f"，默认 {json.dumps(default, ensure_ascii=False)}" if default not in (None, "") else ""
                 lines.append(f"  - {name} ({typ}, {required})：{label or name}{suffix}")
+        lines.extend(["", "模型与节点："])
+        if required_models:
+            for name in required_models:
+                marker = "缺少" if name in missing_models else ("待校验" if name in unverified_models else "已找到")
+                lines.append(f"  - 模型 [{marker}] {name}")
+        else:
+            lines.append("  - 模型：工作流未声明模型文件")
+        if required_nodes:
+            for name in required_nodes:
+                marker = "缺少" if name in missing_nodes else (
+                    "已找到" if workflow.get("nodes_verified") else "启动 ComfyUI 后校验"
+                )
+                lines.append(f"  - 节点 [{marker}] {name}")
+        else:
+            lines.append("  - 节点：工作流未声明节点")
         lines.extend([
             "",
             "通用请求字段：",
@@ -2844,12 +2903,51 @@ class GatewayApp(WindowBase):
         self._button(actions, "复制参数", copy_text, "primary").pack(side="left", ipadx=12, ipady=5)
         self._button(actions, "关闭", popup.destroy, "plain").pack(side="right", ipadx=12, ipady=5)
 
-    def _load_json_file(self, path: Path) -> dict:
+    def _load_json_file(self, path: Path, max_bytes: int = 64 * 1024 * 1024) -> dict:
+        path = Path(path)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise ValueError(f"无法读取 JSON 文件：{path.name}") from exc
+        if size <= 0:
+            raise ValueError(f"JSON 文件为空：{path.name}")
+        if size > max_bytes:
+            raise ValueError(f"JSON 文件过大：{path.name}（最大 {max_bytes // 1024 // 1024} MB）")
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("JSON 顶层必须是对象")
         return data
+
+    def _validate_workflow_manifest(self, manifest: dict) -> dict:
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest.json 顶层必须是对象")
+        for key, limit in (("id", 128), ("name", 200), ("type", 100), ("engine", 50)):
+            value = manifest.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"manifest.json 的 {key} 必须是文本")
+            if len(value.strip()) > limit:
+                raise ValueError(f"manifest.json 的 {key} 过长")
+        engine = str(manifest.get("engine") or "comfyui").strip().lower()
+        if engine != "comfyui":
+            raise ValueError("当前客户端只支持 engine=comfyui 的本地工作流")
+        for key in ("input_schema", "inputSchema"):
+            if key in manifest and not isinstance(manifest.get(key), dict):
+                raise ValueError(f"manifest.json 的 {key} 必须是对象")
+        if "inputs" in manifest and not isinstance(manifest.get("inputs"), list):
+            raise ValueError("manifest.json 的 inputs 必须是列表")
+        if "dependencies" in manifest and not isinstance(manifest.get("dependencies"), dict):
+            raise ValueError("manifest.json 的 dependencies 必须是对象")
+        if "enabled" in manifest and not isinstance(manifest.get("enabled"), bool):
+            raise ValueError("manifest.json 的 enabled 必须是 true 或 false")
+        for key, limit in (("version", 50), ("description", 500)):
+            if key in manifest and not isinstance(manifest.get(key), str):
+                raise ValueError(f"manifest.json 的 {key} 必须是文本")
+            if len(str(manifest.get(key) or "").strip()) > limit:
+                raise ValueError(f"manifest.json 的 {key} 过长")
+        return dict(manifest)
 
     def _is_comfy_api_workflow(self, data: dict) -> bool:
         return isinstance(data, dict) and any(
@@ -2968,162 +3066,193 @@ class GatewayApp(WindowBase):
                 return path
         raise ValueError("没有找到 ComfyUI API 格式的 workflow JSON。请在 ComfyUI 里使用“Save (API Format)”导出。")
 
-    def _prepare_workflow_source(self, source_path: Path) -> tuple[Path, dict, dict]:
+    def _prepare_workflow_source(self, source_path: Path) -> tuple[Path | None, Path, dict, dict, Path | None]:
         source_path = Path(source_path)
-        temp_dir = None
-        if source_path.is_file() and source_path.suffix.lower() == ".zip":
-            temp_dir = BASE_DIR / "runtime" / "workflow_import_tmp" / f"import_{int(time.time())}"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(source_path, "r") as zf:
-                zf.extractall(temp_dir)
-            candidates = [item for item in temp_dir.iterdir()]
-            source_path = candidates[0] if len(candidates) == 1 else temp_dir
+        cleanup_root = None
+        try:
+            if not source_path.exists():
+                raise ValueError("选择的工作流文件或目录不存在")
+            if source_path.is_symlink():
+                raise ValueError("工作流来源不能是符号链接")
 
-        manifest = {}
-        if source_path.is_dir():
-            manifest_path = source_path / "manifest.json"
-            if manifest_path.exists():
-                try:
-                    manifest = self._load_json_file(manifest_path)
-                except Exception:
-                    manifest = {}
-            workflow_json = self._find_workflow_json_in_dir(source_path)
-        else:
-            workflow_json = source_path
-
-        data = self._load_json_file(workflow_json)
-        if not self._is_comfy_api_workflow(data):
-            if "nodes" in data and "links" in data:
-                data = self._convert_front_workflow_to_api(data)
-                converted_dir = BASE_DIR / "runtime" / "workflow_import_tmp" / "converted"
-                converted_dir.mkdir(parents=True, exist_ok=True)
-                converted_path = converted_dir / f"{workflow_json.stem}_{int(time.time())}_api.json"
-                with open(converted_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                workflow_json = converted_path
-                print(f"[Workflow] Converted frontend workflow to API format: {workflow_json}")
+            source_root = None
+            if source_path.is_file() and source_path.suffix.lower() == ".zip":
+                cleanup_root = create_import_workspace(BASE_DIR / "runtime")
+                extract_zip_safely(source_path, cleanup_root)
+                source_root = effective_workflow_root(cleanup_root)
+            elif source_path.is_dir():
+                source_root = source_path
+            elif source_path.is_file() and source_path.suffix.lower() == ".json":
+                source_root = None
             else:
-                raise ValueError("这个 JSON 看起来不是 ComfyUI API 工作流。")
-        if not self._is_comfy_api_workflow(data):
-            raise ValueError("工作流自动转换失败：转换结果不是 API 模式。")
-        return workflow_json, data, manifest
+                raise ValueError("请选择 ComfyUI 工作流 JSON、ZIP 包或工作流文件夹")
 
-    def _write_workflow_config_from_manifests(self, default_workflow_id: str = ""):
-        config_path = BASE_DIR / "runtime" / "workflow_config.json"
-        workflows_dir = BASE_DIR / "workflows"
-        old_default = ""
-        if config_path.exists():
-            try:
-                old_default = self._load_json_file(config_path).get("default_workflow_id", "")
-            except Exception:
-                old_default = ""
+            manifest = {}
+            if source_root is not None:
+                manifest_path = source_root / "manifest.json"
+                if manifest_path.exists():
+                    manifest = self._validate_workflow_manifest(
+                        self._load_json_file(manifest_path, max_bytes=2 * 1024 * 1024)
+                    )
+                workflow_json = self._find_workflow_json_in_dir(source_root)
+            else:
+                workflow_json = source_path
 
-        type_map = {
-            "video.first_last_to_video": "video",
-            "video.image_to_video": "video",
-            "image.text_to_image": "image",
-            "text.chat": "text",
-        }
-        workflows = []
-        for folder in sorted(workflows_dir.iterdir() if workflows_dir.exists() else []):
-            if not folder.is_dir():
-                continue
-            manifest_path = folder / "manifest.json"
-            workflow_path = folder / "workflow.json"
-            if not manifest_path.exists() or not workflow_path.exists():
-                continue
-            try:
-                manifest = self._load_json_file(manifest_path)
-            except Exception:
-                continue
-            wf_id = str(manifest.get("id") or folder.name).strip()
-            raw_type = str(manifest.get("type") or "").strip()
-            output_type = type_map.get(raw_type, raw_type.split(".")[-1] if "." in raw_type else raw_type)
-            if output_type == "text_to_image":
-                output_type = "image"
-            workflows.append({
-                "id": wf_id,
-                "name": str(manifest.get("name") or wf_id).strip(),
-                "enabled": bool(manifest.get("enabled", True)),
-                "description": str(manifest.get("description") or manifest.get("name") or wf_id).strip(),
-                "workflow_json": f"{folder.name}/workflow.json",
-                "output_type": output_type or "image",
-                "folder_name": folder.name,
-                "input_schema": manifest.get("input_schema") or self._workflow_input_schema_for_type(output_type or "image"),
-                "inputs": (manifest.get("input_schema") or self._workflow_input_schema_for_type(output_type or "image")).get("inputs") or manifest.get("inputs") or [],
-            })
+            data = self._load_json_file(workflow_json)
+            if len(data) > 10_000:
+                raise ValueError("工作流节点过多（最多 10000 个）")
+            if not self._is_comfy_api_workflow(data):
+                if "nodes" in data and "links" in data:
+                    data = self._convert_front_workflow_to_api(data)
+                    print(f"[Workflow] Converted frontend workflow to API format: {workflow_json}")
+                else:
+                    raise ValueError("这个 JSON 看起来不是 ComfyUI API 工作流。")
+            if not self._is_comfy_api_workflow(data):
+                raise ValueError("工作流自动转换失败：转换结果不是 API 模式。")
+            return source_root, workflow_json, data, manifest, cleanup_root
+        except Exception:
+            if cleanup_root is not None:
+                shutil.rmtree(cleanup_root, ignore_errors=True)
+            raise
 
-        valid_ids = {item["id"] for item in workflows}
-        chosen_default = default_workflow_id or old_default
-        if chosen_default not in valid_ids:
-            image_default = next((item["id"] for item in workflows if item.get("output_type") == "image"), "")
-            chosen_default = image_default or (workflows[0]["id"] if workflows else "")
+    def _workflow_registry(self) -> WorkflowRegistry:
+        return WorkflowRegistry(
+            config_path=BASE_DIR / "runtime" / "workflow_config.json",
+            workflows_dir=BASE_DIR / "workflows",
+        )
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "workflows": workflows,
-                "default_workflow_id": chosen_default,
-            }, f, ensure_ascii=False, indent=2)
-        return workflows
+    def _workflow_records_from_registry(self, registry: WorkflowRegistry) -> list[dict]:
+        return [
+            {
+                **workflow.to_dict(),
+                "is_default": workflow.id == registry.default_workflow_id,
+            }
+            for workflow in registry.workflows
+        ]
+
+    def _write_workflow_config_from_manifests(self, default_workflow_id: str = "") -> tuple[list[dict], str]:
+        registry = self._workflow_registry()
+        registry.scan_folder()
+        if default_workflow_id and not registry.default_workflow_id:
+            registry.set_default(default_workflow_id)
+        return self._workflow_records_from_registry(registry), str(registry.default_workflow_id or "")
 
     def _install_workflow_from_path(self, source_path: Path) -> dict:
-        workflow_json, data, manifest = self._prepare_workflow_source(source_path)
-        source_path = Path(source_path)
-        source_stem = workflow_json.stem
-        if source_stem.lower() in ("workflow", "api", "workflow_api") and workflow_json.parent.name:
-            source_stem = workflow_json.parent.name
-        base_name = str(manifest.get("id") or source_stem or source_path.stem)
-        workflow_id = self._unique_workflow_id(base_name)
-        output_type = self._infer_workflow_output_type(workflow_json.stem, data, manifest)
-        workflow_name = str(manifest.get("name") or source_stem or workflow_id).strip()
-        target_dir = BASE_DIR / "workflows" / workflow_id
-        target_dir.mkdir(parents=True, exist_ok=False)
-
-        source_root = workflow_json.parent if source_path.is_dir() else None
-        if source_root and source_root.exists():
-            for item in source_root.iterdir():
-                if item.name.lower() == "manifest.json":
-                    continue
-                target = target_dir / item.name
-                if item.is_dir():
-                    shutil.copytree(item, target, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, target)
-        shutil.copy2(workflow_json, target_dir / "workflow.json")
+        source_root = None
+        cleanup_root = None
+        staging_dir = None
+        target_dir = None
+        target_committed = False
         try:
-            temp_root = (BASE_DIR / "runtime" / "workflow_import_tmp").resolve()
-            if str(workflow_json.resolve()).startswith(str(temp_root)):
-                workflow_json.unlink(missing_ok=True)
+            source_root, workflow_json, data, manifest, cleanup_root = self._prepare_workflow_source(source_path)
+            source_stem = workflow_json.stem
+            if source_stem.lower() in ("workflow", "api", "workflow_api") and workflow_json.parent.name:
+                source_stem = workflow_json.parent.name
+            base_name = str(manifest.get("id") or source_stem or Path(source_path).stem)
+            workflow_id = self._unique_workflow_id(base_name)
+            output_type = self._infer_workflow_output_type(workflow_json.stem, data, manifest)
+            workflow_name = str(manifest.get("name") or source_stem or workflow_id).strip()[:200]
+            if not workflow_name:
+                workflow_name = workflow_id
+
+            workflows_dir = ensure_safe_workflows_root(
+                BASE_DIR / "workflows",
+                create=True,
+            )
+            workflows_root = workflows_dir.resolve(strict=True)
+            target_dir = workflows_dir / workflow_id
+            staging_dir = Path(tempfile.mkdtemp(prefix=".importing_", dir=workflows_dir))
+            if staging_dir.resolve(strict=True).parent != workflows_root:
+                raise ValueError("工作流暂存目录越出项目范围")
+            if source_root is not None:
+                copy_workflow_assets(
+                    source_root,
+                    staging_dir,
+                    exclude_names={"manifest.json"},
+                )
+            if self._shutting_down:
+                raise RuntimeError("客户端正在退出，已取消工作流导入")
+
+            with open(staging_dir / "workflow.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            input_schema = manifest.get("input_schema") or manifest.get("inputSchema")
+            if not isinstance(input_schema, dict) or not input_schema:
+                input_schema = self._workflow_input_schema_for_type(output_type)
+            dependencies = normalize_workflow_dependencies(
+                manifest.get("dependencies") or {},
+                data,
+            )
+            manifest_data = {
+                **manifest,
+                "id": workflow_id,
+                "name": workflow_name,
+                "type": self._workflow_manifest_type(output_type),
+                "engine": "comfyui",
+                "enabled": bool(manifest.get("enabled", True)),
+                "version": str(manifest.get("version") or "1.0.0")[:50],
+                "description": str(
+                    manifest.get("description") or self._workflow_description_for_type(output_type)
+                )[:500],
+                "input_schema": input_schema,
+                "dependencies": dependencies,
+            }
+            with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f, ensure_ascii=False, indent=2)
+
+            registry = self._workflow_registry()
+            with registry.locked_mutation():
+                try:
+                    ensure_safe_workflows_root(workflows_dir)
+                    workflows_root = workflows_dir.resolve(strict=True)
+                    if staging_dir.resolve(strict=True).parent != workflows_root:
+                        raise ValueError("工作流暂存目录越出项目范围")
+                    if target_dir.resolve(strict=False).parent != workflows_root:
+                        raise ValueError("工作流目标目录越出项目范围")
+                    if target_dir.exists():
+                        raise FileExistsError(f"工作流 ID 已存在：{workflow_id}")
+                    os.replace(staging_dir, target_dir)
+                    staging_dir = None
+                    target_committed = True
+
+                    # Prepare every in-memory value before the atomic config
+                    # replace. If any preparation fails, the previous config
+                    # is still current and the committed directory is removed
+                    # while the same cross-process lock is held.
+                    registry._scan_folder_unlocked(save=False)
+                    workflows = self._workflow_records_from_registry(registry)
+                    default_workflow_id = str(registry.default_workflow_id or "")
+                    result = {
+                        "id": workflow_id,
+                        "name": workflow_name,
+                        "output_type": output_type,
+                        "target": str(target_dir),
+                        "workflows": workflows,
+                        "default_workflow_id": default_workflow_id,
+                        "dependencies": dependencies,
+                    }
+                    registry._save_unlocked()
+                except Exception:
+                    if target_committed and target_dir is not None:
+                        shutil.rmtree(target_dir, ignore_errors=False)
+                        target_committed = False
+                    registry._load_unlocked()
+                    raise
+            return result
         except Exception:
-            pass
-
-        manifest_data = {
-            **manifest,
-            "id": workflow_id,
-            "name": workflow_name,
-            "type": self._workflow_manifest_type(output_type),
-            "engine": manifest.get("engine", "comfyui"),
-            "version": manifest.get("version", "1.0.0"),
-            "description": manifest.get("description") or self._workflow_description_for_type(output_type),
-            "input_schema": manifest.get("input_schema") or self._workflow_input_schema_for_type(output_type),
-        }
-        with open(target_dir / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest_data, f, ensure_ascii=False, indent=2)
-
-        workflows = self._write_workflow_config_from_manifests(
-            workflow_id if output_type == "image" else ""
-        )
-        return {
-            "id": workflow_id,
-            "name": workflow_name,
-            "output_type": output_type,
-            "target": str(target_dir),
-            "workflows": workflows,
-        }
+            if target_committed and target_dir is not None:
+                shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            if cleanup_root is not None:
+                shutil.rmtree(cleanup_root, ignore_errors=True)
 
     def _reload_workflows_and_sync(self):
         import urllib.request as ur
+        if self._shutting_down:
+            return
         try:
             req = ur.Request(
                 f"{API_BASE}/v1/workflows/reload",
@@ -3135,37 +3264,110 @@ class GatewayApp(WindowBase):
         except Exception as reload_error:
             print(f"[Workflow] reload skipped/failed: {reload_error}")
 
+        if self._shutting_down:
+            return
         try:
             resp = ur.urlopen(f"{API_BASE}/health", timeout=8)
             data = json.loads(resp.read().decode("utf-8"))
-            self.after(0, lambda d=data: self._on_health_update(d))
+            self._post_to_ui(lambda d=data: self._on_health_update(d))
         except Exception as health_error:
             print(f"[Workflow] health refresh failed: {health_error}")
 
+        if self._shutting_down:
+            return
         if self._server_session_token:
             try:
                 self._sync_to_server_with_retry(max_retries=SERVER_SYNC_MAX_RETRIES)
-                self.after(0, lambda: self._set_light("server", "online", "已同步"))
+                self._post_to_ui(lambda: self._set_light("server", "online", "已同步"))
             except Exception as sync_error:
                 print(f"[Workflow] sync after import failed: {sync_error}")
-                self.after(0, lambda: self._set_light("server", "offline", "同步失败"))
+                self._post_to_ui(lambda: self._set_light("server", "offline", "同步失败"))
 
     def _show_workflow_import_result(self, result: dict):
         messagebox.showinfo(
             "工作流已导入",
-            "工作流已自动放入客户端目录并完成注册。\n\n"
+            "工作流已安全放入客户端目录并完成本地注册。\n\n"
             f"名称：{result.get('name')}\n"
             f"ID：{result.get('id')}\n"
             f"类型：{result.get('output_type')}\n\n"
-            "客户端会自动刷新本地 API，并在已登录时同步给服务端。",
+            "客户端正在后台加载最新列表；如果 API 暂未运行，会在下次启动时自动生效。\n"
+            "首次运行不可信工作流前，请先查看节点与模型清单。",
             parent=self,
         )
         self._footer_label.config(text=f"  工作流已导入：{result.get('name')}")
 
+    def _begin_workflow_operation(self, name: str) -> bool:
+        if self._shutting_down:
+            return False
+        if not self._workflow_management_lock.acquire(blocking=False):
+            current = self._workflow_operation_name or "工作流操作"
+            self._footer_label.config(text=f"  {current}正在进行，请稍候")
+            return False
+        self._workflow_operation_name = str(name or "工作流操作")
+        return True
+
+    def _end_workflow_operation(self):
+        self._workflow_operation_name = ""
+        try:
+            self._workflow_management_lock.release()
+        except RuntimeError:
+            pass
+
+    def _wait_for_workflow_idle(self, timeout: float = 10.0) -> bool:
+        lock = getattr(self, "_workflow_management_lock", None)
+        if lock is None:
+            return True
+        acquired = lock.acquire(timeout=max(0.0, float(timeout)))
+        if acquired:
+            lock.release()
+        return acquired
+
+    def _publish_local_workflows(self, workflows: list[dict], default_workflow_id: str = ""):
+        if self._shutting_down:
+            return
+        data = dict(self._last_health or {})
+        data["workflows"] = [dict(item) for item in workflows if isinstance(item, dict)]
+        data["workflow_count"] = len(data["workflows"])
+        data["default_workflow"] = default_workflow_id
+        data["default_workflow_id"] = default_workflow_id
+        self._last_health = data
+        self._update_workflow_display(data)
+        if hasattr(self, "_dashboard_pages"):
+            self._dashboard_pages.refresh(data)
+
+    def _finish_workflow_import(self, result: dict, popup=None):
+        if self._shutting_down:
+            return
+        try:
+            if popup is not None and popup.winfo_exists():
+                popup.destroy()
+        except Exception:
+            pass
+        self._publish_local_workflows(
+            result.get("workflows") or [],
+            str(result.get("default_workflow_id") or ""),
+        )
+        threading.Thread(target=self._reload_workflows_and_sync, daemon=True).start()
+        self._footer_label.config(text=f"  工作流已导入：{result.get('name')}")
+        self._post_to_ui(lambda data=dict(result): self._show_workflow_import_result(data), delay=50)
+
+    def _fail_workflow_operation(self, title: str, error: str, popup=None):
+        if self._shutting_down:
+            return
+        parent = self
+        try:
+            if popup is not None and popup.winfo_exists():
+                parent = popup
+        except Exception:
+            parent = self
+        messagebox.showerror(title, str(error), parent=parent)
+        self._footer_label.config(text=f"  {title}：{error}")
+
     def _select_and_install_workflow_file(self, popup=None):
         path = filedialog.askopenfilename(
-            title="选择 ComfyUI API 工作流 JSON",
+            title="选择 ComfyUI API 工作流 JSON 或 ZIP",
             filetypes=[
+                ("工作流文件", "*.json *.zip"),
                 ("ComfyUI API 工作流", "*.json"),
                 ("ZIP 工作流包", "*.zip"),
                 ("所有文件", "*.*"),
@@ -3186,36 +3388,148 @@ class GatewayApp(WindowBase):
         self._run_workflow_import(Path(path), popup)
 
     def _run_workflow_import(self, source_path: Path, popup=None):
-        try:
-            result = self._install_workflow_from_path(source_path)
-        except Exception as error:
-            messagebox.showerror("工作流导入失败", str(error), parent=popup or self)
+        if not self._begin_workflow_operation("工作流导入"):
             return
-        if popup:
-            popup.destroy()
-        self._update_model_display()
-        threading.Thread(target=self._reload_workflows_and_sync, daemon=True).start()
-        self._show_workflow_import_result(result)
+        try:
+            if popup is not None and popup.winfo_exists():
+                popup.grab_release()
+                popup.destroy()
+        except Exception:
+            pass
+        popup = None
+        self._footer_label.config(text="  正在安全检查并导入工作流...")
+
+        def worker():
+            try:
+                result = self._install_workflow_from_path(source_path)
+            except Exception as error:
+                if not self._shutting_down:
+                    self._post_to_ui(
+                        lambda message=str(error): self._fail_workflow_operation(
+                            "工作流导入失败", message, popup
+                        ),
+                    )
+            else:
+                if not self._shutting_down:
+                    try:
+                        self._run_ui_backend_step(
+                            lambda data=result: self._finish_workflow_import(data, popup)
+                        )
+                    except Exception as error:
+                        print(f"[Workflow] import UI completion failed: {error}")
+            finally:
+                self._end_workflow_operation()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._end_workflow_operation()
+            raise
+
+    def _run_workflow_setting_change(self, name: str, change, success_text: str):
+        if not self._begin_workflow_operation(name):
+            return
+        self._footer_label.config(text=f"  正在{name}...")
+
+        def worker():
+            try:
+                registry = self._workflow_registry()
+                registry.scan_folder()
+                if not change(registry):
+                    raise ValueError("工作流不存在、已停用或当前操作不允许")
+                workflows = self._workflow_records_from_registry(registry)
+                default_id = str(registry.default_workflow_id or "")
+            except Exception as error:
+                if not self._shutting_down:
+                    self._post_to_ui(
+                        lambda message=str(error): self._fail_workflow_operation(
+                            f"{name}失败", message
+                        ),
+                    )
+            else:
+                if not self._shutting_down:
+                    def finish():
+                        self._publish_local_workflows(workflows, default_id)
+                        self._footer_label.config(text=f"  {success_text}")
+                        threading.Thread(target=self._reload_workflows_and_sync, daemon=True).start()
+                    try:
+                        self._run_ui_backend_step(finish)
+                    except Exception as error:
+                        print(f"[Workflow] setting UI completion failed: {error}")
+            finally:
+                self._end_workflow_operation()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._end_workflow_operation()
+            raise
+
+    def _set_workflow_enabled(self, workflow_id: str, enabled: bool):
+        workflow_id = str(workflow_id or "").strip()
+
+        def change(registry: WorkflowRegistry):
+            if not enabled and len(registry.enabled_workflows) <= 1:
+                raise ValueError("至少需要保留一个已启用的工作流")
+            return registry.set_enabled(workflow_id, enabled)
+
+        action = "启用工作流" if enabled else "停用工作流"
+        self._run_workflow_setting_change(action, change, f"已{action[:2]}：{workflow_id}")
+
+    def _set_default_workflow(self, workflow_id: str):
+        workflow_id = str(workflow_id or "").strip()
+
+        def change(registry: WorkflowRegistry):
+            workflow = registry.get(workflow_id)
+            if not workflow or not workflow.enabled:
+                return False
+            workflow_path = workflow.folder / "workflow.json" if workflow.folder else None
+            if not workflow_path or not workflow_path.is_file():
+                raise ValueError("工作流文件不完整，暂时不能设为默认")
+            try:
+                workflow_data = self._load_json_file(workflow_path)
+            except Exception as error:
+                raise ValueError("工作流文件无法读取，暂时不能设为默认") from error
+            if not self._is_comfy_api_workflow(workflow_data):
+                raise ValueError("工作流不是可调用的 ComfyUI API 格式")
+            dependency = workflow_dependency_report(workflow.dependencies, BASE_DIR / "models")
+            if dependency["missing_models"]:
+                raise ValueError("请先补齐缺失模型，再设为默认工作流")
+            health_workflows = (self._last_health or {}).get("workflows") or []
+            health_item = next(
+                (
+                    item
+                    for item in health_workflows
+                    if isinstance(item, dict) and str(item.get("id") or "") == workflow_id
+                ),
+                {},
+            )
+            if health_item.get("missing_nodes"):
+                raise ValueError("请先安装缺失节点，再设为默认工作流")
+            return registry.set_default(workflow_id)
+
+        self._run_workflow_setting_change(
+            "设置默认工作流",
+            change,
+            f"默认工作流已设为：{workflow_id}",
+        )
 
     def _show_workflow_upload_dialog(self):
         text = (
-            "当前客户端暂时只支持三类工作流：\n\n"
-            "1. 文字模型：输入文字需求，用于服务端生成脚本、角色和分镜。\n"
-            "   当前主要由服务端设置里的文字模型承担，客户端只同步说明。\n\n"
-            "2. 文生图片模型：输入 prompt 文字，输出分镜图片。\n"
-            "   目录示例：workflows/flux_t2i_v1/workflow.json\n"
-            "   必填输入：prompt\n\n"
-            "3. 首尾帧视频模型：输入 prompt 文字、首帧图片、尾帧图片，输出分镜视频。\n"
-            "   目录示例：workflows/wan_flf2v_v1/workflow.json\n"
-            "   必填输入：prompt、start_image、end_image\n\n"
-            "推荐方式：\n"
-            "- 点击“选择工作流文件”，选择 ComfyUI 导出的 API Format JSON。\n"
-            "- 客户端会自动复制到 workflows 目录、生成 manifest、重建 workflow_config.json。\n"
-            "- 如果本地 API 已启动，会自动重载；如果已登录服务端，会自动同步 URL / Key / 工作流列表。\n\n"
-            "注意：如果工作流依赖新模型，模型下载地址和存放目录仍需要补充到 config/model_manifest.yaml，后续模型缺失提示才会完整。"
+            "最快的添加方式\n\n"
+            "1. 在 ComfyUI 中把工作流导出为 API Format JSON。\n"
+            "2. 点击下方“选择 JSON / ZIP”，其余注册步骤由客户端自动完成。\n"
+            "3. 回到“我的工作流”查看缺少的模型或节点；模型统一在“模型与环境”中维护。\n\n"
+            "客户端会根据工作流内容识别文字、图片或视频输出，并生成稳定的英文工作流 ID。"
+            "调用方只需使用客户端提供的 URL + Key，并把该 ID 放在 model 参数中。\n\n"
+            "也可以选择一个完整工作流文件夹。文件夹只应包含工作流 JSON、manifest 和少量说明/预览资源，"
+            "不要把大型模型放进工作流包。\n\n"
+            "安全提醒\n"
+            "来自互联网的工作流可能调用本机已经安装的 ComfyUI 自定义节点。客户端只会导入和检查，"
+            "不会自动运行；首次调用前请在“查看参数”中确认完整模型与节点清单。"
         )
         popup = tk.Toplevel(self)
-        popup.title("上传工作流")
+        popup.title("添加工作流")
         popup.geometry("700x500")
         popup.configure(bg=C["bg"])
         popup.transient(self)
@@ -3223,8 +3537,8 @@ class GatewayApp(WindowBase):
         self._center_popup(popup, 700, 500)
 
         panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
-        tk.Label(panel, text="上传工作流", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=20, pady=(18, 6))
-        tk.Label(panel, text="服务端会通过客户端接口读取工作流名称、类型和输入要求。",
+        tk.Label(panel, text="添加工作流", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=20, pady=(18, 6))
+        tk.Label(panel, text="选择一次文件，客户端会完成检查、复制、注册和状态刷新。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=20, pady=(0, 12))
         box = tk.Text(panel, font=F["small"], bg=C["entry"], fg=C["text"], relief="flat", wrap="word", height=18,
                       highlightthickness=1, highlightbackground=C["border2"])
@@ -3233,7 +3547,7 @@ class GatewayApp(WindowBase):
         box.config(state="disabled")
         actions = tk.Frame(panel, bg=C["card"])
         actions.pack(fill="x", padx=20, pady=(0, 16))
-        self._button(actions, "选择工作流文件", lambda: self._select_and_install_workflow_file(popup), "primary").pack(side="left", ipadx=12, ipady=6)
+        self._button(actions, "选择 JSON / ZIP", lambda: self._select_and_install_workflow_file(popup), "primary").pack(side="left", ipadx=12, ipady=6)
         self._button(actions, "选择工作流文件夹", lambda: self._select_and_install_workflow_folder(popup), "plain").pack(side="left", ipadx=12, ipady=6, padx=(10, 0))
         self._button(actions, "打开目录", self._open_workflows_dir, "plain").pack(side="left", ipadx=12, ipady=6, padx=(10, 0))
         self._button(actions, "关闭", popup.destroy, "plain").pack(side="right", ipadx=12, ipady=6)
@@ -4295,6 +4609,11 @@ class GatewayApp(WindowBase):
     def _workflow_model_available(self, workflow: dict) -> bool:
         if "available" in workflow:
             return bool(workflow.get("available"))
+        dependencies = workflow.get("dependencies")
+        if isinstance(dependencies, dict):
+            report = workflow_dependency_report(dependencies, BASE_DIR / "models")
+            if report["dependency_status"] != "ready":
+                return False
         for key in ("missing_models", "missingModels", "missing"):
             value = workflow.get(key)
             if isinstance(value, (list, tuple, set)) and value:
@@ -4337,19 +4656,30 @@ class GatewayApp(WindowBase):
         last_error = None
         attempts = max(1, int(max_retries or 1))
         for attempt in range(1, attempts + 1):
+            if self._shutting_down:
+                raise RuntimeError("客户端正在退出，已取消服务端同步")
             try:
                 result = self._sync_to_server(server_url, status, takeover=takeover)
+                if self._shutting_down:
+                    raise RuntimeError("客户端正在退出，已取消服务端同步")
                 self._server_sync_fail_count = 0
                 return result
             except Exception as ex:
                 if self._is_session_replaced_error(ex):
-                    self.after(0, self._handle_remote_session_replaced)
+                    self._post_to_ui(self._handle_remote_session_replaced)
                     raise ex
                 last_error = ex
                 self._server_sync_fail_count = attempt
                 if attempt < attempts:
-                    self.after(0, lambda a=attempt: self._set_light("server", "loading", f"重试 {a}/{attempts}"))
-                    time.sleep(min(2 * attempt, 6))
+                    self._post_to_ui(
+                        lambda a=attempt: self._set_light("server", "loading", f"重试 {a}/{attempts}")
+                    )
+                    delay = min(2 * attempt, 6)
+                    deadline = time.monotonic() + delay
+                    while time.monotonic() < deadline:
+                        if self._shutting_down:
+                            raise RuntimeError("客户端正在退出，已取消服务端同步")
+                        time.sleep(min(0.1, deadline - time.monotonic()))
         raise last_error
 
     def _is_session_replaced_error(self, error: Exception) -> bool:
@@ -4796,16 +5126,21 @@ class GatewayApp(WindowBase):
         threading.Thread(target=_do_copy, daemon=True).start()
 
     def _recheck_models(self):
-        self.after(0, lambda: self._set_light("models", "loading"))
+        if self._shutting_down:
+            return
+        self._post_to_ui(lambda: self._set_light("models", "loading"))
         time.sleep(0.3)
         self._model_status = _check_models_status()
+        clear_model_index_cache()
+        if self._shutting_down:
+            return
         if self._model_status["all_ok"]:
-            self.after(0, lambda: self._set_light("models", "online", "完整"))
+            self._post_to_ui(lambda: self._set_light("models", "online", "完整"))
         else:
-            self.after(0, lambda: self._set_light("models", "offline", "缺失"))
-        self.after(0, self._update_model_display)
+            self._post_to_ui(lambda: self._set_light("models", "offline", "缺失"))
+        self._post_to_ui(self._update_model_display)
         if hasattr(self, "_dashboard_pages"):
-            self.after(0, lambda: self._dashboard_pages.refresh(self._last_health))
+            self._post_to_ui(lambda: self._dashboard_pages.refresh(self._last_health))
 
     def _finish_runtime_recheck(self, result: dict):
         if self._shutting_down:
@@ -5710,6 +6045,7 @@ class GatewayApp(WindowBase):
 
             self.after(0, lambda: update_item("后台操作", "关闭中...", C["warn"]))
             retry_results = self._process_supervisor.shutdown_all(timeout=8)
+            workflow_idle = self._wait_for_workflow_idle(timeout=20)
             remaining = self._process_supervisor.remaining()
             comfy_left = bool(remaining.get("comfyui"))
             api_left = bool(remaining.get("api"))
@@ -5720,13 +6056,15 @@ class GatewayApp(WindowBase):
                 0,
                 lambda left=remaining: update_item(
                     "后台操作",
-                    "已停止 ✓" if not left else "需要清理",
-                    C["success"] if not left else C["error"],
+                    "已停止 ✓" if not left and workflow_idle else "需要清理",
+                    C["success"] if not left and workflow_idle else C["error"],
                 ),
             )
 
-            if remaining:
+            if remaining or not workflow_idle:
                 details = [error for error in retry_results.values() if error]
+                if not workflow_idle:
+                    details.append("工作流导入或设置仍在安全收尾")
                 if not details:
                     details = [
                         f"{role}: PID {', '.join(map(str, pids))}"
@@ -5779,6 +6117,8 @@ class GatewayApp(WindowBase):
         remaining = self._process_supervisor.remaining()
         for role, pids in remaining.items():
             results[role] = results.get(role) or f"PID {', '.join(map(str, pids))} 仍在运行"
+        if not self._wait_for_workflow_idle(timeout=timeout):
+            results["workflow"] = "工作流导入或设置仍在安全收尾"
         try:
             RuntimeState(BASE_DIR / "runtime").set_offline()
         except Exception as exc:

@@ -15,6 +15,7 @@ from app.core.runtime_package import (
     REQUIRED_RUNTIME_PATHS,
     missing_runtime_paths,
 )
+from app.core.workflow_dependencies import workflow_dependency_report
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -65,9 +66,21 @@ class StaticDashboardPages:
                 "workflows": [
                     {
                         "id": item.get("id"),
+                        "name": item.get("name"),
+                        "type": item.get("type") or item.get("output_type"),
                         "enabled": item.get("enabled", True),
                         "available": item.get("available"),
                         "missing": item.get("missing_models") or item.get("missingModels") or item.get("missing"),
+                        "missing_nodes": item.get("missing_nodes") or item.get("missingNodes"),
+                        "required_models": item.get("required_models"),
+                        "unverified_models": item.get("unverified_models"),
+                        "required_nodes": item.get("required_nodes"),
+                        "is_default": item.get("is_default", False),
+                        "dependency_status": item.get("dependency_status"),
+                        "validation_status": item.get("validation_status"),
+                        "dependencies": item.get("dependencies"),
+                        "input_schema": item.get("input_schema"),
+                        "workflow_json": item.get("workflow_json"),
                     }
                     for item in workflows
                     if isinstance(item, dict)
@@ -195,6 +208,11 @@ class StaticDashboardPages:
             return text
         return f"{text[:18]}...{text[-(limit - 21):]}"
 
+    @staticmethod
+    def _short_text(value, limit: int = 24) -> str:
+        text = str(value or "")
+        return text if len(text) <= limit else f"{text[:max(1, limit - 1)]}…"
+
     # ── data helpers ───────────────────────────────────────
     def _runtime_ready(self) -> bool:
         return self._runtime_status()[0] == "ready"
@@ -254,6 +272,20 @@ class StaticDashboardPages:
         workflows_dir = BASE_DIR / "workflows"
         if not workflows_dir.exists():
             return records
+        configured = {}
+        default_workflow_id = ""
+        config_path = BASE_DIR / "runtime" / "workflow_config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(config, dict):
+                default_workflow_id = str(config.get("default_workflow_id") or "")
+                configured = {
+                    str(item.get("id") or ""): item
+                    for item in config.get("workflows", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+        except (OSError, json.JSONDecodeError, TypeError):
+            configured = {}
         for folder in sorted(workflows_dir.iterdir()):
             manifest_path = folder / "manifest.json"
             if not folder.is_dir() or not manifest_path.exists():
@@ -283,11 +315,15 @@ class StaticDashboardPages:
             records.append(
                 {
                     **manifest,
+                    **configured.get(str(manifest.get("id") or folder.name), {}),
                     "id": str(manifest.get("id") or folder.name),
                     "name": str(manifest.get("name") or folder.name),
-                    "enabled": manifest.get("enabled", True),
+                    "enabled": configured.get(str(manifest.get("id") or folder.name), {}).get(
+                        "enabled", manifest.get("enabled", True)
+                    ),
                     "output_type": output_type,
                     "workflow_json": f"{folder.name}/workflow.json" if (folder / "workflow.json").exists() else "",
+                    "is_default": str(manifest.get("id") or folder.name) == default_workflow_id,
                 }
             )
         return records
@@ -312,6 +348,7 @@ class StaticDashboardPages:
         except Exception:
             pass
         missing = []
+        missing_nodes = []
         model_status = getattr(self.app, "_model_status", {})
         if model_key:
             missing = list((model_status.get("missing") or {}).get(model_key) or [])
@@ -319,6 +356,19 @@ class StaticDashboardPages:
             value = workflow.get(key)
             if isinstance(value, (list, tuple)):
                 missing.extend(str(item) for item in value if item)
+        for key in ("missing_nodes", "missingNodes"):
+            value = workflow.get(key)
+            if isinstance(value, (list, tuple)):
+                missing_nodes.extend(str(item) for item in value if item)
+
+        dependency_status = str(workflow.get("dependency_status") or "").lower()
+        dependencies = workflow.get("dependencies")
+        if isinstance(dependencies, dict):
+            report = workflow_dependency_report(dependencies, BASE_DIR / "models")
+            if not missing:
+                missing.extend(report["missing_models"])
+            if not dependency_status:
+                dependency_status = report["dependency_status"]
         missing = list(dict.fromkeys(missing))
         if missing:
             detail = "、".join(missing[:2])
@@ -326,9 +376,15 @@ class StaticDashboardPages:
                 detail += f" 等 {len(missing)} 个文件"
             return f"缺少 {len(missing)} 个模型", "warn", detail, model_key
 
-        dependency_status = str(workflow.get("dependency_status") or "").lower()
-        if not model_key or dependency_status in {"unknown", "unchecked"}:
-            return "依赖未声明", "warn", "可尝试运行，建议补充模型与节点清单", ""
+        missing_nodes = list(dict.fromkeys(missing_nodes))
+        if missing_nodes:
+            detail = "、".join(missing_nodes[:2])
+            if len(missing_nodes) > 2:
+                detail += f" 等 {len(missing_nodes)} 个节点"
+            return f"缺少 {len(missing_nodes)} 个节点", "danger", detail, ""
+
+        if dependency_status in {"unknown", "unchecked", "unverified", ""}:
+            return "依赖待确认", "warn", "模型已扫描；节点将在 ComfyUI 启动后核对", ""
 
         try:
             available = bool(self.app._workflow_model_available(workflow))
@@ -344,7 +400,9 @@ class StaticDashboardPages:
         workflows = self._workflow_records()
         states = [self._workflow_state(item) for item in workflows]
         ready_count = sum(1 for state, *_ in states if state == "可以使用")
-        issue_count = max(0, len(workflows) - ready_count)
+        issue_count = sum(
+            1 for state, *_ in states if state not in {"可以使用", "已停用"}
+        )
 
         metrics = tk.Frame(body, bg=self.c["bg"])
         metrics.pack(fill="x", pady=(0, 14))
@@ -367,6 +425,35 @@ class StaticDashboardPages:
         listing = self._card(body, listing_height)
         listing.pack(fill="x", pady=(0, 14))
 
+        rows_parent = listing
+        scroll_canvas = None
+        if len(workflows) > 3:
+            scrollbar = tk.Scrollbar(listing, orient="vertical")
+            scrollbar.pack(side="right", fill="y", padx=(0, 3), pady=5)
+            scroll_canvas = tk.Canvas(
+                listing,
+                bg=self.c["card"],
+                highlightthickness=0,
+                bd=0,
+                yscrollcommand=scrollbar.set,
+            )
+            scroll_canvas.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=3)
+            scrollbar.configure(command=scroll_canvas.yview)
+            rows_parent = tk.Frame(scroll_canvas, bg=self.c["card"])
+            rows_window = scroll_canvas.create_window((0, 0), window=rows_parent, anchor="nw")
+            rows_parent.bind(
+                "<Configure>",
+                lambda _event, canvas=scroll_canvas: canvas.configure(
+                    scrollregion=canvas.bbox("all")
+                ),
+            )
+            scroll_canvas.bind(
+                "<Configure>",
+                lambda event, canvas=scroll_canvas, window=rows_window: canvas.itemconfigure(
+                    window, width=event.width
+                ),
+            )
+
         if not workflows:
             tk.Label(listing, text="还没有工作流", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(pady=(28, 4))
             tk.Label(listing, text="点击右上角“添加工作流”即可开始。", font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack()
@@ -384,19 +471,28 @@ class StaticDashboardPages:
                     "success": self.c["soft_success"],
                     "warn": self.c["soft_warn"],
                 }[type_tone]
-                row = tk.Frame(listing, bg=self.c["card"])
+                row = tk.Frame(rows_parent, bg=self.c["card"])
                 row.pack(fill="x", padx=14, pady=(9 if index == 0 else 6, 6))
                 tk.Label(row, text=glyph, font=self.f["bold"], fg=tone_fg, bg=tone_bg, width=3, pady=6).pack(side="left")
-                name_box = tk.Frame(row, bg=self.c["card"])
+                name_box = tk.Frame(row, bg=self.c["card"], width=180, height=44)
                 name_box.pack(side="left", padx=(11, 0), fill="x", expand=True)
-                tk.Label(name_box, text=str(workflow.get("name") or workflow.get("id") or "未命名工作流"), font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-                tk.Label(name_box, text=str(workflow.get("id") or ""), font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
-                tk.Label(row, text=kind, width=7, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
-                detail_box = tk.Frame(row, bg=self.c["card"], width=210, height=44)
+                name_box.pack_propagate(False)
+                name_line = tk.Frame(name_box, bg=self.c["card"])
+                name_line.pack(fill="x", anchor="w")
+                display_name = self._short_text(
+                    workflow.get("name") or workflow.get("id") or "未命名工作流",
+                    18,
+                )
+                tk.Label(name_line, text=display_name, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+                if workflow.get("is_default"):
+                    self._badge(name_line, "默认", "primary").pack(side="left", padx=(7, 0))
+                tk.Label(name_box, text=self._short_text(workflow.get("id"), 24), font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
+                tk.Label(row, text=kind, width=6, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
+                detail_box = tk.Frame(row, bg=self.c["card"], width=174, height=44)
                 detail_box.pack(side="left", padx=(4, 8))
                 detail_box.pack_propagate(False)
                 self._badge(detail_box, state, state_tone).pack(anchor="w")
-                tk.Label(detail_box, text=detail, font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"], anchor="w").pack(anchor="w", pady=(2, 0))
+                tk.Label(detail_box, text=self._short_text(detail, 24), font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"], anchor="w").pack(anchor="w", pady=(2, 0))
 
                 if state_tone == "warn" and model_key:
                     self._action(
@@ -404,17 +500,52 @@ class StaticDashboardPages:
                         "修复",
                         lambda key=model_key: self.app._show_model_install_help(key),
                         "primary",
-                        72,
+                        58,
                     ).pack(side="right", padx=(6, 0))
                 self._action(
                     row,
                     "查看参数",
                     lambda item=dict(workflow): self.app._show_workflow_schema(item),
                     "plain",
-                    84,
+                    78,
                 ).pack(side="right")
+                workflow_id = str(workflow.get("id") or "")
+                enabled = bool(workflow.get("enabled", True))
+                self._action(
+                    row,
+                    "停用" if enabled else "启用",
+                    lambda wf_id=workflow_id, next_enabled=not enabled: self.app._set_workflow_enabled(
+                        wf_id, next_enabled
+                    ),
+                    "plain" if enabled else "primary",
+                    56,
+                ).pack(side="right", padx=(6, 0))
+                can_be_default = (
+                    enabled
+                    and state not in {"文件异常", "需要检查"}
+                    and not state.startswith("缺少")
+                )
+                if can_be_default and not workflow.get("is_default"):
+                    self._action(
+                        row,
+                        "设为默认",
+                        lambda wf_id=workflow_id: self.app._set_default_workflow(wf_id),
+                        "plain",
+                        68,
+                    ).pack(side="right", padx=(6, 0))
                 if index < len(workflows) - 1:
-                    tk.Frame(listing, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
+                    tk.Frame(rows_parent, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
+
+            if scroll_canvas is not None:
+                def scroll(event, canvas=scroll_canvas):
+                    canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+                def bind_wheel(widget):
+                    widget.bind("<MouseWheel>", scroll, add="+")
+                    for child in widget.winfo_children():
+                        bind_wheel(child)
+
+                bind_wheel(rows_parent)
 
         guide = self._card(body, 96)
         guide.pack(fill="x")

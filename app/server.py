@@ -35,6 +35,7 @@ from app.config import Config
 from app.core.model_maintenance import MODEL_REQUIREMENTS, check_model_groups
 from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths
 from app.core.runtime_state import RuntimeState
+from app.core.workflow_dependencies import workflow_dependency_report
 from app.workflow_registry import WorkflowRegistry
 from app.tunnel.cloudflared_manager import CloudflaredManager
 from app.engines.comfyui_client import ComfyUIClient
@@ -53,6 +54,8 @@ PUBLIC_PATHS = {"/health", "/openapi.json", "/docs", "/redoc"}
 
 # mutex for current_task
 _task_lock = threading.Lock()
+_comfy_nodes_lock = threading.Lock()
+_comfy_nodes_cache = {"url": "", "checked_at": 0.0, "nodes": None}
 
 
 def _clamped_nonterminal_progress_percent(value) -> int:
@@ -93,10 +96,10 @@ def _workflow_type(workflow_id: str, output_type: str = "") -> str:
 
 def _workflow_json_data(w) -> dict:
     try:
-        workflow_json = getattr(w, "workflow_json", "") or "workflow.json"
-        path = getattr(w, "folder", BASE_DIR / "workflows" / getattr(w, "id", "")) / workflow_json
-        if not Path(path).exists():
-            path = getattr(w, "folder", BASE_DIR / "workflows" / getattr(w, "id", "")) / "workflow.json"
+        folder = getattr(w, "folder", None) or BASE_DIR / "workflows" / getattr(w, "id", "")
+        path = Path(folder) / "workflow.json"
+        if not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
+            return {}
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
@@ -188,11 +191,69 @@ def _normalize_input_schema(schema: dict, workflow_type: str) -> dict:
     return merged
 
 
+def _installed_comfy_node_types(cache_seconds: float = 30.0) -> set[str] | None:
+    """Read ComfyUI node types with a short cache; unavailable means unverified."""
+    if config is None:
+        return None
+    url = str(config.comfyui_url or "").rstrip("/")
+    if not url:
+        return None
+    now = time.monotonic()
+    with _comfy_nodes_lock:
+        cached_nodes = _comfy_nodes_cache["nodes"]
+        cache_ttl = max(0.0, cache_seconds) if cached_nodes is not None else min(1.0, max(0.0, cache_seconds))
+        if (
+            _comfy_nodes_cache["url"] == url
+            and now - float(_comfy_nodes_cache["checked_at"]) < cache_ttl
+        ):
+            return set(cached_nodes) if cached_nodes is not None else None
+    try:
+        import requests
+
+        response = requests.get(f"{url}/object_info", timeout=1.0)
+        response.raise_for_status()
+        data = response.json()
+        nodes = set(data) if isinstance(data, dict) else None
+    except Exception:
+        nodes = None
+    with _comfy_nodes_lock:
+        _comfy_nodes_cache.update(
+            {"url": url, "checked_at": now, "nodes": set(nodes) if nodes is not None else None}
+        )
+    return nodes
+
+
 def _workflow_payload(w) -> dict:
     workflow_type = _workflow_type(w.id, getattr(w, "output_type", ""))
     if workflow_type == "text_chat" and _workflow_has_image_input(w):
         workflow_type = "text_vision"
     input_schema = _normalize_input_schema(getattr(w, "input_schema", {}) or {}, workflow_type)
+    dependency = workflow_dependency_report(
+        getattr(w, "dependencies", {}) or {},
+        BASE_DIR / "models",
+        installed_nodes=_installed_comfy_node_types(),
+    )
+    workflow_data = _workflow_json_data(w)
+    workflow_file_ready = bool(
+        workflow_data
+        and any(
+            isinstance(node, dict) and str(node.get("class_type") or "").strip()
+            for node in workflow_data.values()
+        )
+    )
+    dependency_status = dependency["dependency_status"]
+    if not workflow_file_ready:
+        validation_status = "file_error"
+    elif not w.enabled:
+        validation_status = "disabled"
+    else:
+        validation_status = dependency_status
+    available = bool(
+        w.enabled
+        and workflow_file_ready
+        and dependency_status == "ready"
+        and dependency["available"]
+    )
     return {
         "id": w.id,
         "name": w.name,
@@ -203,6 +264,17 @@ def _workflow_payload(w) -> dict:
         "input_schema": input_schema,
         "inputs": input_schema["inputs"],
         "is_default": w.id == registry.default_workflow_id,
+        "workflow_json": getattr(w, "workflow_json", ""),
+        "dependencies": dependency["dependencies"],
+        "required_models": dependency["required_models"],
+        "missing_models": dependency["missing_models"],
+        "unverified_models": dependency["unverified_models"],
+        "required_nodes": dependency["required_nodes"],
+        "missing_nodes": dependency["missing_nodes"],
+        "nodes_verified": dependency["nodes_verified"],
+        "dependency_status": dependency_status,
+        "validation_status": validation_status,
+        "available": available,
     }
 
 def _model_group_for_type(model_type: str) -> str:
@@ -258,7 +330,7 @@ def _models_from_workflows() -> list:
     for wf in registry.workflows:
         payload = _workflow_payload(wf)
         model_id = payload["id"]
-        available = payload.get("enabled", True) and _workflow_available(model_id, payload.get("type", ""))
+        available = bool(payload.get("available"))
         if not model_id or model_id in seen:
             continue
         seen.add(model_id)
@@ -871,6 +943,21 @@ def create_app() -> FastAPI:
                 comfyui_status = "online"
         except Exception:
             pass
+        with _comfy_nodes_lock:
+            if comfyui_status == "online":
+                if (
+                    _comfy_nodes_cache["url"] == str(comfyui_url).rstrip("/")
+                    and _comfy_nodes_cache["nodes"] is None
+                ):
+                    _comfy_nodes_cache["checked_at"] = 0.0
+            else:
+                _comfy_nodes_cache.update(
+                    {
+                        "url": str(comfyui_url).rstrip("/"),
+                        "checked_at": time.monotonic(),
+                        "nodes": None,
+                    }
+                )
 
         # 运行时环境检查
         runtime_status = _local_runtime_status()

@@ -7,6 +7,8 @@ from unittest import mock
 
 from app import server
 from app.core.runtime_package import REQUIRED_RUNTIME_PATHS
+from app.core.workflow_dependencies import clear_model_index_cache
+from app.workflow_registry import WorkflowDef
 
 
 FIXTURE_REQUIREMENTS = {
@@ -23,6 +25,13 @@ FIXTURE_REQUIREMENTS = {
 
 
 class ServerStatusTests(unittest.TestCase):
+    def tearDown(self):
+        clear_model_index_cache()
+        with server._comfy_nodes_lock:
+            server._comfy_nodes_cache.update(
+                {"url": "", "checked_at": 0.0, "nodes": None}
+            )
+
     def test_stale_public_url_is_hidden_while_tunnel_is_offline(self):
         fake_state = SimpleNamespace(
             base_url="https://stale.example",
@@ -118,6 +127,96 @@ class ServerStatusTests(unittest.TestCase):
             self.assertEqual(status["status"], "missing")
             self.assertFalse(status["python"])
             self.assertIn(REQUIRED_RUNTIME_PATHS[0].as_posix(), status["missing"])
+
+    def test_invalid_workflow_json_is_never_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            folder = base / "workflows" / "broken"
+            folder.mkdir(parents=True)
+            (folder / "workflow.json").write_text("{broken", encoding="utf-8")
+            workflow = WorkflowDef(
+                id="broken",
+                name="Broken",
+                folder_name="broken",
+                workflow_json="broken/workflow.json",
+                dependencies={"nodes": ["SaveImage"]},
+            )
+            workflow._workflows_dir = base / "workflows"
+
+            with (
+                mock.patch.object(server, "BASE_DIR", base),
+                mock.patch.object(server, "registry", SimpleNamespace(default_workflow_id="broken")),
+                mock.patch.object(server, "_installed_comfy_node_types", return_value={"SaveImage"}),
+            ):
+                payload = server._workflow_payload(workflow)
+
+            self.assertEqual(payload["validation_status"], "file_error")
+            self.assertFalse(payload["available"])
+
+    def test_workflow_payload_moves_from_missing_to_ready_and_reports_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            folder = base / "workflows" / "image"
+            folder.mkdir(parents=True)
+            (folder / "workflow.json").write_text(
+                '{"1":{"class_type":"CheckpointLoaderSimple","inputs":{}}}',
+                encoding="utf-8",
+            )
+            workflow = WorkflowDef(
+                id="image",
+                name="Image",
+                folder_name="image",
+                workflow_json="image/workflow.json",
+                output_type="image",
+                dependencies={
+                    "models": ["diffusion_models/image.safetensors"],
+                    "nodes": ["CheckpointLoaderSimple"],
+                },
+            )
+            workflow._workflows_dir = base / "workflows"
+            patches = (
+                mock.patch.object(server, "BASE_DIR", base),
+                mock.patch.object(server, "registry", SimpleNamespace(default_workflow_id="image")),
+                mock.patch.object(
+                    server,
+                    "_installed_comfy_node_types",
+                    return_value={"CheckpointLoaderSimple"},
+                ),
+            )
+            with patches[0], patches[1], patches[2]:
+                missing = server._workflow_payload(workflow)
+                model = base / "models" / "diffusion_models" / "image.safetensors"
+                model.parent.mkdir(parents=True)
+                model.write_bytes(b"model")
+                clear_model_index_cache()
+                ready = server._workflow_payload(workflow)
+                workflow.enabled = False
+                disabled = server._workflow_payload(workflow)
+
+            self.assertEqual(missing["dependency_status"], "missing")
+            self.assertEqual(missing["missing_models"], ["image.safetensors"])
+            self.assertTrue(ready["available"])
+            self.assertTrue(ready["is_default"])
+            self.assertEqual(disabled["validation_status"], "disabled")
+            self.assertFalse(disabled["available"])
+
+    def test_failed_comfy_node_probe_recovers_on_short_retry(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"SaveImage": {}, "LoadImage": {}}
+        fake_config = SimpleNamespace(comfyui_url="http://127.0.0.1:8188")
+
+        with (
+            mock.patch.object(server, "config", fake_config),
+            mock.patch.object(server.time, "monotonic", side_effect=[0.0, 2.0]),
+            mock.patch("requests.get", side_effect=[OSError("starting"), response]) as get,
+        ):
+            first = server._installed_comfy_node_types(cache_seconds=30)
+            second = server._installed_comfy_node_types(cache_seconds=30)
+
+        self.assertIsNone(first)
+        self.assertEqual(second, {"SaveImage", "LoadImage"})
+        self.assertEqual(get.call_count, 2)
 
 
 if __name__ == "__main__":
