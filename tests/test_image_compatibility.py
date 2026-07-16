@@ -79,6 +79,10 @@ class FakeRegistry:
     def scan_folder(self):
         return []
 
+    @property
+    def enabled_workflows(self):
+        return [workflow for workflow in self.workflows if getattr(workflow, "enabled", True)]
+
     def resolve(self, workflow_id=None):
         if workflow_id in (None, ""):
             return self.workflows[0]
@@ -146,7 +150,7 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         image_workflow = SimpleNamespace(
             id="flux_t2i_v1",
-            name="Flux Test",
+            name="flux2",
             folder=workflow_dir,
             output_type="image",
         )
@@ -263,6 +267,55 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["status_url"].endswith(payload["status_path"]))
         FakeComfyUIClient.release.set()
         release_timer.cancel()
+
+    async def test_root_short_url_runs_current_default_workflow_asynchronously(self):
+        status, headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/",
+            headers=self.auth,
+            json_body=self._image_body(),
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["workflow_id"], "flux_t2i_v1")
+        self.assertEqual(payload["workflow_name"], "flux2")
+        self.assertEqual(payload["status"], "submitted")
+        self.assertEqual(headers["location"], payload["status_path"])
+        self.assertTrue(payload["status_url"].endswith(payload["status_path"]))
+        request_files = list(self.fake_config.requests_dir.glob("task_*.json"))
+        self.assertEqual(len(request_files), 1)
+        saved_request = json.loads(request_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(saved_request["body"]["width"], 1024)
+        self.assertEqual(saved_request["body"]["height"], 1024)
+
+    async def test_named_short_url_resolves_case_insensitive_workflow_name(self):
+        status, _headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/FLUX2",
+            headers=self.auth,
+            json_body=self._image_body(),
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["workflow_id"], "flux_t2i_v1")
+        self.assertEqual(payload["requested_workflow"], "FLUX2")
+
+    async def test_unknown_short_url_returns_not_found(self):
+        status, _headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/not-a-workflow",
+            headers=self.auth,
+            json_body=self._image_body(),
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 404)
+        self.assertIn("not-a-workflow", payload["detail"])
 
     async def test_sync_wait_keeps_event_loop_responsive_and_ark_shape(self):
         release_timer = threading.Timer(0.35, FakeComfyUIClient.release.set)

@@ -3,6 +3,8 @@ Local AI API Gateway — API 服务器
 
 集成 FastAPI + Bearer 鉴权 + Cloudflare Quick Tunnel
 端点：
+  POST /                             → 默认工作流（短 URL）
+  POST /{workflow_alias}            → 指定工作流（短 URL）
   POST /v1/workflows/run             → 默认工作流
   POST /v1/workflows/run/{wf_id}     → 指定工作流
   GET  /v1/workflows/list            → 工作流列表
@@ -627,6 +629,32 @@ def _image_task_submission_payload(submitted: dict, model: str) -> dict:
     }
 
 
+def _workflow_task_submission_payload(
+    submitted: dict,
+    requested_workflow: str = "",
+    output_type: str = "",
+) -> dict:
+    task_id = str(submitted.get("task_id") or submitted.get("id") or "")
+    status_path = f"/v1/tasks/{quote(task_id, safe='')}"
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "object": "workflow.task",
+        "created": int(time.time()),
+        "status": "submitted",
+        "requested_workflow": requested_workflow,
+        "workflow": submitted.get("workflow_id") or "",
+        "workflow_id": submitted.get("workflow_id") or "",
+        "workflow_name": submitted.get("workflow_name") or "",
+        "output_type": output_type,
+        "prompt_id": submitted.get("prompt_id") or "",
+        "status_path": status_path,
+        "status_url": f"{_public_base_url()}{status_path}",
+        "poll_after_ms": 3000,
+        "data": [],
+    }
+
+
 def _normalize_seed(value) -> int:
     """ComfyUI 的 noise_seed 不接受 -1；外部 API 里 -1 统一表示随机种子。"""
     try:
@@ -1124,6 +1152,88 @@ def create_app() -> FastAPI:
             "prompt_id": task_info["prompt_id"],
             "message": f"任务已提交，通过 /health 查看进度",
         }
+
+    def _resolve_short_workflow(workflow_alias: Optional[str]):
+        requested = str(workflow_alias or "").strip()
+        if not requested:
+            return registry.resolve(None)
+
+        exact = registry.resolve(requested)
+        if exact is not None:
+            return exact
+
+        normalized = requested.casefold()
+        id_matches = [
+            workflow
+            for workflow in registry.enabled_workflows
+            if str(workflow.id or "").strip().casefold() == normalized
+        ]
+        if id_matches:
+            return id_matches[0]
+
+        name_matches = [
+            workflow
+            for workflow in registry.enabled_workflows
+            if str(workflow.name or "").strip().casefold() == normalized
+        ]
+        if len(name_matches) > 1:
+            raise HTTPException(
+                409,
+                detail=f"Workflow alias is ambiguous: {requested}. Use the workflow ID instead.",
+            )
+        return name_matches[0] if name_matches else None
+
+    def _short_workflow_body(workflow, body: dict) -> dict:
+        normalized = dict(body)
+        output_type = str(getattr(workflow, "output_type", "") or "").lower()
+        if output_type == "image":
+            width, height = _size_to_dimensions(normalized)
+            normalized["width"] = width
+            normalized["height"] = height
+            normalized.setdefault(
+                "filename_prefix",
+                f"{workflow.id}-{int(time.time())}",
+            )
+        return normalized
+
+    @app.post("/")
+    @app.post("/{workflow_alias}")
+    async def run_short_workflow(
+        request: Request,
+        workflow_alias: Optional[str] = None,
+    ):
+        """稳定短 URL：根路径走默认工作流，一级路径按 ID 或名称选工作流。"""
+        requested = str(workflow_alias or "").strip()
+        workflow = _resolve_short_workflow(requested)
+        if workflow is None:
+            missing = requested or "(default)"
+            raise HTTPException(404, detail=f"Workflow not found: {missing}")
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        submitted = _start_workflow_task(
+            workflow.id,
+            _short_workflow_body(workflow, body),
+        )
+        status_path = f"/v1/tasks/{quote(submitted['task_id'], safe='')}"
+        return JSONResponse(
+            status_code=202,
+            headers={
+                "Location": status_path,
+                "Retry-After": "3",
+                "Preference-Applied": "respond-async",
+            },
+            content=_workflow_task_submission_payload(
+                submitted,
+                requested_workflow=requested,
+                output_type=str(getattr(workflow, "output_type", "") or ""),
+            ),
+        )
 
     def _chat_prompt_from_body(body: dict) -> str:
         def ensure_json_contract(text: str) -> str:
