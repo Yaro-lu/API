@@ -395,8 +395,14 @@ async def _restart_tunnel_manager() -> dict:
     }
 
 
+def _output_download_path(task_id: str, filename: str) -> str:
+    safe_task_id = quote(str(task_id or ""), safe="")
+    safe_filename = quote(Path(str(filename or "")).name, safe="")
+    return f"/v1/files/{safe_task_id}/{safe_filename}"
+
+
 def _output_url(task_id: str, filename: str) -> str:
-    return f"{_public_base_url()}/v1/files/{quote(task_id)}/{quote(filename)}"
+    return f"{_public_base_url()}{_output_download_path(task_id, filename)}"
 
 
 def _with_output_urls(task_id: str, outputs: list) -> list:
@@ -414,12 +420,15 @@ def _with_output_urls(task_id: str, outputs: list) -> list:
         filename = str(item.get("filename") or item.get("file") or "").strip()
         if not filename:
             continue
-        url = _output_url(task_id, Path(filename).name)
+        safe_filename = Path(filename).name
+        download_path = _output_download_path(task_id, safe_filename)
+        url = f"{_public_base_url()}{download_path}"
         normalized.append({
             **item,
-            "filename": Path(filename).name,
+            "filename": safe_filename,
             "url": url,
             "download_url": url,
+            "download_path": download_path,
         })
     return normalized
 
@@ -444,6 +453,14 @@ def _read_text_output_file(task_id: str, item: dict) -> str:
         return ""
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _find_output_file_from_record(task_id: str, filename: str, item: dict = None) -> Optional[Path]:
     safe_name = Path(filename).name
     if not safe_name:
@@ -465,7 +482,7 @@ def _find_output_file_from_record(task_id: str, filename: str, item: dict = None
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
-            if resolved.is_file() and any(str(resolved).startswith(str(root)) for root in roots):
+            if resolved.is_file() and any(_path_is_within(resolved, root) for root in roots):
                 return resolved
         except Exception:
             continue
@@ -500,7 +517,10 @@ def _task_api_response(record: dict) -> dict:
             "type": first.get("type", "image"),
             "url": first.get("url", ""),
             "download_url": first.get("download_url", ""),
+            "download_path": first.get("download_path", ""),
         }
+        if _guess_media_type(str(first.get("filename") or "")).startswith("image/"):
+            payload["data"] = [{"url": first.get("url", "")}]
     text_output = _task_text_output(payload)
     if text_output:
         payload["text"] = text_output
@@ -577,6 +597,36 @@ def _image_workflow_from_model(model: str) -> str:
     return model
 
 
+def _prefers_async_image_response(body: dict, prefer_header: str = "") -> bool:
+    if body.get("async") is True:
+        return True
+    for preference in str(prefer_header or "").split(","):
+        if preference.strip().split(";", 1)[0].lower() == "respond-async":
+            return True
+    return False
+
+
+def _image_task_submission_payload(submitted: dict, model: str) -> dict:
+    task_id = str(submitted.get("task_id") or submitted.get("id") or "")
+    status_path = f"/v1/tasks/{quote(task_id, safe='')}"
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "object": "image.generation.task",
+        "created": int(time.time()),
+        "status": "submitted",
+        "model": model or submitted.get("workflow_id") or "",
+        "workflow": submitted.get("workflow_id") or "",
+        "workflow_id": submitted.get("workflow_id") or "",
+        "workflow_name": submitted.get("workflow_name") or "",
+        "prompt_id": submitted.get("prompt_id") or "",
+        "status_path": status_path,
+        "status_url": f"{_public_base_url()}{status_path}",
+        "poll_after_ms": 3000,
+        "data": [],
+    }
+
+
 def _normalize_seed(value) -> int:
     """ComfyUI 的 noise_seed 不接受 -1；外部 API 里 -1 统一表示随机种子。"""
     try:
@@ -590,6 +640,8 @@ def _normalize_seed(value) -> int:
 
 def _guess_media_type(filename: str) -> str:
     ext = Path(filename).suffix.lower()
+    if ext == ".png":
+        return "image/png"
     if ext in (".jpg", ".jpeg"):
         return "image/jpeg"
     if ext == ".webp":
@@ -600,7 +652,7 @@ def _guess_media_type(filename: str) -> str:
         return "video/quicktime"
     if ext == ".webm":
         return "video/webm"
-    return "image/png"
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
 # ── 鉴权中间件 ────────────────────────────────────────
@@ -924,7 +976,7 @@ def create_app() -> FastAPI:
                     (BASE_DIR / "outputs").resolve(),
                     (BASE_DIR / "runtime" / "outputs").resolve(),
                 ]
-                if any(str(resolved).startswith(str(root)) for root in roots):
+                if any(_path_is_within(resolved, root) for root in roots):
                     return resolved
             except Exception:
                 continue
@@ -1162,7 +1214,11 @@ def create_app() -> FastAPI:
         try:
             submitted = _start_workflow_task(workflow_id, workflow_body)
             timeout_sec = int(body.get("timeout") or body.get("timeout_sec") or 1800)
-            completed = _wait_for_task(submitted["task_id"], timeout_sec=max(30, timeout_sec))
+            completed = await asyncio.to_thread(
+                _wait_for_task,
+                submitted["task_id"],
+                max(30, timeout_sec),
+            )
             content = _task_text_output(completed)
             if not content:
                 return JSONResponse(status_code=502, content={
@@ -1272,7 +1328,25 @@ def create_app() -> FastAPI:
 
         try:
             submitted = _start_workflow_task(workflow_id, workflow_body)
-            completed = _wait_for_task(submitted["task_id"], timeout_sec=1800)
+            if _prefers_async_image_response(body, request.headers.get("prefer", "")):
+                status_path = f"/v1/tasks/{quote(submitted['task_id'], safe='')}"
+                return JSONResponse(
+                    status_code=202,
+                    headers={
+                        "Location": status_path,
+                        "Retry-After": "3",
+                        "Preference-Applied": "respond-async",
+                    },
+                    content=_image_task_submission_payload(
+                        submitted,
+                        str(body.get("model") or workflow_id),
+                    ),
+                )
+            completed = await asyncio.to_thread(
+                _wait_for_task,
+                submitted["task_id"],
+                1800,
+            )
             outputs = completed.get("outputs") or []
             if not outputs:
                 return JSONResponse(status_code=502, content={
