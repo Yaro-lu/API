@@ -27,6 +27,37 @@ class ComfyUIClientTimeoutTests(unittest.TestCase):
 
         get.assert_called_once_with("http://127.0.0.1:8188/queue", timeout=30)
 
+    def test_input_image_upload_uses_comfy_contract_and_returns_load_image_name(self):
+        response = mock.Mock(ok=True)
+        response.json.return_value = {
+            "name": "frame.png",
+            "subfolder": "lingjing",
+            "type": "input",
+        }
+        with mock.patch(
+            "app.engines.comfyui_client.requests.post", return_value=response
+        ) as post:
+            name = ComfyUIClient().upload_input_image(
+                b"png-data", "frame.png", "image/png"
+            )
+
+        self.assertEqual(name, "lingjing/frame.png")
+        post.assert_called_once_with(
+            "http://127.0.0.1:8188/upload/image",
+            files={"image": ("frame.png", b"png-data", "image/png")},
+            data={"type": "input", "overwrite": "true"},
+            timeout=60,
+        )
+
+    def test_input_image_upload_rejects_traversal_from_comfy(self):
+        response = mock.Mock(ok=True)
+        response.json.return_value = {"name": "../frame.png", "subfolder": ""}
+        with mock.patch(
+            "app.engines.comfyui_client.requests.post", return_value=response
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid filename"):
+                ComfyUIClient().upload_input_image(b"x", "frame.png", "image/png")
+
 
 if __name__ == "__main__":
     unittest.main()

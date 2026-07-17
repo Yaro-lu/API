@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Generate the installed LingJingAI Chinese user and API guide."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    HRFlowable,
+    Image,
+    PageBreak,
+    Paragraph,
+    Preformatted,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT = ROOT / "docs" / "灵境造片厂使用教学.pdf"
+CLIENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8-sig").strip()
+RUNTIME_RELEASE = json.loads(
+    (ROOT / "app" / "runtime_release.json").read_text(encoding="utf-8-sig")
+)
+RUNTIME_PACKAGE_NAME = str(RUNTIME_RELEASE["package_name"])
+PROJECT_URL = str(RUNTIME_RELEASE["homepage_url"])
+ACCENT = colors.HexColor("#5545FC")
+ACCENT_DARK = colors.HexColor("#3844E1")
+TEXT = colors.HexColor("#172033")
+TEXT_2 = colors.HexColor("#52657F")
+BORDER = colors.HexColor("#D7E2F4")
+SOFT = colors.HexColor("#F4F6FF")
+SOFT_WARN = colors.HexColor("#FFF5E6")
+
+
+def register_fonts() -> None:
+    font_dir = Path("C:/Windows/Fonts")
+    pdfmetrics.registerFont(
+        TTFont("LingJing", str(font_dir / "msyh.ttc"), subfontIndex=0)
+    )
+    pdfmetrics.registerFont(
+        TTFont("LingJingBold", str(font_dir / "msyhbd.ttc"), subfontIndex=0)
+    )
+    pdfmetrics.registerFontFamily(
+        "LingJing",
+        normal="LingJing",
+        bold="LingJingBold",
+        italic="LingJing",
+        boldItalic="LingJingBold",
+    )
+
+
+def styles():
+    base = getSampleStyleSheet()
+    return {
+        "cover_title": ParagraphStyle(
+            "CoverTitle",
+            parent=base["Title"],
+            fontName="LingJingBold",
+            fontSize=25,
+            leading=34,
+            textColor=TEXT,
+            alignment=TA_CENTER,
+            spaceAfter=6 * mm,
+        ),
+        "cover_subtitle": ParagraphStyle(
+            "CoverSubtitle",
+            parent=base["Normal"],
+            fontName="LingJing",
+            fontSize=11,
+            leading=18,
+            textColor=TEXT_2,
+            alignment=TA_CENTER,
+        ),
+        "h1": ParagraphStyle(
+            "H1",
+            parent=base["Heading1"],
+            fontName="LingJingBold",
+            fontSize=19,
+            leading=26,
+            textColor=TEXT,
+            spaceBefore=2 * mm,
+            spaceAfter=5 * mm,
+        ),
+        "h2": ParagraphStyle(
+            "H2",
+            parent=base["Heading2"],
+            fontName="LingJingBold",
+            fontSize=13,
+            leading=19,
+            textColor=ACCENT_DARK,
+            spaceBefore=4 * mm,
+            spaceAfter=2.5 * mm,
+        ),
+        "body": ParagraphStyle(
+            "Body",
+            parent=base["BodyText"],
+            fontName="LingJing",
+            fontSize=9.5,
+            leading=16,
+            textColor=TEXT,
+            wordWrap="CJK",
+            spaceAfter=2.4 * mm,
+        ),
+        "small": ParagraphStyle(
+            "Small",
+            parent=base["BodyText"],
+            fontName="LingJing",
+            fontSize=8,
+            leading=12,
+            textColor=TEXT_2,
+            wordWrap="CJK",
+        ),
+        "step": ParagraphStyle(
+            "Step",
+            parent=base["BodyText"],
+            fontName="LingJing",
+            fontSize=9.5,
+            leading=16,
+            leftIndent=6 * mm,
+            firstLineIndent=-6 * mm,
+            textColor=TEXT,
+            wordWrap="CJK",
+            spaceAfter=2.6 * mm,
+        ),
+        "code": ParagraphStyle(
+            "Code",
+            parent=base["Code"],
+            fontName="LingJing",
+            fontSize=7.5,
+            leading=11,
+            textColor=colors.HexColor("#24314A"),
+            leftIndent=0,
+            rightIndent=0,
+            spaceBefore=0,
+            spaceAfter=0,
+        ),
+        "table_head": ParagraphStyle(
+            "TableHead",
+            parent=base["BodyText"],
+            fontName="LingJingBold",
+            fontSize=8,
+            leading=11,
+            textColor=colors.white,
+            alignment=TA_LEFT,
+        ),
+        "table_cell": ParagraphStyle(
+            "TableCell",
+            parent=base["BodyText"],
+            fontName="LingJing",
+            fontSize=7.5,
+            leading=11,
+            textColor=TEXT,
+            wordWrap="CJK",
+        ),
+    }
+
+
+def note_box(text: str, style, background=SOFT):
+    table = Table([[Paragraph(text, style)]], colWidths=[166 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), background),
+                ("BOX", (0, 0), (-1, -1), 0.8, BORDER),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
+
+
+def code_box(code: str, style):
+    block = Preformatted(code.strip(), style)
+    table = Table([[block]], colWidths=[166 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F7F9FC")),
+                ("BOX", (0, 0), (-1, -1), 0.7, BORDER),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
+
+
+def endpoint_table(s):
+    rows = [
+        ["方法", "路径", "用途"],
+        ["GET", "/healthz", "免鉴权的最小存活状态"],
+        ["GET", "/v1/status", "客户端、环境和后台服务完整状态"],
+        ["GET", "/v1/models", "当前可调用模型列表"],
+        ["GET", "/v1/workflows", "工作流与公开调用名称列表"],
+        ["POST", "/", "运行当前选中的默认工作流"],
+        ["POST", "/{workflow_alias}", "按公开名称运行指定工作流"],
+        ["POST", "/v1/chat/completions", "OpenAI 风格文字生成接口"],
+        ["POST", "/api/v3/images/generations", "火山/即梦风格图片生成接口"],
+        ["POST", "/v1/workflows/run/{workflow_id}", "按工作流 ID 提交生成任务"],
+        ["GET", "/v1/tasks/{task_id}", "查询异步任务进度和结果"],
+        ["GET", "/v1/files/{task_id}/{filename}", "下载任务生成文件"],
+    ]
+    rendered = []
+    for index, row in enumerate(rows):
+        rendered.append(
+            [Paragraph(value, s["table_head"] if index == 0 else s["table_cell"]) for value in row]
+        )
+    table = Table(rendered, colWidths=[18 * mm, 66 * mm, 82 * mm], repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), ACCENT_DARK),
+                ("GRID", (0, 0), (-1, -1), 0.45, BORDER),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFD")]),
+            ]
+        )
+    )
+    return table
+
+
+def draw_page_frame(canvas, doc):
+    canvas.saveState()
+    width, height = A4
+    canvas.setStrokeColor(BORDER)
+    canvas.setLineWidth(0.5)
+    if doc.page > 1:
+        canvas.line(22 * mm, height - 15 * mm, width - 22 * mm, height - 15 * mm)
+        canvas.setFont("LingJing", 7.5)
+        canvas.setFillColor(TEXT_2)
+        canvas.drawString(22 * mm, height - 11.5 * mm, "灵境造片厂使用教学与接口说明")
+    canvas.line(22 * mm, 14 * mm, width - 22 * mm, 14 * mm)
+    canvas.setFont("LingJing", 7.5)
+    canvas.setFillColor(TEXT_2)
+    canvas.drawString(22 * mm, 9.5 * mm, f"版本 {CLIENT_VERSION}  |  Windows 10/11 x64")
+    canvas.drawRightString(width - 22 * mm, 9.5 * mm, f"第 {doc.page} 页")
+    canvas.restoreState()
+
+
+def build_story(s):
+    story = []
+    logo = ROOT / "icon.png"
+    if logo.is_file():
+        image = Image(str(logo), width=28 * mm, height=28 * mm)
+        image.hAlign = "CENTER"
+        story.extend([Spacer(1, 18 * mm), image, Spacer(1, 8 * mm)])
+    story.append(Paragraph("灵境造片厂", s["cover_title"]))
+    story.append(Paragraph("使用教学与 API 接口说明", s["cover_subtitle"]))
+    story.append(Spacer(1, 12 * mm))
+    story.append(
+        note_box(
+            "这份文档面向首次安装用户和接口接入人员。客户端、AI 运行环境、模型和用户数据彼此分离；安装客户端后可一键拉取运行环境，只有网络失败时才需要手动下载。",
+            s["body"],
+        )
+    )
+    story.append(Spacer(1, 10 * mm))
+    summary = [
+        [Paragraph("项目主页", s["table_head"]), Paragraph(PROJECT_URL, s["table_cell"])],
+        [Paragraph("客户端版本", s["table_head"]), Paragraph(CLIENT_VERSION, s["table_cell"])],
+        [Paragraph("支持系统", s["table_head"]), Paragraph("Windows 10 22H2 / Windows 11，64 位", s["table_cell"])],
+        [Paragraph("支持硬件", s["table_head"]), Paragraph("NVIDIA RTX 20 系列或更高，显存 8GB 或以上；CUDA 13 环境要求 R580 或更高驱动", s["table_cell"])],
+    ]
+    info = Table(summary, colWidths=[38 * mm, 128 * mm])
+    info.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), ACCENT_DARK),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+    story.append(info)
+    story.append(Spacer(1, 22 * mm))
+    story.append(Paragraph("Yaro-lu  |  本地 AI 工作流服务", s["cover_subtitle"]))
+
+    story.extend([PageBreak(), Paragraph("1. 安装与第一次启动", s["h1"])])
+    story.append(Paragraph("1. 双击轻量安装包，按提示完成安装。安装过程不需要管理员权限，也不会安装模型。", s["step"]))
+    story.append(Paragraph("2. 安装完成后，桌面会出现两个同 Logo 入口：“灵境造片厂”用于启动客户端，“灵境造片厂示例页”用于第一次体验接口。", s["step"]))
+    story.append(Paragraph("3. 客户端界面可以立即打开；此时文字、图片和视频生成仍不可用，因为大型 AI 运行环境独立分发。", s["step"]))
+    story.append(Paragraph("4. 进入“模型与环境”，点击“一键修复”。客户端会自动拉取环境包，并使用内置 SHA256 校验，通过后直接安装。", s["step"]))
+    story.append(Paragraph("5. 只有自动拉取失败时，客户端才会显示“自动修复失败”弹窗。可复制 GitHub 地址，手动下载环境包，再选择本地环境包完成安装。", s["step"]))
+    story.append(Spacer(1, 3 * mm))
+    story.append(note_box(f"运行环境包文件名：<b>{RUNTIME_PACKAGE_NAME}</b><br/>项目主页：<b>{PROJECT_URL}</b>", s["body"], SOFT_WARN))
+    story.append(Paragraph("安装目录中的主要入口", s["h2"]))
+    entry_rows = [
+        ["名称", "用途"],
+        ["灵境造片厂", "正式启动入口，使用项目 Logo"],
+        ["灵境造片厂示例页.html", "本地纯前端新手页面；填写 URL 和 Key 后自动检测模型并调用生成"],
+        ["灵境造片厂使用教学.pdf", "当前使用教学与接口说明"],
+        ["models", "用户模型目录，更新客户端时保留"],
+        ["outputs", "生成结果目录"],
+        ["workflows", "内置或导入的工作流定义"],
+    ]
+    entry_table = Table(
+        [[Paragraph(v, s["table_head"] if i == 0 else s["table_cell"]) for v in row] for i, row in enumerate(entry_rows)],
+        colWidths=[55 * mm, 111 * mm],
+        repeatRows=1,
+    )
+    entry_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), ACCENT_DARK), ("GRID", (0, 0), (-1, -1), 0.5, BORDER), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+    story.append(entry_table)
+
+    story.extend([PageBreak(), Paragraph("2. 环境、模型与工作流", s["h1"])])
+    story.append(Paragraph("运行环境", s["h2"]))
+    story.append(Paragraph("运行环境包含便携 Python、ComfyUI、Torch/CUDA 和 Cloudflared。客户端会先校验环境包名称、SHA256 和目录结构，再事务替换环境目录。模型、工作流和生成结果不会因为环境修复而删除。", s["body"]))
+    story.append(Paragraph("官方环境包版本、文件名、下载地址和 SHA256 固定在客户端发布清单中。需要使用授权镜像时，可以在 runtime/config.local.json 的 runtime.download_url 中填写完整地址、目录地址或带 {package_name} 占位符的模板；镜像不能改变客户端内置的文件名和 SHA256 校验。", s["body"]))
+    story.append(Paragraph("模型", s["h2"]))
+    story.append(Paragraph("模型统一放在安装根目录的 `models` 文件夹。优先使用可信来源的 safetensors 或 GGUF 文件，不要导入来源不明的传统 PyTorch checkpoint。", s["body"]))
+    story.append(Paragraph("工作流", s["h2"]))
+    story.append(Paragraph("每个工作流至少包含 manifest.json 和 workflow.json。manifest.json 定义公开调用名称、输入参数、输出类型和模型依赖。导入后应在“工作流”页面确认状态为“可以使用”。", s["body"]))
+    story.append(Paragraph("推荐操作顺序", s["h2"]))
+    for index, text in enumerate(
+        [
+            "安装或修复运行环境，并执行“检查环境”。",
+            "导入工作流所需模型，然后点击“重新检查”。",
+            "在工作流页面选择默认工作流。",
+            "回到控制台启动后台服务，复制 URL 和 API Key。",
+            "打开桌面或安装目录中的“灵境造片厂示例页”，填写 URL 和 Key，连接后选择已检测到的文字、图片或视频模型。",
+        ],
+        1,
+    ):
+        story.append(Paragraph(f"{index}. {text}", s["step"]))
+    story.append(note_box("客户端更新只替换程序文件；运行环境、模型、配置、日志和生成结果独立保存。卸载时可能保留可变数据，删除前请先备份。", s["body"]))
+
+    story.extend([PageBreak(), Paragraph("3. API 接入基础", s["h1"])])
+    story.append(Paragraph("新手示例页", s["h2"]))
+    story.append(Paragraph("“灵境造片厂示例页.html”完全保存在本机，是一个不依赖额外服务的纯前端页面。它只会把你填写的 URL、API Key 和生成参数发送给已经启动的灵境造片厂客户端；连接后会读取客户端模型列表，并按文字、图片、视频自动分类。", s["body"]))
+    story.append(note_box("推荐第一次使用先打开示例页：输入客户端控制台显示的 URL 与 API Key，点击“连接并检测模型”，在“图片”分类输入画面描述后开始生成；视频分类需要选择首帧和尾帧图片。API Key 仅保存在当前浏览器会话中，关闭浏览器后需要重新填写。", s["body"]))
+    story.append(Paragraph("地址与鉴权", s["h2"]))
+    story.append(Paragraph("控制台会显示公网或本地 BASE_URL，以及生成接口使用的 API_KEY。除 `/healthz` 外，业务接口通常需要在请求头中携带 Bearer Token。本机地址可使用 HTTP；远程或公网地址必须使用 HTTPS，示例页会拒绝向远程明文 HTTP 地址发送 Key。", s["body"]))
+    story.append(code_box('Authorization: Bearer API_KEY\nContent-Type: application/json', s["code"]))
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph("主要接口", s["h2"]))
+    story.append(endpoint_table(s))
+    story.append(Spacer(1, 4 * mm))
+    story.append(note_box("不要把 API Key 写入公开网页、代码仓库、聊天截图或日志。公网 URL 是互联网入口，应和 API Key 一起妥善保存。", s["body"], SOFT_WARN))
+
+    story.extend([PageBreak(), Paragraph("4. 调用示例与异步任务", s["h1"])])
+    story.append(Paragraph("运行默认工作流", s["h2"]))
+    story.append(code_box('curl -X POST "BASE_URL/" ^\n  -H "Authorization: Bearer API_KEY" ^\n  -H "Content-Type: application/json" ^\n  -d "{\\"prompt\\":\\"一只在窗边晒太阳的猫\\"}"', s["code"]))
+    story.append(Paragraph("OpenAI 风格文字接口", s["h2"]))
+    story.append(code_box('curl -X POST "BASE_URL/v1/chat/completions" ^\n  -H "Authorization: Bearer API_KEY" ^\n  -H "Content-Type: application/json" ^\n  -d "{\\"model\\":\\"qwen3\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"写一段产品介绍\\"}]}"', s["code"]))
+    story.append(Paragraph("图片生成兼容接口", s["h2"]))
+    story.append(code_box('curl -X POST "BASE_URL/api/v3/images/generations" ^\n  -H "Authorization: Bearer API_KEY" ^\n  -H "Content-Type: application/json" ^\n  -d "{\\"prompt\\":\\"电影感城市夜景\\",\\"response_format\\":\\"url\\"}"', s["code"]))
+    story.append(Paragraph("异步任务流程", s["h2"]))
+    for index, text in enumerate(
+        [
+            "生成接口返回 task_id。",
+            "轮询 GET /v1/tasks/{task_id}，直到状态变为完成或失败。",
+            "从响应读取文件名或 URL。",
+            "调用 GET /v1/files/{task_id}/{filename} 下载结果。",
+        ],
+        1,
+    ):
+        story.append(Paragraph(f"{index}. {text}", s["step"]))
+
+    story.extend([PageBreak(), Paragraph("5. 常见问题与安全说明", s["h1"])])
+    questions = [
+        ("客户端能打开，但不能生成", "轻量客户端只负责界面和环境维护。请先下载并安装独立运行环境包，再补齐工作流要求的模型。"),
+        ("一键修复拉取失败怎么办", "失败弹窗会显示网络或下载错误，并提供可复制的 GitHub 地址。在项目 Releases 下载 7z 环境包，然后回到客户端选择本地环境包；客户端会使用内置 SHA256 校验。"),
+        ("环境检查提示 NVIDIA 驱动过旧", "CUDA 13 运行环境要求使用 R580 或更高驱动。更新驱动后重启电脑，再点击“检查环境”。"),
+        ("接口返回 401 或 403", "检查 Authorization 请求头是否使用 `Bearer API_KEY`，并确认复制的是生成接口 Key，而不是本机管理 Key。"),
+        ("接口能访问但工作流失败", "在工作流页面查看缺失模型和公开参数；确认模型文件完整，默认工作流已选中，ComfyUI 状态正常。"),
+        ("更新客户端会不会删除模型", "不会。程序、运行环境、模型和用户数据分离。重要模型和输出仍建议定期备份。"),
+    ]
+    for title, answer in questions:
+        story.append(Paragraph(title, s["h2"]))
+        story.append(Paragraph(answer, s["body"]))
+    story.append(HRFlowable(width="100%", thickness=0.7, color=BORDER, spaceBefore=5 * mm, spaceAfter=4 * mm))
+    story.append(Paragraph(f"项目主页：<b>{PROJECT_URL}</b>", s["body"]))
+    story.append(Paragraph("建议始终从项目主页或明确授权的镜像获取安装包和环境包；客户端会用内置 SHA256 验证环境包。", s["small"]))
+    return story
+
+
+def build_pdf(output: Path) -> None:
+    register_fonts()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    document = SimpleDocTemplate(
+        str(output),
+        pagesize=A4,
+        rightMargin=22 * mm,
+        leftMargin=22 * mm,
+        topMargin=22 * mm,
+        bottomMargin=20 * mm,
+        title="灵境造片厂使用教学与 API 接口说明",
+        author="Yaro-lu",
+        subject="灵境造片厂轻量客户端使用教学、环境安装与 API 接口说明",
+    )
+    document.build(
+        build_story(styles()),
+        onFirstPage=draw_page_frame,
+        onLaterPages=draw_page_frame,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+    build_pdf(args.output.resolve())
+    print(args.output.resolve())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

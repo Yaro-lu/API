@@ -33,6 +33,30 @@ class ComfyUIClient:
             raise RuntimeError(f"ComfyUI prompt validation failed: {message}")
         return data["prompt_id"]
 
+    def upload_input_image(self, image_data: bytes, filename: str, mime_type: str) -> str:
+        """Upload a validated image to ComfyUI and return its LoadImage name."""
+        response = requests.post(
+            f"{self.url}/upload/image",
+            files={"image": (filename, image_data, mime_type)},
+            data={"type": "input", "overwrite": "true"},
+            timeout=60,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            response.raise_for_status()
+            raise RuntimeError("ComfyUI image upload returned a non-JSON response")
+        if not response.ok:
+            message = payload.get("error") or payload.get("message") or payload.get("detail") or str(payload)
+            raise RuntimeError(f"ComfyUI image upload failed: {message}")
+        name = str(payload.get("name") or "").strip().replace("\\", "/")
+        subfolder = str(payload.get("subfolder") or "").strip().strip("/\\").replace("\\", "/")
+        if not name or name.startswith("/") or ".." in name.split("/"):
+            raise RuntimeError("ComfyUI image upload returned an invalid filename")
+        if subfolder and (subfolder.startswith("/") or ".." in subfolder.split("/")):
+            raise RuntimeError("ComfyUI image upload returned an invalid subfolder")
+        return f"{subfolder}/{name}" if subfolder else name
+
     def get_queue_status(self) -> Dict:
         """获取 ComfyUI 队列状态，含当前执行进度"""
         response = requests.get(f"{self.url}/queue", timeout=30)

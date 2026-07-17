@@ -1,5 +1,5 @@
 """
-灵镜造片厂 — 主界面
+灵境造片厂 — 主界面
 - 启动 ComfyUI + API 服务器 + Cloudflare Tunnel
 - 环境检测 / 运行时检查 / 模型检查
 - 进度监控面板
@@ -30,13 +30,14 @@ except Exception:
 BASE_DIR = Path(__file__).parent.parent.parent
 GUI_ASSET_DIR = Path(__file__).parent / "assets"
 MIN_NVIDIA_DRIVER_MAJOR = 580
+MIN_SUPPORTED_VRAM_MB = 8 * 1024
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from app.core.runtime_package import (  # noqa: E402
     REQUIRED_RUNTIME_PATHS,
     RUNTIME_PACKAGE_NAME,
-    RUNTIME_RELEASE_URL,
+    RUNTIME_HOMEPAGE_URL,
     archive_extract_command,
     archive_list_command,
     find_extractor,
@@ -44,9 +45,13 @@ from app.core.runtime_package import (  # noqa: E402
     missing_archive_entries,
     missing_runtime_paths,
     parse_archive_members,
-    install_staged_runtime,
     validate_staged_runtime,
     verify_runtime_package,
+    resolve_runtime_download_url,
+)
+from app.core.runtime_update import (  # noqa: E402
+    consume_runtime_update_result,
+    launch_runtime_update,
 )
 from app.core.process_supervisor import ProcessSupervisor  # noqa: E402
 from app.core.model_maintenance import (  # noqa: E402
@@ -78,6 +83,7 @@ from app.workflow_registry import WorkflowRegistry  # noqa: E402
 
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
+PROJECT_HOMEPAGE_URL = RUNTIME_HOMEPAGE_URL
 
 # ── 配色 ──────────────────────────────────────────────
 C = {
@@ -189,12 +195,23 @@ def _comfy_vram_args():
         return ["--lowvram"]
     if mode in ("none", "default", "auto-comfy"):
         return []
-    gpu_memory_mb = _detect_gpu_memory_mb()
-    if 0 < gpu_memory_mb <= 12288:
-        return []
-    if gpu_memory_mb >= 16384:
-        return ["--highvram"]
+    # ComfyUI's DynamicVRAM is the safest common default.  In particular, the
+    # bundled video workflow is larger than 16–24 GB cards and must not be
+    # forced into high-VRAM mode based on card capacity alone.  Advanced users
+    # can still opt in through vram_mode or launch_args above.
     return []
+
+
+def _is_supported_rtx_gpu(gpu_name: str) -> bool:
+    """Return whether a GPU name is in the supported RTX 20+ family."""
+    name = str(gpu_name or "").upper()
+    numbered = re.search(r"\bRTX\s*(\d{4})\b", name)
+    if numbered and int(numbered.group(1)) >= 2000:
+        return True
+    return any(
+        marker in name
+        for marker in ("TITAN RTX", "QUADRO RTX", "RTX A", "RTX PRO")
+    )
 
 
 def _platform_server_url_error(value: str) -> str:
@@ -369,12 +386,45 @@ def _check_system_env(run_command=subprocess.run) -> dict:
         lines = output.strip().split("\n")
         if not lines:
             return {"success": False, "error": "未检测到 NVIDIA 显卡"}
-        parts = [p.strip() for p in lines[0].split(",")]
-        if len(parts) < 3:
+        gpus = []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                gpus.append(
+                    {
+                        "gpu_name": parts[0],
+                        "driver_version": parts[1],
+                        "vram_mb": int(parts[2]),
+                    }
+                )
+            except ValueError:
+                continue
+        if not gpus:
             return {"success": False, "error": "无法解析 GPU 信息"}
-        gpu_name = parts[0]
-        driver = parts[1]
-        vram_mb = int(parts[2])
+        supported = [gpu for gpu in gpus if _is_supported_rtx_gpu(gpu["gpu_name"])]
+        if not supported:
+            detected = max(gpus, key=lambda gpu: gpu["vram_mb"])
+            return {
+                "success": False,
+                "error": "本版运行环境要求 NVIDIA RTX 20 系列或更高显卡",
+                "gpu_name": detected["gpu_name"],
+                "driver_version": detected["driver_version"],
+                "vram_gb": detected["vram_mb"] // 1024,
+            }
+        selected = max(supported, key=lambda gpu: gpu["vram_mb"])
+        gpu_name = selected["gpu_name"]
+        driver = selected["driver_version"]
+        vram_mb = selected["vram_mb"]
+        if vram_mb < MIN_SUPPORTED_VRAM_MB:
+            return {
+                "success": False,
+                "error": "本版运行环境要求至少 8GB 显存",
+                "gpu_name": gpu_name,
+                "driver_version": driver,
+                "vram_gb": vram_mb // 1024,
+            }
         match = re.match(r"^(\d+)", driver)
         driver_major = int(match.group(1)) if match else 0
         if driver_major < MIN_NVIDIA_DRIVER_MAJOR:
@@ -403,7 +453,7 @@ def _check_system_env(run_command=subprocess.run) -> dict:
 def _ensure_extra_model_paths():
     """确保 ComfyUI 的 extra_model_paths.yaml 使用相对路径指向 models/"""
     yaml_path = BASE_DIR / "runtime" / "ComfyUI" / "extra_model_paths.yaml"
-    content = """# 灵镜造片厂 — 自动生成的模型路径配置
+    content = """# 灵境造片厂 — 自动生成的模型路径配置
 comfyui:
     base_path: ../../models/
     checkpoints: checkpoints/
@@ -505,7 +555,7 @@ class GatewayApp(WindowBase):
     def __init__(self):
         super().__init__()
         self._tk_destroyed = False
-        self.title("灵镜造片厂")
+        self.title("灵境造片厂")
         self.geometry(f"{LAYOUT['window_w']}x{LAYOUT['window_h']}")
         self.minsize(LAYOUT["min_w"], LAYOUT["min_h"])
         if CTK_AVAILABLE:
@@ -523,6 +573,7 @@ class GatewayApp(WindowBase):
         self._backend_action_name = ""
         self._runtime_maintenance_lock = threading.RLock()
         self._runtime_maintenance_in_progress = False
+        self._runtime_update_helper_proc = None
         self._model_transfer_lock = threading.RLock()
         self._active_model_transfers = {}
         self._workflow_management_lock = threading.Lock()
@@ -600,6 +651,7 @@ class GatewayApp(WindowBase):
         # 异步启动序列
         self._request_backend_start("启动后台")
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        self.after(800, self._show_runtime_update_result)
 
     def center(self):
         self.update_idletasks()
@@ -1090,7 +1142,7 @@ class GatewayApp(WindowBase):
 
         brand_text = tk.Frame(brand, bg=C["sidebar"])
         brand_text.pack(side="left", fill="x", expand=True)
-        tk.Label(brand_text, text="灵镜造片厂", font=("Microsoft YaHei UI", 13, "bold"), fg=C["text"], bg=C["sidebar"]).pack(anchor="w")
+        tk.Label(brand_text, text="灵境造片厂", font=("Microsoft YaHei UI", 13, "bold"), fg=C["text"], bg=C["sidebar"]).pack(anchor="w")
         tk.Label(brand_text, text="LOCAL AI GATEWAY", font=("Consolas", 7), fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", pady=(2, 0))
 
         tk.Frame(self._sidebar, bg=C["sidebar_border"], height=1).pack(fill="x", padx=14, pady=(0, 12))
@@ -3833,7 +3885,7 @@ class GatewayApp(WindowBase):
 
         tk.Label(
             content,
-            text=f"需要安装 {RUNTIME_PACKAGE_NAME}，可以选择本地 7z 包，也可以从官方 Release 或配置的镜像自动下载安装。",
+            text=f"需要安装 {RUNTIME_PACKAGE_NAME}。点击一键修复后，客户端会自动拉取、校验并安装；仅在网络失败时提示手动下载。",
             font=F["normal"],
             fg=C["text2"],
             bg=C["card"],
@@ -3854,7 +3906,7 @@ class GatewayApp(WindowBase):
             self._button(card, button, command, "plain").pack(pady=(0, 20), ipadx=22, ipady=5)
 
         install_card("1", "□", "选择 7z 环境包", "从本地选择已经下载好的 7z 运行环境包进行安装。", "选择文件", self._select_runtime)
-        install_card("2", "☁", "在线一键安装", "从官方 Release 或配置的镜像下载并安装运行环境。", "一键安装", self._install_runtime_from_mirror)
+        install_card("2", "☁", "在线一键修复", "自动拉取、校验并安装官方运行环境；网络失败时提供手动下载地址。", "一键修复", self._install_runtime_from_mirror)
         install_card("3", "▣", "安装同目录环境包", "自动查找客户端同目录下的 7z 环境包并安装。", "开始安装", self._install_local_runtime)
 
         secondary_row = tk.Frame(content, bg=C["card"])
@@ -3896,16 +3948,10 @@ class GatewayApp(WindowBase):
         self._extract_runtime(pkg)
 
     def _runtime_mirror_url(self) -> str:
-        cfg = _load_local_config()
-        runtime_cfg = cfg.get("runtime", {}) if isinstance(cfg.get("runtime", {}), dict) else {}
-        return str(
-            runtime_cfg.get("mirror_url") or
-            cfg.get("runtime_mirror_url") or
-            os.environ.get("LINGJING_RUNTIME_MIRROR_URL") or
-            RUNTIME_RELEASE_URL
-        ).strip()
+        return resolve_runtime_download_url(_load_local_config())
 
     def _install_runtime_from_mirror(self):
+        """Download the configured runtime package, falling back to manual recovery."""
         repairing = _runtime_has_package_files()
         if repairing and not messagebox.askyesno(
             "安装或修复运行环境",
@@ -3914,16 +3960,111 @@ class GatewayApp(WindowBase):
             parent=self,
         ):
             return
-        url = self._runtime_mirror_url()
+
+        try:
+            url = self._runtime_mirror_url()
+        except ValueError as exc:
+            self._show_runtime_download_fallback(f"下载地址配置无效：{exc}")
+            return
         if url:
             self._download_runtime(url, repair_confirmed=repairing)
             return
 
-        messagebox.showerror(
-            "未配置下载地址",
-            "当前版本没有配置运行环境包下载地址，无法自动安装。\n\n"
-            "请先使用本地 7z 包安装，或配置 runtime.mirror_url 后再点一键安装。"
+        self._show_runtime_download_fallback("当前版本没有配置运行环境包下载地址。")
+
+    def _show_runtime_download_fallback(self, error_message: str):
+        """Offer a copyable manual route only after automatic acquisition fails."""
+        reason = " ".join(str(error_message or "网络连接异常").split())
+        if len(reason) > 180:
+            reason = f"{reason[:177]}..."
+
+        popup = tk.Toplevel(self)
+        popup.title("自动修复失败")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.grab_set()
+        popup.resizable(False, False)
+        self._center_popup(popup, 620, 350)
+
+        panel = self._card(popup, fill="both", expand=True, padx=16, pady=16)
+        tk.Label(
+            panel,
+            text="自动拉取失败，请手动下载",
+            font=F["title"],
+            fg=C["text"],
+            bg=C["card"],
+        ).pack(anchor="w", padx=22, pady=(22, 8))
+        tk.Label(
+            panel,
+            text=(
+                "可能是网络问题或 GitHub 暂时不可达。请在项目主页进入 Releases，"
+                f"下载 {RUNTIME_PACKAGE_NAME}。\n"
+                "下载完成后回到客户端，选择本地环境包继续安装或修复。"
+            ),
+            font=F["normal"],
+            fg=C["text2"],
+            bg=C["card"],
+            justify="left",
+            wraplength=550,
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        tk.Label(
+            panel,
+            text=f"失败原因：{reason}",
+            font=F["small"],
+            fg=C["error"],
+            bg=C["card"],
+            justify="left",
+            wraplength=550,
+        ).pack(anchor="w", padx=22, pady=(0, 10))
+
+        url_row = tk.Frame(panel, bg=C["card"])
+        url_row.pack(fill="x", padx=22)
+        url_value = tk.StringVar(value=PROJECT_HOMEPAGE_URL)
+        url_entry = tk.Entry(
+            url_row,
+            textvariable=url_value,
+            state="readonly",
+            readonlybackground=C["entry"],
+            fg=C["text"],
+            font=("Consolas", 10),
+            relief="solid",
+            bd=1,
         )
+        url_entry.pack(side="left", fill="x", expand=True, ipady=7)
+        self._button(
+            url_row,
+            "复制地址",
+            lambda: self._copy(PROJECT_HOMEPAGE_URL),
+            "primary",
+            width=88,
+        ).pack(side="left", padx=(10, 0))
+
+        tk.Label(
+            panel,
+            text="提示：环境包体积较大，浏览器下载完成后不要改名。",
+            font=F["small"],
+            fg=C["warn"],
+            bg=C["card"],
+        ).pack(anchor="w", padx=22, pady=(12, 16))
+
+        actions = tk.Frame(panel, bg=C["card"])
+        actions.pack(fill="x", padx=22, pady=(0, 20))
+        self._button(
+            actions,
+            "打开 GitHub",
+            lambda: webbrowser.open(PROJECT_HOMEPAGE_URL),
+            "primary",
+            width=102,
+        ).pack(side="left")
+        self._button(
+            actions,
+            "选择本地环境包",
+            lambda: (popup.destroy(), self._select_runtime()),
+            "plain",
+            width=126,
+        ).pack(side="left", padx=(8, 0))
+        self._button(actions, "关闭", popup.destroy, "plain", width=72).pack(side="right")
 
     def _download_runtime(self, url: str, repair_confirmed: bool = False):
         popup = tk.Toplevel(self)
@@ -3946,11 +4087,11 @@ class GatewayApp(WindowBase):
 
         def show_download_error(message: str):
             try:
-                progress_lbl.config(text=f"下载失败：{message}", fg=C["error"])
                 popup.grab_release()
-                popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+                popup.destroy()
             except Exception:
                 pass
+            self._show_runtime_download_fallback(message)
 
         popup.protocol("WM_DELETE_WINDOW", keep_download_open)
 
@@ -3964,7 +4105,7 @@ class GatewayApp(WindowBase):
                 sidecar = Path(f"{target}.sha256")
 
                 resume_at = partial.stat().st_size if partial.exists() else 0
-                headers = {"User-Agent": "LingJing-Desktop/0.2.0"}
+                headers = {"User-Agent": "LingJing-Desktop/1.0.0"}
                 if resume_at:
                     headers["Range"] = f"bytes={resume_at}-"
                 request = ur.Request(url, headers=headers)
@@ -3990,15 +4131,8 @@ class GatewayApp(WindowBase):
                                 size_mb = downloaded / (1024 * 1024)
                                 self.after(0, lambda s=size_mb: progress_lbl.config(text=f"已下载：{s:.1f} MB"))
                 partial.replace(target)
-
-                self.after(0, lambda: progress_lbl.config(text="正在下载校验文件..."))
-                try:
-                    checksum_request = ur.Request(f"{url}.sha256", headers={"User-Agent": "LingJing-Desktop/0.2.0"})
-                    with ur.urlopen(checksum_request, timeout=30) as response:
-                        sidecar.write_bytes(response.read())
-                except Exception:
-                    if url.rstrip("/") == RUNTIME_RELEASE_URL.rstrip("/"):
-                        raise RuntimeError("官方环境包 SHA256 校验文件下载失败")
+                sidecar.unlink(missing_ok=True)
+                self.after(0, lambda: progress_lbl.config(text="下载完成，准备校验..."))
 
                 self.after(0, popup.destroy)
                 self.after(100, lambda: self._extract_runtime(target, repair_confirmed=repair_confirmed))
@@ -4064,8 +4198,10 @@ class GatewayApp(WindowBase):
 
         def _do_extract():
             maintenance_started = False
+            handoff_started = False
             running_before: set[str] = set()
-            staging_dir = BASE_DIR / f".runtime-install-staging-{uuid.uuid4().hex}"
+            operation_id = uuid.uuid4().hex
+            staging_dir = BASE_DIR / f".runtime-install-staging-{operation_id}"
             try:
                 package = Path(pkg_path)
                 if not package.is_file():
@@ -4128,26 +4264,15 @@ class GatewayApp(WindowBase):
                 if stop_error:
                     raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
 
-                self.after(0, lambda: progress_lbl.config(text="正在事务更新运行环境..."))
-                install_staged_runtime(staging_dir, BASE_DIR)
-
-                if not self._shutting_down:
-                    self._end_runtime_maintenance(restart=True)
-                    maintenance_started = False
-
-                    def finish_install():
-                        try:
-                            popup.destroy()
-                        except Exception:
-                            pass
-                        self._environment_status = {}
-                        self._show_main_content()
-                        if hasattr(self, "_dashboard_pages"):
-                            self._dashboard_pages.refresh(self._last_health)
-                            if self._current_page_id == "resources":
-                                self.after_idle(self._dashboard_pages.focus_runtime_maintenance)
-
-                    self.after(0, finish_install)
+                self.after(0, lambda: progress_lbl.config(text="客户端即将重启并完成环境更新..."))
+                self._runtime_update_helper_proc = launch_runtime_update(
+                    BASE_DIR,
+                    staging_dir,
+                    parent_pid=os.getpid(),
+                )
+                handoff_started = True
+                maintenance_started = False
+                self.after(0, lambda: self._exit_for_runtime_update(popup))
             except Exception as e:
                 if maintenance_started:
                     can_restore = bool(running_before) and _check_runtime_exists()
@@ -4159,10 +4284,41 @@ class GatewayApp(WindowBase):
                 if maintenance_started:
                     can_restore = bool(running_before) and _check_runtime_exists()
                     self._end_runtime_maintenance(restart=can_restore)
-                if staging_dir.exists():
+                if not handoff_started and staging_dir.exists():
                     shutil.rmtree(staging_dir, ignore_errors=True)
 
         threading.Thread(target=_do_extract, daemon=True).start()
+
+    def _show_runtime_update_result(self):
+        """Report the detached updater result once the restarted GUI is ready."""
+        result = consume_runtime_update_result(BASE_DIR)
+        if not result:
+            return
+        code = str(result.get("result_code") or "")
+        detail = str(result.get("message") or "").strip()
+        messages = {
+            "installed": "运行环境安装完成。",
+            "installed_restart_failed": "运行环境已安装，但自动重启失败；本次为手动启动。",
+            "install_failed_rolled_back": "运行环境安装失败，旧环境已恢复。",
+            "install_failed_rollback_incomplete": (
+                "运行环境安装失败，自动回滚也未完成；环境备份已保留。"
+            ),
+        }
+        message = messages.get(code, "运行环境更新已完成。")
+        if detail and code != "installed":
+            message = f"{message}\n\n详细信息：{detail}"
+        if result.get("success") is True:
+            messagebox.showinfo("运行环境更新", message, parent=self)
+        else:
+            messagebox.showerror("运行环境更新失败", message, parent=self)
+
+    def _exit_for_runtime_update(self, popup=None):
+        """Close this process so the external helper can replace mapped DLLs."""
+        self._shutting_down = True
+        self._anim_running = False
+        self._heartbeat_run = False
+        self._poll_run = False
+        self._complete_destroy(popup)
 
     def _runtime_maintenance_active(self) -> bool:
         lock = self.__dict__.get("_runtime_maintenance_lock")
@@ -4228,12 +4384,15 @@ class GatewayApp(WindowBase):
 
     def _open_install_guide(self):
         """打开安装说明"""
-        import webbrowser
+        pdf_path = BASE_DIR / "灵境造片厂使用教学.pdf"
+        if pdf_path.exists():
+            os.startfile(str(pdf_path))
+            return
         guide_path = BASE_DIR / "README.md"
         if guide_path.exists():
             os.startfile(str(guide_path))
         else:
-            webbrowser.open("https://github.com")
+            webbrowser.open(PROJECT_HOMEPAGE_URL)
 
     # ══════════════════════════════════════════════════════
     # 底部状态栏
@@ -4568,7 +4727,7 @@ class GatewayApp(WindowBase):
         title_row.pack(fill="x", padx=28, pady=(22, 8))
         tk.Label(title_row, text="▷", font=("Microsoft YaHei UI", 18, "bold"),
                  fg="#ffffff", bg=C["primary"], width=3).pack(side="left", padx=(0, 10), ipady=4)
-        tk.Label(title_row, text="登录灵镜造片厂账号", font=F["title"],
+        tk.Label(title_row, text="登录灵境造片厂账号", font=F["title"],
                  fg=C["text"], bg=C["card"]).pack(side="left")
         tk.Label(panel, text="登录后可同步会员与平台信息；不登录也能完整使用本地工作流、API 和 Tunnel。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=28, pady=(0, 18))
@@ -4764,7 +4923,7 @@ class GatewayApp(WindowBase):
             "client_id": self._last_health.get("session_id", "") or f"local-{os.environ.get('COMPUTERNAME', 'windows')}",
             "instance_id": self._client_instance_id,
             "client_name": os.environ.get("COMPUTERNAME", "Windows 客户端"),
-            "version": self._last_health.get("version", "0.2.0"),
+            "version": self._last_health.get("version", "1.0.0"),
             "local_api": API_BASE,
             "status": status or ("online" if self._tunnel_url else "starting"),
             "heartbeatAt": now_iso,
@@ -5197,8 +5356,8 @@ class GatewayApp(WindowBase):
 
         maintenance_row(
             "在线安装或修复",
-            "自动下载已配置的环境包，校验后安装；完成后自动恢复后台服务。",
-            [("开始", lambda: (close_popup(), self._install_runtime_from_mirror()), "primary", 76)],
+            "自动下载已配置的环境包，校验后安装；拉取失败时提供手动下载地址。",
+            [("开始修复", lambda: (close_popup(), self._install_runtime_from_mirror()), "primary", 86)],
         )
         maintenance_row(
             "使用本地环境包",
@@ -6075,7 +6234,7 @@ class GatewayApp(WindowBase):
                 pystray.MenuItem("显示窗口", self._restore_from_tray, default=True),
                 pystray.MenuItem("退出", lambda *_args: self.after(0, self._on_close)),
             )
-            self._tray = pystray.Icon("ai_gateway", img, "灵镜造片厂", menu)
+            self._tray = pystray.Icon("ai_gateway", img, "灵境造片厂", menu)
             self._tray.run()
         except Exception as e:
             print(f"[Tray] 托盘创建失败: {e}")
@@ -6129,7 +6288,7 @@ class GatewayApp(WindowBase):
             return
         confirmed = messagebox.askyesno(
             "确认退出",
-            "确定要退出灵镜造片厂吗？\n\n"
+            "确定要退出灵境造片厂吗？\n\n"
             "退出后将关闭：\n"
             "  - ComfyUI\n"
             "  - 本地 API 服务\n"
@@ -6416,8 +6575,8 @@ def main():
         root = tk.Tk()
         root.withdraw()
         messagebox.showinfo(
-            "灵镜造片厂已在运行",
-            "已经打开了一个灵镜造片厂客户端。\n\n请使用已打开的窗口，避免多个客户端同时同步 URL / Key。",
+            "灵境造片厂已在运行",
+            "已经打开了一个灵境造片厂客户端。\n\n请使用已打开的窗口，避免多个客户端同时同步 URL / Key。",
             parent=root,
         )
         root.destroy()

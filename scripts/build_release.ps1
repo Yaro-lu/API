@@ -287,7 +287,7 @@ function Assert-StagingPolicy {
 
     $secretPatterns = [ordered]@{
         'private-key' = '-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'
-        'github-token' = '\bgh[pousr]_[A-Za-z0-9]{30,}\b'
+        'github-token' = '\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,})\b'
         'aws-access-key' = '\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
         'api-secret' = '\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}\b'
     }
@@ -409,6 +409,8 @@ try {
         'start.bat',
         'check-env.bat',
         'README.md',
+        'docs\灵境造片厂使用教学.pdf',
+        'examples\灵境造片厂示例页.html',
         'requirements.lock',
         'requirements-runtime.lock',
         'VERSION'
@@ -453,6 +455,12 @@ try {
             Copy-RequiredFile -Source $source -Destination (Join-Path $StageRoot $optionalNotice)
         }
     }
+    Copy-RequiredFile `
+        -Source (Join-Path $SourceRoot 'docs\灵境造片厂使用教学.pdf') `
+        -Destination (Join-Path $StageRoot '灵境造片厂使用教学.pdf')
+    Copy-RequiredFile `
+        -Source (Join-Path $SourceRoot 'examples\灵境造片厂示例页.html') `
+        -Destination (Join-Path $StageRoot '灵境造片厂示例页.html')
 
     $releaseInfo = [ordered]@{
         product = 'LingJingAI'
@@ -482,6 +490,8 @@ try {
         'start.bat',
         'check-env.bat',
         'README.md',
+        '灵境造片厂使用教学.pdf',
+        '灵境造片厂示例页.html',
         'requirements.lock',
         'requirements-runtime.lock',
         'VERSION',

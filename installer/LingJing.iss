@@ -1,4 +1,4 @@
-; 灵镜造片厂 — Windows 10 x64 轻量客户端安装包
+; 灵境造片厂 — Windows 10 x64 轻量客户端安装包
 ; 该脚本只能读取 build_release.ps1 生成并审核过的 staging 目录。
 ; ComfyUI、Torch、CUDA、Cloudflared 和模型通过独立运行环境包安装。
 
@@ -14,7 +14,7 @@
   #error ReleaseOutputDir must be supplied by scripts/build_release.ps1
 #endif
 
-#define MyAppName "灵镜造片厂"
+#define MyAppName "灵境造片厂"
 #define MyAppPublisher "Yaro-lu"
 #define MyAppURL "https://github.com/Yaro-lu/API"
 #define MyAppExe "runtime\python\pythonw.exe"
@@ -52,8 +52,8 @@ UsePreviousAppDir=yes
 UsePreviousGroup=yes
 CreateUninstallRegKey=yes
 Uninstallable=yes
-VersionInfoDescription=灵镜造片厂轻量客户端
-VersionInfoProductName=灵镜造片厂
+VersionInfoDescription=灵境造片厂轻量客户端
+VersionInfoProductName=灵境造片厂
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoVersion={#MyAppVersion}
 
@@ -66,11 +66,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Icons]
+Name: "{app}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Parameters: "-s -B ""{app}\app\gui\main_gateway.py"""; WorkingDir: "{app}"; IconFilename: "{app}\app\gui\assets\app.ico"; Comment: "启动 {#MyAppName}"
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Parameters: "-s -B ""{app}\app\gui\main_gateway.py"""; WorkingDir: "{app}"; IconFilename: "{app}\app\gui\assets\app.ico"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Parameters: "-s -B ""{app}\app\gui\main_gateway.py"""; WorkingDir: "{app}"; IconFilename: "{app}\app\gui\assets\app.ico"; Tasks: desktopicon
+Name: "{autodesktop}\灵境造片厂示例页"; Filename: "{app}\灵境造片厂示例页.html"; WorkingDir: "{app}"; IconFilename: "{app}\app\gui\assets\app.ico"; Comment: "打开灵境造片厂本地 API 示例页"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Parameters: "-s -B ""{app}\app\gui\main_gateway.py"""; WorkingDir: "{app}"; Description: "启动 {#MyAppName}"; Flags: postinstall nowait skipifsilent runascurrentuser

@@ -2,7 +2,10 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "",
+    [string]$SourceRoot = "",
+    [string]$PackageBaseName = "runtime-nvidia-rtx20plus-cu130",
+    [string]$Repository = "Yaro-lu/API",
     [switch]$ValidateOnly
 )
 
@@ -11,12 +14,33 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ScriptDir
+$ProjectVersionPath = Join-Path $ProjectDir "VERSION"
+if (-not (Test-Path -LiteralPath $ProjectVersionPath -PathType Leaf)) {
+    throw "Project VERSION file not found: $ProjectVersionPath"
+}
+$ProjectVersion = (Get-Content -LiteralPath $ProjectVersionPath -Raw).Trim()
+if (-not $Version) {
+    $Version = $ProjectVersion
+}
+elseif ($Version -ne $ProjectVersion) {
+    throw "Requested runtime version $Version does not match project VERSION $ProjectVersion"
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+    throw "Invalid runtime version: $Version"
+}
+$RuntimeSourceRoot = if ($SourceRoot) {
+    [System.IO.Path]::GetFullPath($SourceRoot)
+}
+else {
+    $ProjectDir
+}
 $DistDir = Join-Path $ProjectDir "dist"
-$PackageName = "runtime-nvidia-rtx30plus-cu130-v$Version.7z"
+$PackageName = "$PackageBaseName-v$Version.7z"
 $ArchivePath = Join-Path $DistDir $PackageName
 $HashPath = "$ArchivePath.sha256"
+$ReleaseManifestPath = "$ArchivePath.release.json"
 $StagingBase = Join-Path $DistDir "runtime-staging"
-$StageRoot = Join-Path $StagingBase "runtime-nvidia-rtx30plus-cu130-v$Version"
+$StageRoot = Join-Path $StagingBase "$PackageBaseName-v$Version"
 
 function Write-Step {
     param([Parameter(Mandatory)][string]$Message)
@@ -199,7 +223,11 @@ function Get-ArchiveMembers {
                     if (
                         $candidate -and
                         -not $candidate.Equals($archiveFull, [System.StringComparison]::OrdinalIgnoreCase) -and
-                        -not $candidate.Equals($archiveLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+                        -not $candidate.Equals($archiveLeaf, [System.StringComparison]::OrdinalIgnoreCase) -and
+                        -not $candidate.EndsWith(
+                            "/$archiveLeaf",
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
                     ) {
                         $candidate
                     }
@@ -293,6 +321,15 @@ function Assert-ArchivePolicy {
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
     throw "Version is not a safe semantic version: $Version"
 }
+if ($PackageBaseName -notmatch '^runtime-nvidia-[a-z0-9][a-z0-9.-]*$') {
+    throw "Package base name is not safe: $PackageBaseName"
+}
+if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+    throw "GitHub repository must use owner/name form: $Repository"
+}
+if (-not (Test-Path -LiteralPath $RuntimeSourceRoot -PathType Container)) {
+    throw "Runtime source root does not exist: $RuntimeSourceRoot"
+}
 
 $requiredInputs = @(
     'runtime\python\python.exe',
@@ -301,16 +338,17 @@ $requiredInputs = @(
     'bin\cloudflared.exe'
 )
 $missingInputs = @($requiredInputs | Where-Object {
-    -not (Test-Path -LiteralPath (Join-Path $ProjectDir $_) -PathType Leaf)
+    -not (Test-Path -LiteralPath (Join-Path $RuntimeSourceRoot $_) -PathType Leaf)
 })
 if ($missingInputs.Count) {
     throw "Environment is incomplete. Missing: $($missingInputs -join ', ')"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $ProjectDir '.venv\Lib') -PathType Container)) {
+if (-not (Test-Path -LiteralPath (Join-Path $RuntimeSourceRoot '.venv\Lib') -PathType Container)) {
     throw "Environment is incomplete. Missing: .venv\Lib"
 }
 
 Write-Host "[Runtime] Package source contract is valid." -ForegroundColor Green
+Write-Host "[Runtime] Source root: $RuntimeSourceRoot"
 Write-Host "[Runtime] Only .venv/Lib, optional .venv/share, portable Python, sanitized ComfyUI, and Cloudflared are allowed."
 if ($ValidateOnly) {
     exit 0
@@ -323,18 +361,19 @@ Remove-SafeStage
 New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
 Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $HashPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $ReleaseManifestPath -Force -ErrorAction SilentlyContinue
 
 $buildSucceeded = $false
 try {
     Write-Step "Creating sanitized runtime staging"
-    Copy-SanitizedTree -Source (Join-Path $ProjectDir '.venv\Lib') -Destination (Join-Path $StageRoot '.venv\Lib') -Profile Venv
-    $venvShare = Join-Path $ProjectDir '.venv\share'
+    Copy-SanitizedTree -Source (Join-Path $RuntimeSourceRoot '.venv\Lib') -Destination (Join-Path $StageRoot '.venv\Lib') -Profile Venv
+    $venvShare = Join-Path $RuntimeSourceRoot '.venv\share'
     if (Test-Path -LiteralPath $venvShare -PathType Container) {
         Copy-SanitizedTree -Source $venvShare -Destination (Join-Path $StageRoot '.venv\share') -Profile Venv
     }
-    Copy-SanitizedTree -Source (Join-Path $ProjectDir 'runtime\python') -Destination (Join-Path $StageRoot 'runtime\python') -Profile RuntimePython
-    Copy-SanitizedTree -Source (Join-Path $ProjectDir 'runtime\ComfyUI') -Destination (Join-Path $StageRoot 'runtime\ComfyUI') -Profile ComfyUI
-    Copy-RequiredFile -Source (Join-Path $ProjectDir 'bin\cloudflared.exe') -Destination (Join-Path $StageRoot 'bin\cloudflared.exe')
+    Copy-SanitizedTree -Source (Join-Path $RuntimeSourceRoot 'runtime\python') -Destination (Join-Path $StageRoot 'runtime\python') -Profile RuntimePython
+    Copy-SanitizedTree -Source (Join-Path $RuntimeSourceRoot 'runtime\ComfyUI') -Destination (Join-Path $StageRoot 'runtime\ComfyUI') -Profile ComfyUI
+    Copy-RequiredFile -Source (Join-Path $RuntimeSourceRoot 'bin\cloudflared.exe') -Destination (Join-Path $StageRoot 'bin\cloudflared.exe')
 
     Write-Step "Creating $PackageName with $($tool.Kind)"
     Push-Location $StageRoot
@@ -367,9 +406,21 @@ try {
 
     $hash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $PackageName" | Set-Content -LiteralPath $HashPath -Encoding ascii
+    $releaseTag = "v$Version"
+    $releaseUrl = "https://github.com/$Repository/releases/download/$releaseTag/$PackageName"
+    [ordered]@{
+        schema_version = 1
+        version = $Version
+        release_tag = $releaseTag
+        package_name = $PackageName
+        sha256 = $hash
+        download_url = $releaseUrl
+        homepage_url = "https://github.com/$Repository"
+    } | ConvertTo-Json | Set-Content -LiteralPath $ReleaseManifestPath -Encoding utf8
     $buildSucceeded = $true
 
     Write-Host "[Runtime] Created: $ArchivePath" -ForegroundColor Green
+    Write-Host "[Runtime] Release manifest: $ReleaseManifestPath"
     Write-Host "[Runtime] Members: $($members.Count)"
     Write-Host "[Runtime] Size: $([Math]::Round($archive.Length / 1GB, 3)) GiB"
     Write-Host "[Runtime] SHA256: $hash"
@@ -379,5 +430,6 @@ finally {
     if (-not $buildSucceeded) {
         Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $HashPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $ReleaseManifestPath -Force -ErrorAction SilentlyContinue
     }
 }

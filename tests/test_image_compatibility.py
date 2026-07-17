@@ -103,11 +103,14 @@ class FakeComfyUIClient:
     queue_release = threading.Event()
     block_queue = False
     fail_queue = False
+    uploaded_images = []
+    queued_workflows = []
 
     def __init__(self, *args, **kwargs):
         pass
 
     def queue_prompt(self, workflow_data):
+        self.queued_workflows.append(json.loads(json.dumps(workflow_data)))
         self.queue_entered.set()
         if self.block_queue:
             self.queue_release.wait(timeout=5)
@@ -119,6 +122,12 @@ class FakeComfyUIClient:
         ):
             return "prompt-text-test"
         return "prompt-image-test"
+
+    def upload_input_image(self, image_data, filename, mime_type):
+        self.uploaded_images.append(
+            {"image_data": image_data, "filename": filename, "mime_type": mime_type}
+        )
+        return f"api-input/{filename}"
 
     def get_progress(self, prompt_id, **kwargs):
         self.started.set()
@@ -190,13 +199,50 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             enabled=True,
             description="",
         )
-        FakeRegistry.workflow_defs = [image_workflow, text_workflow]
+        video_workflow_dir = self.base / "workflows" / "wan_flf2v_v1"
+        video_workflow_dir.mkdir(parents=True)
+        (video_workflow_dir / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "9": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "start_frame.png", "upload": "image"},
+                        "_meta": {"title": "Load Start Frame"},
+                    },
+                    "10": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "end_frame.png", "upload": "image"},
+                        "_meta": {"title": "Load End Frame"},
+                    },
+                    "14": {
+                        "class_type": "WanFirstLastFrameToVideo",
+                        "inputs": {"length": 33, "width": 720, "height": 1280},
+                    },
+                    "17": {
+                        "class_type": "CreateVideo",
+                        "inputs": {"fps": 16.0},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        video_workflow = SimpleNamespace(
+            id="wan_flf2v_v1",
+            name="wan2.1",
+            folder=video_workflow_dir,
+            output_type="video",
+            enabled=True,
+            description="",
+        )
+        FakeRegistry.workflow_defs = [image_workflow, text_workflow, video_workflow]
         FakeComfyUIClient.release.clear()
         FakeComfyUIClient.started.clear()
         FakeComfyUIClient.queue_entered.clear()
         FakeComfyUIClient.queue_release.clear()
         FakeComfyUIClient.block_queue = False
         FakeComfyUIClient.fail_queue = False
+        FakeComfyUIClient.uploaded_images.clear()
+        FakeComfyUIClient.queued_workflows.clear()
         self.fake_state = SimpleNamespace(
             api_key="sk-test-image",
             admin_key="sk-admin-test",
@@ -300,6 +346,65 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["status_url"].endswith(payload["status_path"]))
         FakeComfyUIClient.release.set()
         release_timer.cancel()
+
+    async def test_video_request_uploads_frames_and_injects_real_load_image_names(self):
+        frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+        status, _headers, body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/wan_flf2v_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "镜头缓慢推进",
+                "start_image": frame_data_url,
+                "end_image": frame_data_url,
+                "duration": 5,
+                "seed": 7,
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["workflow_id"], "wan_flf2v_v1")
+        self.assertEqual(payload["status_path"], f"/v1/tasks/{payload['task_id']}")
+        self.assertEqual(len(FakeComfyUIClient.uploaded_images), 2)
+        self.assertTrue(all(item["image_data"] == PNG_BYTES for item in FakeComfyUIClient.uploaded_images))
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertTrue(queued["9"]["inputs"]["image"].startswith("api-input/lingjing_task_"))
+        self.assertTrue(queued["10"]["inputs"]["image"].startswith("api-input/lingjing_task_"))
+        self.assertEqual(queued["14"]["inputs"]["length"], 81)
+        self.assertEqual(queued["14"]["inputs"]["width"], 720)
+        self.assertEqual(queued["14"]["inputs"]["height"], 1280)
+        self.assertEqual(queued["17"]["inputs"]["fps"], 16.0)
+        request_record = next(self.fake_config.requests_dir.glob("task_*.json"))
+        self.assertNotIn("data:image", request_record.read_text(encoding="utf-8"))
+
+    async def test_video_request_rejects_missing_or_fake_frames_before_upload(self):
+        frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+        missing_status, _headers, missing_body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/wan_flf2v_v1",
+            headers=self.auth,
+            json_body={"prompt": "test", "start_image": frame_data_url},
+        )
+        fake_status, _headers, fake_body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/wan_flf2v_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "test",
+                "start_image": "data:image/png;base64," + base64.b64encode(b"not-png").decode("ascii"),
+                "end_image": frame_data_url,
+            },
+        )
+
+        self.assertEqual(missing_status, 422)
+        self.assertIn("尾帧", json.loads(missing_body)["detail"])
+        self.assertEqual(fake_status, 422)
+        self.assertIn("声明格式", json.loads(fake_body)["detail"])
+        self.assertEqual(FakeComfyUIClient.uploaded_images, [])
 
     async def test_root_short_url_runs_current_default_workflow_asynchronously(self):
         status, headers, body = await asgi_request(
@@ -612,7 +717,7 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 "status": "completed",
                 "outputs": [{"filename": output.name}],
             }
-        origin = "http://100.77.118.69"
+        origin = "https://example.test"
 
         preflight_status, preflight_headers, _ = await asgi_request(
             self.app,

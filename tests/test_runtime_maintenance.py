@@ -46,6 +46,42 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["driver_version"], "580.88")
 
+    def test_system_environment_rejects_pre_rtx_gpu_even_with_enough_vram(self):
+        result = main_gateway._check_system_env(
+            lambda *args, **kwargs: mock.Mock(
+                returncode=0,
+                stdout="NVIDIA GeForce GTX 1080 Ti, 580.88, 11264\n",
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("RTX 20", result["error"])
+
+    def test_system_environment_rejects_supported_gpu_below_8gb(self):
+        result = main_gateway._check_system_env(
+            lambda *args, **kwargs: mock.Mock(
+                returncode=0,
+                stdout="NVIDIA GeForce RTX 2060, 580.88, 6144\n",
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("8GB", result["error"])
+
+    def test_system_environment_selects_supported_gpu_from_multiple_cards(self):
+        result = main_gateway._check_system_env(
+            lambda *args, **kwargs: mock.Mock(
+                returncode=0,
+                stdout=(
+                    "NVIDIA GeForce GTX 1080 Ti, 580.88, 11264\n"
+                    "NVIDIA GeForce RTX 3060, 580.88, 12288\n"
+                ),
+            )
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["gpu_name"], "NVIDIA GeForce RTX 3060")
+
     def test_maintenance_guard_records_and_releases_owned_services(self):
         app = self._app()
         app._process_supervisor = mock.Mock()
@@ -546,6 +582,41 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         self.assertEqual(first["state"], "downloading")
         self.assertEqual(second["state"], "idle")
         self.assertIs(app._active_model_transfers[app._model_transfer_key(target)], first)
+
+    def test_runtime_update_result_reports_rollback_in_chinese(self):
+        app = self._app()
+        result = {
+            "success": False,
+            "result_code": "install_failed_rolled_back",
+            "message": "locked file",
+        }
+        with (
+            mock.patch.object(main_gateway, "consume_runtime_update_result", return_value=result),
+            mock.patch.object(main_gateway.messagebox, "showerror") as showerror,
+        ):
+            app._show_runtime_update_result()
+
+        title, message = showerror.call_args.args
+        self.assertEqual(title, "运行环境更新失败")
+        self.assertIn("旧环境已恢复", message)
+        self.assertIn("locked file", message)
+        self.assertIs(showerror.call_args.kwargs["parent"], app)
+
+    def test_runtime_update_handoff_closes_gui_for_external_swap(self):
+        app = self._app()
+        app._anim_running = True
+        app._heartbeat_run = True
+        app._poll_run = True
+        app._complete_destroy = mock.Mock()
+        popup = mock.sentinel.popup
+
+        app._exit_for_runtime_update(popup)
+
+        self.assertTrue(app._shutting_down)
+        self.assertFalse(app._anim_running)
+        self.assertFalse(app._heartbeat_run)
+        self.assertFalse(app._poll_run)
+        app._complete_destroy.assert_called_once_with(popup)
 
 
 if __name__ == "__main__":

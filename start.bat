@@ -1,7 +1,7 @@
 @echo off
 setlocal
 chcp 65001 >nul
-title 灵镜造片厂
+title 灵境造片厂
 cd /d "%~dp0"
 
 set "PYTHONNOUSERSITE=1"

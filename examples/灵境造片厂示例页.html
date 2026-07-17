@@ -1,0 +1,1351 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>灵境造片厂｜本地 API 示例页</title>
+  <style>
+    :root {
+      --ink: #f4f2ec;
+      --muted: #aaa8a3;
+      --dim: #74736f;
+      --bg: #111210;
+      --panel: #191a17;
+      --panel-2: #20211d;
+      --line: #34352f;
+      --brand: #7657ff;
+      --signal: #d8ff58;
+      --warm: #ffb36b;
+      --danger: #ff6b75;
+      --ok: #76df9b;
+      --shadow: 0 28px 80px rgba(0, 0, 0, .38);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-width: 320px; background: var(--bg); }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 82% 8%, rgba(216, 255, 88, .08), transparent 27rem),
+        radial-gradient(circle at 4% 92%, rgba(118, 87, 255, .12), transparent 32rem),
+        var(--bg);
+      font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      letter-spacing: .01em;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .22;
+      background-image: linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px),
+                        linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, #000, transparent 76%);
+    }
+
+    button, input, select, textarea { font: inherit; }
+
+    button { color: inherit; }
+
+    .shell {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      padding: 24px;
+      position: relative;
+    }
+
+    .masthead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      min-height: 76px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-width: 0;
+    }
+
+    .brand img {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      box-shadow: 0 12px 30px rgba(85, 55, 255, .28);
+    }
+
+    .brand-name {
+      font-family: Bahnschrift, "Microsoft YaHei UI", sans-serif;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      white-space: nowrap;
+    }
+
+    .brand-sub {
+      margin-top: 3px;
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .local-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(25, 26, 23, .78);
+      font-size: 12px;
+    }
+
+    .local-tag::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--signal);
+      box-shadow: 0 0 0 5px rgba(216,255,88,.09);
+    }
+
+    .intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
+      gap: 28px;
+      padding: 54px 0 30px;
+      align-items: end;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--signal);
+      font: 600 12px/1 Bahnschrift, sans-serif;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before { content: "01"; color: var(--dim); }
+
+    h1 {
+      max-width: 800px;
+      margin: 18px 0 14px;
+      font: 700 clamp(38px, 6vw, 76px)/.98 Bahnschrift, "Microsoft YaHei UI", sans-serif;
+      letter-spacing: -.045em;
+    }
+
+    h1 em { color: var(--signal); font-style: normal; }
+
+    .intro-copy {
+      max-width: 720px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.9;
+    }
+
+    .quick-steps {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: var(--line);
+    }
+
+    .quick-step { min-height: 112px; padding: 18px; background: var(--panel); }
+    .quick-step b { display: block; color: var(--signal); font: 600 11px Bahnschrift, sans-serif; letter-spacing: .1em; }
+    .quick-step span { display: block; margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+
+    .connection {
+      margin-bottom: 20px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(25, 26, 23, .9);
+      box-shadow: var(--shadow);
+    }
+
+    .connection-grid {
+      display: grid;
+      grid-template-columns: minmax(220px, 1.35fr) minmax(220px, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+    }
+
+    .field label {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .field label small { color: var(--dim); }
+
+    .input-wrap { position: relative; }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      outline: none;
+      color: var(--ink);
+      background: #10110f;
+      transition: border-color .18s, box-shadow .18s, background .18s;
+    }
+
+    input, select { min-height: 46px; padding: 0 13px; }
+
+    textarea {
+      min-height: 152px;
+      padding: 16px;
+      resize: vertical;
+      line-height: 1.75;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--signal);
+      box-shadow: 0 0 0 3px rgba(216,255,88,.08);
+      background: #141511;
+    }
+
+    input::placeholder, textarea::placeholder { color: #62635d; }
+
+    .key-toggle {
+      position: absolute;
+      right: 7px;
+      top: 7px;
+      height: 32px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 7px;
+      color: var(--muted);
+      background: var(--panel-2);
+      cursor: pointer;
+    }
+
+    .primary-btn, .ghost-btn {
+      min-height: 46px;
+      padding: 0 18px;
+      border-radius: 11px;
+      cursor: pointer;
+      transition: transform .18s, background .18s, opacity .18s;
+    }
+
+    .primary-btn {
+      border: 1px solid var(--signal);
+      color: #11120f;
+      background: var(--signal);
+      font-weight: 700;
+      box-shadow: 0 10px 28px rgba(216,255,88,.12);
+    }
+
+    .primary-btn:hover:not(:disabled) { transform: translateY(-2px); }
+    .primary-btn:disabled { cursor: not-allowed; opacity: .42; }
+
+    .ghost-btn {
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .ghost-btn:hover { color: var(--ink); background: var(--panel-2); }
+
+    .connection-state {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 13px;
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .state-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--dim);
+    }
+
+    .connection-state.ok .state-dot { background: var(--ok); box-shadow: 0 0 0 5px rgba(118,223,155,.08); }
+    .connection-state.error .state-dot { background: var(--danger); box-shadow: 0 0 0 5px rgba(255,107,117,.08); }
+    .connection-state.busy .state-dot { background: var(--warm); animation: pulse 1s infinite; }
+
+    @keyframes pulse { 50% { opacity: .35; } }
+
+    .workbench {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 20px;
+      min-height: 590px;
+    }
+
+    .side-panel, .studio-panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(25, 26, 23, .92);
+      box-shadow: var(--shadow);
+    }
+
+    .side-panel { padding: 18px; }
+
+    .panel-kicker {
+      color: var(--dim);
+      font: 600 11px Bahnschrift, sans-serif;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .category-list { display: grid; gap: 8px; margin-top: 16px; }
+
+    .category-btn {
+      display: grid;
+      grid-template-columns: 38px 1fr auto;
+      align-items: center;
+      gap: 11px;
+      width: 100%;
+      min-height: 64px;
+      padding: 10px;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      color: var(--muted);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .category-btn:hover { background: var(--panel-2); }
+    .category-btn.active { border-color: #4d4f43; color: var(--ink); background: #24261f; }
+
+    .category-icon {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      font: 700 15px Bahnschrift, sans-serif;
+    }
+
+    .category-btn.active .category-icon { color: #11120f; border-color: var(--signal); background: var(--signal); }
+    .category-name { display: block; font-weight: 700; }
+    .category-caption { display: block; margin-top: 3px; color: var(--dim); font-size: 11px; }
+    .model-count { min-width: 24px; padding: 4px 7px; border-radius: 999px; color: var(--muted); background: #10110f; font: 600 11px Consolas, monospace; text-align: center; }
+
+    .model-card {
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    .model-card select { margin-top: 9px; }
+
+    .model-detail {
+      min-height: 110px;
+      margin-top: 12px;
+      padding: 13px;
+      border-radius: 11px;
+      color: var(--muted);
+      background: #11120f;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .model-detail strong { display: block; margin-bottom: 5px; color: var(--ink); }
+    .model-ready { color: var(--ok); }
+    .model-missing { color: var(--warm); }
+
+    .privacy-note {
+      margin-top: 18px;
+      padding: 13px;
+      border: 1px dashed #45463f;
+      border-radius: 11px;
+      color: var(--dim);
+      font-size: 11px;
+      line-height: 1.7;
+    }
+
+    .studio-panel { overflow: hidden; }
+
+    .studio-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .studio-head h2 { margin: 0; font: 700 24px Bahnschrift, "Microsoft YaHei UI", sans-serif; }
+    .studio-head p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+
+    .endpoint-chip {
+      align-self: center;
+      max-width: 48%;
+      overflow: hidden;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--dim);
+      background: #11120f;
+      font: 11px Consolas, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .studio-grid {
+      display: grid;
+      grid-template-columns: minmax(0, .95fr) minmax(320px, 1.05fr);
+      min-height: 500px;
+    }
+
+    .composer { padding: 24px; border-right: 1px solid var(--line); }
+
+    .prompt-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .category-controls {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .control-group[hidden] { display: none; }
+
+    .file-field input[type="file"] {
+      min-height: 46px;
+      padding: 8px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .file-field input[type="file"]::file-selector-button {
+      margin-right: 10px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--ink);
+      background: var(--panel-2);
+      cursor: pointer;
+    }
+
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .request-hint { color: var(--dim); font-size: 11px; line-height: 1.55; }
+    .generate-btn { min-width: 138px; }
+
+    .result-panel {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 24px;
+      background: #151613;
+    }
+
+    .result-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .result-title { font-weight: 700; }
+
+    .result-status {
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font: 11px Consolas, monospace;
+    }
+
+    .result-status.ok { color: var(--ok); border-color: rgba(118,223,155,.35); }
+    .result-status.error { color: var(--danger); border-color: rgba(255,107,117,.35); }
+    .result-status.busy { color: var(--warm); border-color: rgba(255,179,107,.35); }
+
+    .result-stage {
+      display: grid;
+      place-items: center;
+      flex: 1;
+      min-height: 340px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background:
+        linear-gradient(45deg, rgba(255,255,255,.015) 25%, transparent 25%) 0 0 / 18px 18px,
+        linear-gradient(45deg, transparent 75%, rgba(255,255,255,.015) 75%) 0 0 / 18px 18px,
+        #0e0f0d;
+    }
+
+    .empty-result { max-width: 300px; color: var(--dim); text-align: center; line-height: 1.8; }
+    .empty-result b { display: block; margin-bottom: 8px; color: var(--muted); }
+
+    .text-result {
+      align-self: stretch;
+      width: 100%;
+      min-height: 340px;
+      margin: 0;
+      padding: 20px;
+      overflow: auto;
+      color: #e6e4de;
+      font: 13px/1.8 Consolas, "Microsoft YaHei UI", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .media-result { display: block; width: 100%; max-height: 520px; object-fit: contain; }
+
+    .task-progress { width: min(320px, 82%); text-align: center; }
+    .task-progress strong { display: block; margin-bottom: 14px; font-size: 15px; }
+    .progress-track { height: 6px; overflow: hidden; border-radius: 99px; background: #30312c; }
+    .progress-bar { width: 12%; height: 100%; border-radius: inherit; background: var(--signal); transition: width .35s ease; }
+    .task-progress p { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+
+    .result-actions { display: flex; gap: 8px; min-height: 42px; padding-top: 12px; }
+    .result-actions:empty { display: none; }
+    .result-actions a { display: inline-flex; align-items: center; text-decoration: none; }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 26px;
+      z-index: 20;
+      max-width: min(560px, calc(100vw - 32px));
+      padding: 12px 16px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--ink);
+      background: #252620;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 14px);
+      transition: opacity .2s, transform .2s;
+      font-size: 13px;
+    }
+
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    .toast.error { border-color: rgba(255,107,117,.45); }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 2px 4px;
+      color: var(--dim);
+      font-size: 11px;
+    }
+
+    @media (max-width: 1080px) {
+      .intro { grid-template-columns: 1fr; align-items: start; }
+      .quick-steps { max-width: 720px; }
+      .workbench { grid-template-columns: 240px minmax(0, 1fr); }
+      .studio-grid { grid-template-columns: 1fr; }
+      .composer { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 760px) {
+      .shell { padding: 16px; }
+      .masthead { align-items: flex-start; padding-bottom: 16px; }
+      .local-tag { display: none; }
+      .intro { padding-top: 34px; }
+      h1 { font-size: 42px; }
+      .quick-steps { grid-template-columns: 1fr; }
+      .quick-step { min-height: auto; }
+      .connection-grid { grid-template-columns: 1fr; }
+      .workbench { grid-template-columns: 1fr; }
+      .category-list { grid-template-columns: repeat(3, 1fr); }
+      .category-btn { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+      .category-caption { display: none; }
+      .model-count { position: absolute; margin: -42px 0 0 42px; }
+      .studio-head { align-items: flex-start; flex-direction: column; }
+      .endpoint-chip { max-width: 100%; }
+      .category-controls { grid-template-columns: 1fr; }
+      .composer-actions { align-items: stretch; flex-direction: column; }
+      .generate-btn { width: 100%; }
+      footer { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brand">
+        <img src="icon.png" alt="灵境造片厂 Logo" onerror="this.onerror=null;this.src='../icon.png'">
+        <div>
+          <div class="brand-name">灵境造片厂</div>
+          <div class="brand-sub">Local AI Gateway</div>
+        </div>
+      </div>
+      <div class="local-tag">本地 API 示例页</div>
+    </header>
+
+    <section class="intro" aria-labelledby="page-title">
+      <div>
+        <div class="eyebrow">New user quick start</div>
+        <h1 id="page-title">把 URL 和 Key<br>变成第一个<em>作品</em></h1>
+        <p class="intro-copy">这是随客户端安装的本地示例页。它不会上传或保存你的密钥，也不需要额外部署网站。启动灵境造片厂，复制 URL 和 API Key，连接后即可自动发现这台客户端可用的文字、图片和视频模型。</p>
+      </div>
+      <div class="quick-steps" aria-label="快速使用步骤">
+        <div class="quick-step"><b>STEP 01</b><span>启动客户端并完成运行环境、模型检查</span></div>
+        <div class="quick-step"><b>STEP 02</b><span>复制客户端显示的 URL 和 API Key</span></div>
+        <div class="quick-step"><b>STEP 03</b><span>连接检测模型，输入描述后开始生成</span></div>
+      </div>
+    </section>
+
+    <section class="connection" aria-label="连接客户端">
+      <div class="connection-grid">
+        <div class="field">
+          <label for="baseUrl">客户端 URL <small>填写基础地址，不必带接口路径</small></label>
+          <input id="baseUrl" type="url" spellcheck="false" placeholder="例如 http://127.0.0.1:18188" autocomplete="url">
+        </div>
+        <div class="field">
+          <label for="apiKey">API Key <small>仅保留在当前浏览器会话</small></label>
+          <div class="input-wrap">
+            <input id="apiKey" type="password" spellcheck="false" placeholder="粘贴 Bearer API Key" autocomplete="off">
+            <button class="key-toggle" id="keyToggle" type="button" aria-label="显示或隐藏 API Key">显示</button>
+          </div>
+        </div>
+        <button class="primary-btn" id="connectBtn" type="button">连接并检测模型</button>
+      </div>
+      <div class="connection-state" id="connectionState" role="status" aria-live="polite">
+        <span class="state-dot"></span>
+        <span id="connectionText">等待连接客户端</span>
+      </div>
+    </section>
+
+    <section class="workbench" aria-label="示例创作台">
+      <aside class="side-panel">
+        <div class="panel-kicker">Creation category</div>
+        <div class="category-list" role="tablist" aria-label="生成分类">
+          <button class="category-btn" data-category="text" type="button" role="tab" aria-selected="false">
+            <span class="category-icon">文</span>
+            <span><span class="category-name">文字生成</span><span class="category-caption">脚本 / 分镜 / 描述</span></span>
+            <span class="model-count" id="textCount">0</span>
+          </button>
+          <button class="category-btn active" data-category="image" type="button" role="tab" aria-selected="true">
+            <span class="category-icon">图</span>
+            <span><span class="category-name">图片生成</span><span class="category-caption">文生图 / 视觉草图</span></span>
+            <span class="model-count" id="imageCount">0</span>
+          </button>
+          <button class="category-btn" data-category="video" type="button" role="tab" aria-selected="false">
+            <span class="category-icon">影</span>
+            <span><span class="category-name">视频生成</span><span class="category-caption">镜头 / 动态画面</span></span>
+            <span class="model-count" id="videoCount">0</span>
+          </button>
+        </div>
+
+        <div class="model-card">
+          <div class="field">
+            <label for="modelSelect">自动检测到的模型</label>
+            <select id="modelSelect" disabled>
+              <option value="">连接客户端后自动加载</option>
+            </select>
+          </div>
+          <div class="model-detail" id="modelDetail">
+            <strong>尚未检测</strong>
+            URL 和 Key 验证成功后，这里会显示客户端当前可用模型。
+          </div>
+        </div>
+
+        <div class="privacy-note">安全提示：本页是本地文件。URL 会保存在本机浏览器，API Key 只进入当前会话；关闭全部同源页面后会话数据失效。</div>
+      </aside>
+
+      <div class="studio-panel">
+        <div class="studio-head">
+          <div>
+            <h2 id="studioTitle">图片生成</h2>
+            <p id="studioSubtitle">输入画面描述，调用客户端可用的图片工作流。</p>
+          </div>
+          <div class="endpoint-chip" id="endpointChip">POST /api/v3/images/generations</div>
+        </div>
+
+        <div class="studio-grid">
+          <div class="composer">
+            <div class="prompt-label"><span id="promptLabel">画面描述</span><span id="charCount">0 / 4000</span></div>
+            <textarea id="prompt" maxlength="4000" placeholder="例如：清晨的江南水乡，一艘木船穿过薄雾，电影感光影，细腻写实"></textarea>
+
+            <div class="category-controls control-group" id="imageControls">
+              <div class="field">
+                <label for="imageSize">图片尺寸</label>
+                <select id="imageSize">
+                  <option value="1024x1024">1:1 · 1024 × 1024</option>
+                  <option value="1344x768">16:9 · 1344 × 768</option>
+                  <option value="768x1344">9:16 · 768 × 1344</option>
+                  <option value="1216x832">3:2 · 1216 × 832</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="imageSeed">随机种子 <small>-1 表示随机</small></label>
+                <input id="imageSeed" type="number" value="-1" min="-1" step="1">
+              </div>
+            </div>
+
+            <div class="category-controls control-group" id="textControls" hidden>
+              <div class="field">
+                <label for="textStyle">输出偏好</label>
+                <select id="textStyle">
+                  <option value="自然回答">自然回答</option>
+                  <option value="请输出结构清晰的分镜脚本">分镜脚本</option>
+                  <option value="请输出可直接使用的 JSON 结构">JSON 结构</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="category-controls control-group" id="videoControls" hidden>
+              <div class="field file-field" id="videoStartFrameField">
+                <label for="videoStartFrame">首帧图片 <small>PNG / JPEG / WebP，最大 20 MB</small></label>
+                <input id="videoStartFrame" type="file" accept="image/png,image/jpeg,image/webp">
+              </div>
+              <div class="field file-field" id="videoEndFrameField">
+                <label for="videoEndFrame">尾帧图片 <small>PNG / JPEG / WebP，最大 20 MB</small></label>
+                <input id="videoEndFrame" type="file" accept="image/png,image/jpeg,image/webp">
+              </div>
+              <div class="field">
+                <label for="videoDuration">期望时长</label>
+                <select id="videoDuration">
+                  <option value="5">5 秒</option>
+                  <option value="8">8 秒</option>
+                  <option value="10">10 秒</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="videoSeed">随机种子</label>
+                <input id="videoSeed" type="number" value="-1" min="-1" step="1">
+              </div>
+            </div>
+
+            <div class="composer-actions">
+              <div class="request-hint" id="requestHint">图片默认采用异步任务，页面会自动轮询并展示结果。</div>
+              <button class="primary-btn generate-btn" id="generateBtn" type="button" disabled>开始生成图片</button>
+            </div>
+          </div>
+
+          <div class="result-panel">
+            <div class="result-top">
+              <span class="result-title">调用结果</span>
+              <span class="result-status" id="resultStatus">等待请求</span>
+            </div>
+            <div class="result-stage" id="resultStage" aria-live="polite">
+              <div class="empty-result"><b>先连接客户端</b>检测到可用模型后，在左侧输入内容并开始第一次调用。</div>
+            </div>
+            <div class="result-actions" id="resultActions"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>灵境造片厂 · 本地 API 新手示例</span>
+      <span>页面本身不包含模型，也不会替代客户端运行环境。</span>
+    </footer>
+  </main>
+
+  <div class="toast" id="toast" role="alert"></div>
+
+  <script>
+    "use strict";
+
+    const MAX_WORKFLOW_IMAGE_BYTES = 20 * 1024 * 1024;
+    const WORKFLOW_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+    const CATEGORY_META = {
+      text: {
+        title: "文字生成",
+        subtitle: "输入需求，调用客户端可用的文字工作流。",
+        endpoint: "POST /v1/chat/completions",
+        label: "文字需求",
+        placeholder: "例如：为一支 30 秒的东方奇幻香水广告写三段式分镜脚本",
+        button: "开始生成文字",
+        hint: "文字接口会等待本地工作流完成后返回结果。"
+      },
+      image: {
+        title: "图片生成",
+        subtitle: "输入画面描述，调用客户端可用的图片工作流。",
+        endpoint: "POST /api/v3/images/generations",
+        label: "画面描述",
+        placeholder: "例如：清晨的江南水乡，一艘木船穿过薄雾，电影感光影，细腻写实",
+        button: "开始生成图片",
+        hint: "图片默认采用异步任务，页面会自动轮询并展示结果。"
+      },
+      video: {
+        title: "视频生成",
+        subtitle: "输入镜头描述，提交客户端已安装的视频工作流。",
+        endpoint: "POST /v1/workflows/run/{workflow_id}",
+        label: "镜头描述",
+        placeholder: "例如：镜头缓慢推进，人物回头看向远处灯火，衣摆随风自然摆动",
+        button: "开始生成视频",
+        hint: "页面会提交工作流并轮询任务；具体输入能力取决于客户端中的视频模型。"
+      }
+    };
+
+    const state = {
+      baseUrl: "",
+      apiKey: "",
+      connected: false,
+      category: "image",
+      models: { text: [], image: [], video: [] },
+      selected: { text: "", image: "", video: "" },
+      busy: false,
+      mediaObjectUrl: ""
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const elements = {
+      baseUrl: $("baseUrl"), apiKey: $("apiKey"), keyToggle: $("keyToggle"),
+      connectBtn: $("connectBtn"), connectionState: $("connectionState"),
+      connectionText: $("connectionText"), modelSelect: $("modelSelect"),
+      modelDetail: $("modelDetail"), studioTitle: $("studioTitle"),
+      studioSubtitle: $("studioSubtitle"), endpointChip: $("endpointChip"),
+      promptLabel: $("promptLabel"), prompt: $("prompt"), charCount: $("charCount"),
+      requestHint: $("requestHint"), generateBtn: $("generateBtn"),
+      resultStage: $("resultStage"), resultStatus: $("resultStatus"),
+      resultActions: $("resultActions"), toast: $("toast")
+    };
+
+    function normalizeBaseUrl(rawValue) {
+      const raw = String(rawValue || "").trim();
+      if (!raw) throw new Error("请填写客户端 URL");
+      let parsed;
+      try { parsed = new URL(raw); }
+      catch { throw new Error("URL 格式不正确，请复制客户端显示的完整地址"); }
+      if (!/^https?:$/.test(parsed.protocol)) throw new Error("客户端 URL 必须以 http:// 或 https:// 开头");
+      const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+      if (parsed.protocol === "http:" && !loopbackHosts.has(parsed.hostname.toLowerCase())) {
+        throw new Error("远程客户端必须使用 https://，只有本机地址可以使用 http://");
+      }
+      let path = parsed.pathname.replace(/\/+$/, "");
+      const endpointPattern = /\/(?:v1\/models|v1\/chat\/completions|api\/v3\/images\/generations|v1\/workflows\/run(?:\/[^/]+)?|v1\/tasks(?:\/[^/]+)?)$/i;
+      path = path.replace(endpointPattern, "").replace(/\/+$/, "");
+      return `${parsed.origin}${path}`;
+    }
+
+    function endpointUrl(pathOrUrl) {
+      const raw = String(pathOrUrl || "").trim();
+      const base = new URL(state.baseUrl);
+      const target = /^https?:\/\//i.test(raw)
+        ? new URL(raw)
+        : new URL(raw.replace(/^[\\/]+/, ""), `${state.baseUrl}/`);
+      if (target.origin === base.origin) return target.href;
+      return new URL(`${target.pathname}${target.search}${target.hash}`.replace(/^[\\/]+/, ""), `${state.baseUrl}/`).href;
+    }
+
+    function authHeaders(extra = {}) {
+      return { "Authorization": `Bearer ${state.apiKey}`, "Accept": "application/json", ...extra };
+    }
+
+    async function readResponse(response) {
+      const text = await response.text();
+      let payload = {};
+      if (text) {
+        try { payload = JSON.parse(text); }
+        catch { payload = { message: text }; }
+      }
+      if (!response.ok) {
+        const message = payload?.error?.message || payload?.detail || payload?.message || `HTTP ${response.status}`;
+        const error = new Error(String(message));
+        error.status = response.status;
+        throw error;
+      }
+      return payload;
+    }
+
+    async function apiRequest(pathOrUrl, options = {}) {
+      const response = await fetch(endpointUrl(pathOrUrl), {
+        ...options,
+        redirect: "error",
+        headers: authHeaders(options.headers || {})
+      });
+      return { response, data: await readResponse(response) };
+    }
+
+    function categoryForModel(model) {
+      const direct = String(model.group || model.category || model.output_type || "").toLowerCase();
+      const type = `${direct} ${model.type || ""} ${model.id || ""}`.toLowerCase();
+      if (type.includes("video") || type.includes("flf2v") || type.includes("i2v")) return "video";
+      if (type.includes("text") || type.includes("chat") || type.includes("llm") || type.includes("qwen")) return "text";
+      return "image";
+    }
+
+    function normalizeModels(payload) {
+      const direct = Array.isArray(payload?.models) ? payload.models : Array.isArray(payload?.data) ? payload.data : [];
+      const grouped = ["text", "image", "video"].flatMap(group =>
+        Array.isArray(payload?.[group]) ? payload[group].map(item => ({ ...item, group: item.group || group })) : []
+      );
+      const source = direct.length ? direct : grouped;
+      const seen = new Set();
+      const result = { text: [], image: [], video: [] };
+      source.forEach((item, index) => {
+        if (!item || typeof item !== "object") return;
+        const id = String(item.id || item.model || item.workflow_id || item.workflowId || "").trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const group = categoryForModel(item);
+        result[group].push({
+          ...item,
+          id,
+          group,
+          label: String(item.label || item.name || item.model || id),
+          workflowId: String(item.workflow_id || item.workflowId || id),
+          available: item.available !== false
+        });
+      });
+      return result;
+    }
+
+    function setConnection(kind, text) {
+      elements.connectionState.className = `connection-state${kind ? ` ${kind}` : ""}`;
+      elements.connectionText.textContent = text;
+    }
+
+    function friendlyError(error) {
+      if (error?.status === 401) return "连接失败：API Key 不正确，请重新从客户端复制。";
+      if (error?.status === 403) return "连接失败：当前 Key 没有访问权限。";
+      if (error?.status === 429) return "请求过于频繁，请稍等一分钟后重试。";
+      if (error instanceof TypeError) return "无法访问客户端。请确认客户端已启动、URL 正确且公网连接在线。";
+      return String(error?.message || "请求失败，请检查客户端状态");
+    }
+
+    function showToast(message, isError = false) {
+      elements.toast.textContent = message;
+      elements.toast.className = `toast show${isError ? " error" : ""}`;
+      clearTimeout(showToast.timer);
+      showToast.timer = setTimeout(() => { elements.toast.className = "toast"; }, 3600);
+    }
+
+    async function connectClient() {
+      if (state.busy) return;
+      try {
+        state.baseUrl = normalizeBaseUrl(elements.baseUrl.value);
+        state.apiKey = elements.apiKey.value.trim();
+        if (!state.apiKey) throw new Error("请填写 API Key");
+        state.busy = true;
+        elements.connectBtn.disabled = true;
+        elements.connectBtn.textContent = "正在检测...";
+        setConnection("busy", "正在验证 URL 和 Key，并读取模型列表...");
+
+        const { data } = await apiRequest("/v1/models", { method: "GET" });
+        state.models = normalizeModels(data);
+        ["text", "image", "video"].forEach(group => {
+          const ready = state.models[group].find(model => model.available);
+          state.selected[group] = ready?.id || "";
+          $(`${group}Count`).textContent = String(state.models[group].filter(model => model.available).length);
+        });
+        state.connected = true;
+        localStorage.setItem("lingjing_example_base_url", state.baseUrl);
+        sessionStorage.setItem("lingjing_example_api_key", state.apiKey);
+        elements.baseUrl.value = state.baseUrl;
+        const readyCount = Object.values(state.models).flat().filter(model => model.available).length;
+        setConnection("ok", `连接成功，检测到 ${readyCount} 个可用模型`);
+        renderCategory();
+        showToast("客户端连接成功，模型列表已更新");
+      } catch (error) {
+        state.connected = false;
+        state.models = { text: [], image: [], video: [] };
+        const message = friendlyError(error);
+        setConnection("error", message);
+        updateGenerateAvailability();
+        showToast(message, true);
+      } finally {
+        state.busy = false;
+        elements.connectBtn.disabled = false;
+        elements.connectBtn.textContent = "连接并检测模型";
+        updateGenerateAvailability();
+      }
+    }
+
+    function selectedModel() {
+      return state.models[state.category].find(model => model.id === state.selected[state.category]) || null;
+    }
+
+    function modelRequiresInput(model, inputName) {
+      const required = model?.input_schema?.required;
+      if (Array.isArray(required)) return required.includes(inputName);
+      return categoryForModel(model || {}) === "video" && ["start_image", "end_image"].includes(inputName);
+    }
+
+    function updateVideoInputs(model = selectedModel()) {
+      const requiresStart = modelRequiresInput(model, "start_image");
+      const requiresEnd = modelRequiresInput(model, "end_image");
+      $("videoStartFrameField").hidden = !requiresStart;
+      $("videoEndFrameField").hidden = !requiresEnd;
+    }
+
+    function renderCategory() {
+      const meta = CATEGORY_META[state.category];
+      document.querySelectorAll(".category-btn").forEach(button => {
+        const active = button.dataset.category === state.category;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+      });
+      elements.studioTitle.textContent = meta.title;
+      elements.studioSubtitle.textContent = meta.subtitle;
+      elements.endpointChip.textContent = meta.endpoint;
+      elements.promptLabel.textContent = meta.label;
+      elements.prompt.placeholder = meta.placeholder;
+      elements.requestHint.textContent = meta.hint;
+      elements.generateBtn.textContent = meta.button;
+      ["text", "image", "video"].forEach(group => {
+        $(`${group}Controls`).hidden = group !== state.category;
+      });
+      renderModelSelect();
+    }
+
+    function renderModelSelect() {
+      const models = state.models[state.category];
+      elements.modelSelect.replaceChildren();
+      if (!state.connected) {
+        elements.modelSelect.add(new Option("连接客户端后自动加载", ""));
+        elements.modelSelect.disabled = true;
+      } else if (!models.length) {
+        elements.modelSelect.add(new Option(`未检测到${CATEGORY_META[state.category].title}模型`, ""));
+        elements.modelSelect.disabled = true;
+      } else {
+        models.forEach(model => {
+          const option = new Option(`${model.label}${model.available ? "" : " · 未就绪"}`, model.id);
+          option.disabled = !model.available;
+          elements.modelSelect.add(option);
+        });
+        const ready = models.find(model => model.available);
+        if (ready && !models.some(model => model.id === state.selected[state.category] && model.available)) {
+          state.selected[state.category] = ready.id;
+        }
+        elements.modelSelect.value = state.selected[state.category];
+        elements.modelSelect.disabled = !ready;
+      }
+      updateVideoInputs();
+      renderModelDetail();
+      updateGenerateAvailability();
+    }
+
+    function renderModelDetail() {
+      const model = selectedModel();
+      elements.modelDetail.replaceChildren();
+      const title = document.createElement("strong");
+      const body = document.createElement("span");
+      if (model) {
+        title.textContent = model.label;
+        const stateLabel = document.createElement("span");
+        stateLabel.className = model.available ? "model-ready" : "model-missing";
+        stateLabel.textContent = model.available ? "● 可以调用" : "● 环境或模型未就绪";
+        body.textContent = `\n${model.description || model.type || model.id}`;
+        elements.modelDetail.append(title, stateLabel, body);
+      } else {
+        title.textContent = state.connected ? "当前分类暂无可用模型" : "尚未检测";
+        body.textContent = state.connected
+          ? "请回到客户端安装对应环境与模型，再点击上方“连接并检测模型”刷新。"
+          : "URL 和 Key 验证成功后，这里会显示客户端当前可用模型。";
+        elements.modelDetail.append(title, body);
+      }
+    }
+
+    function updateGenerateAvailability() {
+      const model = selectedModel();
+      const missingRequiredFrame = state.category === "video" && (
+        (modelRequiresInput(model, "start_image") && !$("videoStartFrame").files?.[0])
+        || (modelRequiresInput(model, "end_image") && !$("videoEndFrame").files?.[0])
+      );
+      elements.generateBtn.disabled = state.busy || !state.connected || !model?.available || missingRequiredFrame;
+    }
+
+    function setResultStatus(text, kind = "") {
+      elements.resultStatus.textContent = text;
+      elements.resultStatus.className = `result-status${kind ? ` ${kind}` : ""}`;
+    }
+
+    function resetResultActions() {
+      elements.resultActions.replaceChildren();
+      if (state.mediaObjectUrl) {
+        URL.revokeObjectURL(state.mediaObjectUrl);
+        state.mediaObjectUrl = "";
+      }
+    }
+
+    function renderProgress(title, detail, percent = 12) {
+      resetResultActions();
+      elements.resultStage.replaceChildren();
+      const wrap = document.createElement("div");
+      wrap.className = "task-progress";
+      const heading = document.createElement("strong");
+      heading.textContent = title;
+      const track = document.createElement("div");
+      track.className = "progress-track";
+      const bar = document.createElement("div");
+      bar.className = "progress-bar";
+      bar.id = "liveProgress";
+      bar.style.width = `${Math.max(4, Math.min(100, percent))}%`;
+      track.append(bar);
+      const copy = document.createElement("p");
+      copy.id = "liveProgressText";
+      copy.textContent = detail;
+      wrap.append(heading, track, copy);
+      elements.resultStage.append(wrap);
+    }
+
+    function updateProgress(percent, text) {
+      const bar = $("liveProgress");
+      const copy = $("liveProgressText");
+      if (bar) bar.style.width = `${Math.max(4, Math.min(100, Number(percent) || 0))}%`;
+      if (copy) copy.textContent = text;
+    }
+
+    function renderTextResult(content) {
+      resetResultActions();
+      elements.resultStage.replaceChildren();
+      const pre = document.createElement("pre");
+      pre.className = "text-result";
+      pre.textContent = content || "接口返回为空";
+      elements.resultStage.append(pre);
+      const copy = document.createElement("button");
+      copy.className = "ghost-btn";
+      copy.type = "button";
+      copy.textContent = "复制文字";
+      copy.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(pre.textContent);
+        showToast("文字结果已复制");
+      });
+      elements.resultActions.append(copy);
+    }
+
+    function findMediaUrl(data) {
+      const output = data?.outputs?.find(item => item?.download_path || item?.download_url || item?.url);
+      return data?.output?.download_path || output?.download_path || data?.data?.[0]?.download_path ||
+        data?.output?.download_url || output?.download_url || data?.data?.[0]?.url ||
+        data?.output?.url || output?.url || "";
+    }
+
+    function fileToDataUrl(file, label) {
+      if (!file) throw new Error(`请选择${label}`);
+      if (!WORKFLOW_IMAGE_TYPES.has(file.type)) throw new Error(`${label}仅支持 PNG、JPEG 或 WebP`);
+      if (file.size > MAX_WORKFLOW_IMAGE_BYTES) throw new Error(`${label}不能超过 20 MB`);
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.addEventListener("load", () => resolve(String(reader.result || "")), { once: true });
+        reader.addEventListener("error", () => reject(new Error(`${label}读取失败`)), { once: true });
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function protectedMediaUrl(rawUrl) {
+      const response = await fetch(endpointUrl(rawUrl), { headers: authHeaders(), redirect: "error" });
+      if (!response.ok) await readResponse(response);
+      const blob = await response.blob();
+      state.mediaObjectUrl = URL.createObjectURL(blob);
+      return state.mediaObjectUrl;
+    }
+
+    async function renderMediaResult(rawUrl, category) {
+      resetResultActions();
+      const objectUrl = await protectedMediaUrl(rawUrl);
+      elements.resultStage.replaceChildren();
+      const media = document.createElement(category === "video" ? "video" : "img");
+      media.className = "media-result";
+      media.src = objectUrl;
+      if (category === "video") {
+        media.controls = true;
+        media.playsInline = true;
+      } else {
+        media.alt = "灵境造片厂生成图片";
+      }
+      elements.resultStage.append(media);
+      const download = document.createElement("a");
+      download.className = "ghost-btn";
+      download.href = objectUrl;
+      download.download = category === "video" ? "灵境造片厂生成视频" : "灵境造片厂生成图片";
+      download.textContent = category === "video" ? "下载视频" : "下载图片";
+      elements.resultActions.append(download);
+    }
+
+    async function pollTask(taskId, statusPath, category) {
+      const path = statusPath || `/v1/tasks/${encodeURIComponent(taskId)}`;
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        if (attempt) await new Promise(resolve => setTimeout(resolve, 3000));
+        const { data } = await apiRequest(path, { method: "GET" });
+        const status = String(data.status || "").toLowerCase();
+        const percent = Number(data.progress?.percent ?? data.progress_percent ?? data.percent ?? Math.min(92, 14 + attempt * 3));
+        if (["completed", "succeeded", "success"].includes(status)) {
+          updateProgress(100, "任务完成，正在读取结果...");
+          const mediaUrl = findMediaUrl(data);
+          if (category === "text") {
+            renderTextResult(data.text || data.output?.text || "任务完成，但未返回文字内容");
+          } else if (mediaUrl) {
+            await renderMediaResult(mediaUrl, category);
+          } else {
+            throw new Error("任务已完成，但响应中没有找到生成文件 URL");
+          }
+          return;
+        }
+        if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+          throw new Error(data?.error?.message || data?.error || data?.message || "客户端任务执行失败");
+        }
+        updateProgress(percent, data.progress_label || data.phase || `任务状态：${status || "处理中"}`);
+      }
+      throw new Error("任务等待超时，请在客户端查看运行日志");
+    }
+
+    async function generateText(model, prompt) {
+      const style = $("textStyle").value;
+      const content = style === "自然回答" ? prompt : `${prompt}\n\n输出要求：${style}`;
+      const { data } = await apiRequest("/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: model.id, messages: [{ role: "user", content }] })
+      });
+      renderTextResult(data?.choices?.[0]?.message?.content || data?.text || data?.output?.text || JSON.stringify(data, null, 2));
+    }
+
+    async function generateImage(model, prompt) {
+      const { response, data } = await apiRequest("/api/v3/images/generations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Prefer": "respond-async" },
+        body: JSON.stringify({
+          model: model.id,
+          prompt,
+          size: $("imageSize").value,
+          seed: Number($("imageSeed").value || -1),
+          response_format: "url",
+          async: true
+        })
+      });
+      const mediaUrl = findMediaUrl(data);
+      if (mediaUrl) return renderMediaResult(mediaUrl, "image");
+      const taskId = data.task_id || data.id;
+      if (!taskId) throw new Error("客户端未返回图片或任务 ID");
+      const statusPath = data.status_path || response.headers.get("Location") || data.status_url;
+      return pollTask(taskId, statusPath, "image");
+    }
+
+    async function generateVideo(model, prompt) {
+      const workflowId = model.workflowId || model.id;
+      const requiresStart = modelRequiresInput(model, "start_image");
+      const requiresEnd = modelRequiresInput(model, "end_image");
+      const [startImage, endImage] = await Promise.all([
+        requiresStart ? fileToDataUrl($("videoStartFrame").files?.[0], "首帧图片") : Promise.resolve(undefined),
+        requiresEnd ? fileToDataUrl($("videoEndFrame").files?.[0], "尾帧图片") : Promise.resolve(undefined)
+      ]);
+      const body = {
+        prompt,
+        duration: Number($("videoDuration").value || 5),
+        seed: Number($("videoSeed").value || -1)
+      };
+      if (startImage) body.start_image = startImage;
+      if (endImage) body.end_image = endImage;
+      const { response, data } = await apiRequest(`/v1/workflows/run/${encodeURIComponent(workflowId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const taskId = data.task_id || data.id;
+      if (!taskId) throw new Error("客户端未返回视频任务 ID");
+      const statusPath = data.status_path || response.headers.get("Location") || data.status_url;
+      return pollTask(taskId, statusPath || `/v1/tasks/${encodeURIComponent(taskId)}`, "video");
+    }
+
+    async function generate() {
+      if (state.busy) return;
+      const model = selectedModel();
+      const prompt = elements.prompt.value.trim();
+      if (!state.connected || !model?.available) return showToast("请先连接客户端并选择可用模型", true);
+      if (!prompt) return showToast(`请填写${CATEGORY_META[state.category].label}`, true);
+      state.busy = true;
+      updateGenerateAvailability();
+      elements.generateBtn.textContent = "正在处理...";
+      setResultStatus("请求中", "busy");
+      renderProgress("任务已经开始", "正在向客户端提交请求...", 8);
+      const started = performance.now();
+      try {
+        if (state.category === "text") await generateText(model, prompt);
+        else if (state.category === "image") await generateImage(model, prompt);
+        else await generateVideo(model, prompt);
+        const seconds = ((performance.now() - started) / 1000).toFixed(1);
+        setResultStatus(`完成 · ${seconds}s`, "ok");
+      } catch (error) {
+        const message = friendlyError(error);
+        resetResultActions();
+        elements.resultStage.replaceChildren();
+        const empty = document.createElement("div");
+        empty.className = "empty-result";
+        const title = document.createElement("b");
+        title.textContent = "调用没有完成";
+        const copy = document.createElement("span");
+        copy.textContent = message;
+        empty.append(title, copy);
+        elements.resultStage.append(empty);
+        setResultStatus("调用失败", "error");
+        showToast(message, true);
+      } finally {
+        state.busy = false;
+        elements.generateBtn.textContent = CATEGORY_META[state.category].button;
+        updateGenerateAvailability();
+      }
+    }
+
+    document.querySelectorAll(".category-btn").forEach(button => {
+      button.addEventListener("click", () => {
+        if (state.busy) return showToast("当前任务处理中，请等待完成", true);
+        state.category = button.dataset.category;
+        renderCategory();
+      });
+    });
+
+    elements.connectBtn.addEventListener("click", connectClient);
+    elements.generateBtn.addEventListener("click", generate);
+    elements.keyToggle.addEventListener("click", () => {
+      const reveal = elements.apiKey.type === "password";
+      elements.apiKey.type = reveal ? "text" : "password";
+      elements.keyToggle.textContent = reveal ? "隐藏" : "显示";
+    });
+    elements.modelSelect.addEventListener("change", () => {
+      state.selected[state.category] = elements.modelSelect.value;
+      updateVideoInputs();
+      renderModelDetail();
+      updateGenerateAvailability();
+    });
+    $("videoStartFrame").addEventListener("change", updateGenerateAvailability);
+    $("videoEndFrame").addEventListener("change", updateGenerateAvailability);
+    elements.prompt.addEventListener("input", () => {
+      elements.charCount.textContent = `${elements.prompt.value.length} / 4000`;
+    });
+    elements.apiKey.addEventListener("keydown", event => {
+      if (event.key === "Enter") connectClient();
+    });
+
+    elements.baseUrl.value = localStorage.getItem("lingjing_example_base_url") || "http://127.0.0.1:18188";
+    elements.apiKey.value = sessionStorage.getItem("lingjing_example_api_key") || "";
+    window.LingJingExample = Object.freeze({ normalizeBaseUrl, normalizeModels, categoryForModel });
+    renderCategory();
+  </script>
+</body>
+</html>

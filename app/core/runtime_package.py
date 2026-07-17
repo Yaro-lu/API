@@ -3,22 +3,121 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import uuid
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
+from urllib.parse import urljoin, urlsplit
 
 
-RUNTIME_PACKAGE_VERSION = "1.0.0"
-RUNTIME_RELEASE_TAG = f"runtime-v{RUNTIME_PACKAGE_VERSION}"
-RUNTIME_PACKAGE_NAME = f"runtime-nvidia-rtx30plus-cu130-v{RUNTIME_PACKAGE_VERSION}.7z"
-RUNTIME_PACKAGE_SHA256 = "f23fff8ae20e458eddbca1ac30ebbf805d85129aaba9116a1537d9aacd9360d6"
-RUNTIME_RELEASE_URL = (
-    "https://github.com/Yaro-lu/API/releases/download/"
-    f"{RUNTIME_RELEASE_TAG}/{RUNTIME_PACKAGE_NAME}"
-)
+RUNTIME_RELEASE_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "runtime_release.json"
+
+
+def _validated_http_url(value: object, *, field: str) -> str:
+    url = str(value or "").strip()
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"{field} 必须是有效的 HTTP/HTTPS 地址")
+    return url
+
+
+def load_runtime_release_manifest(path: Path = RUNTIME_RELEASE_MANIFEST_PATH) -> dict[str, object]:
+    """Load and strictly validate the source-controlled runtime release pin."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"无法读取运行环境发布清单: {path}") from exc
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError("运行环境发布清单版本无效")
+
+    version = str(data.get("version") or "").strip()
+    release_tag = str(data.get("release_tag") or "").strip()
+    package_name = str(data.get("package_name") or "").strip()
+    sha256 = str(data.get("sha256") or "").strip().lower()
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise ValueError("运行环境发布版本无效")
+    if release_tag != f"v{version}":
+        raise ValueError("运行环境发布标签与版本不匹配")
+    if not re.fullmatch(r"runtime-nvidia-[a-z0-9.-]+-v[0-9A-Za-z.+-]+\.7z", package_name):
+        raise ValueError("运行环境包文件名无效")
+    if not package_name.endswith(f"-v{version}.7z"):
+        raise ValueError("运行环境包文件名与版本不匹配")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError("运行环境包 SHA256 无效")
+
+    download_url = _validated_http_url(data.get("download_url"), field="download_url")
+    homepage_url = _validated_http_url(data.get("homepage_url"), field="homepage_url")
+    download_path = urlsplit(download_url).path.rstrip("/")
+    if not download_path.endswith(f"/{release_tag}/{package_name}"):
+        raise ValueError("运行环境下载地址与发布标签或包文件名不匹配")
+    return {
+        "schema_version": 1,
+        "version": version,
+        "release_tag": release_tag,
+        "package_name": package_name,
+        "sha256": sha256,
+        "download_url": download_url,
+        "homepage_url": homepage_url,
+    }
+
+
+RUNTIME_RELEASE = load_runtime_release_manifest()
+RUNTIME_PACKAGE_VERSION = str(RUNTIME_RELEASE["version"])
+RUNTIME_RELEASE_TAG = str(RUNTIME_RELEASE["release_tag"])
+RUNTIME_PACKAGE_NAME = str(RUNTIME_RELEASE["package_name"])
+RUNTIME_PACKAGE_SHA256 = str(RUNTIME_RELEASE["sha256"])
+RUNTIME_RELEASE_URL = str(RUNTIME_RELEASE["download_url"])
+RUNTIME_HOMEPAGE_URL = str(RUNTIME_RELEASE["homepage_url"])
+
+
+def _expand_runtime_download_url(value: object) -> str:
+    template = str(value or "").strip()
+    if not template:
+        return ""
+    try:
+        url = template.format(
+            package_name=RUNTIME_PACKAGE_NAME,
+            version=RUNTIME_PACKAGE_VERSION,
+            release_tag=RUNTIME_RELEASE_TAG,
+        )
+    except (KeyError, ValueError) as exc:
+        raise ValueError("运行环境下载地址模板无效") from exc
+    url = _validated_http_url(url, field="运行环境下载地址")
+    parsed = urlsplit(url)
+    if not parsed.path.lower().endswith(".7z"):
+        url = urljoin(f"{url.rstrip('/')}/", RUNTIME_PACKAGE_NAME)
+    return url
+
+
+def resolve_runtime_download_url(
+    config: Mapping[str, object] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve a mirror override while keeping package name and SHA pinned."""
+    config = config or {}
+    environ = os.environ if environ is None else environ
+    runtime_config = config.get("runtime", {})
+    if not isinstance(runtime_config, Mapping):
+        runtime_config = {}
+    candidates = (
+        runtime_config.get("download_url"),
+        runtime_config.get("mirror_url"),
+        config.get("runtime_mirror_url"),
+        environ.get("LINGJING_RUNTIME_DOWNLOAD_URL"),
+        environ.get("LINGJING_RUNTIME_MIRROR_URL"),
+        RUNTIME_RELEASE_URL,
+    )
+    selected = next((value for value in candidates if str(value or "").strip()), "")
+    return _expand_runtime_download_url(selected)
 
 REQUIRED_RUNTIME_PATHS = (
     Path("runtime/python/python.exe"),

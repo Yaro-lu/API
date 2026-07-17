@@ -31,6 +31,7 @@ class Config:
                 "api_key_prefix": "sk-local",
             },
             "queue": {"max_concurrent": 1, "max_pending": 10},
+            "runtime": {"download_url": ""},
             "storage": {
                 "keep_requests": True,
                 "keep_inputs": True,

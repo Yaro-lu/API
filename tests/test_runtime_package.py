@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,13 +6,16 @@ from pathlib import Path
 from app.core.runtime_package import (
     RUNTIME_PACKAGE_NAME,
     RUNTIME_PACKAGE_SHA256,
+    RUNTIME_RELEASE_URL,
     REQUIRED_RUNTIME_PATHS,
     install_staged_runtime,
     invalid_archive_entries,
+    load_runtime_release_manifest,
     missing_archive_entries,
     missing_runtime_paths,
     parse_archive_members,
     read_sha256_sidecar,
+    resolve_runtime_download_url,
     sha256_file,
     validate_staged_runtime,
     verify_runtime_package,
@@ -20,6 +24,114 @@ from app.core.runtime_package import (
 
 
 class RuntimePackageContractTests(unittest.TestCase):
+    def test_source_controlled_release_manifest_is_consistent(self):
+        manifest = load_runtime_release_manifest()
+
+        self.assertEqual(manifest["package_name"], RUNTIME_PACKAGE_NAME)
+        self.assertEqual(manifest["sha256"], RUNTIME_PACKAGE_SHA256)
+        self.assertEqual(manifest["download_url"], RUNTIME_RELEASE_URL)
+        self.assertTrue(RUNTIME_RELEASE_URL.endswith(f"/{RUNTIME_PACKAGE_NAME}"))
+
+    def test_release_manifest_rejects_url_for_a_different_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime_release.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "version": "1.2.3",
+                        "release_tag": "v1.2.3",
+                        "package_name": "runtime-nvidia-rtx20plus-cu130-v1.2.3.7z",
+                        "sha256": "a" * 64,
+                        "download_url": "https://example.com/wrong.7z",
+                        "homepage_url": "https://example.com/project",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "下载地址与发布标签或包文件名不匹配"):
+                load_runtime_release_manifest(path)
+
+    def test_release_manifest_rejects_package_version_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime_release.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "version": "1.2.3",
+                        "release_tag": "v1.2.3",
+                        "package_name": "runtime-nvidia-rtx20plus-cu130-v9.9.9.7z",
+                        "sha256": "a" * 64,
+                        "download_url": (
+                            "https://example.com/v1.2.3/"
+                            "runtime-nvidia-rtx20plus-cu130-v9.9.9.7z"
+                        ),
+                        "homepage_url": "https://example.com/project",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "文件名与版本不匹配"):
+                load_runtime_release_manifest(path)
+
+    def test_release_manifest_rejects_download_url_for_wrong_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime_release.json"
+            package_name = "runtime-nvidia-rtx20plus-cu130-v1.2.3.7z"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "version": "1.2.3",
+                        "release_tag": "v1.2.3",
+                        "package_name": package_name,
+                        "sha256": "a" * 64,
+                        "download_url": f"https://example.com/v9.9.9/{package_name}",
+                        "homepage_url": "https://example.com/project",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "发布标签或包文件名不匹配"):
+                load_runtime_release_manifest(path)
+
+    def test_download_url_has_fixed_default_and_controlled_overrides(self):
+        self.assertEqual(resolve_runtime_download_url({}, {}), RUNTIME_RELEASE_URL)
+        self.assertEqual(
+            resolve_runtime_download_url(
+                {"runtime": {"download_url": "https://mirror.example/runtime"}},
+                {},
+            ),
+            f"https://mirror.example/runtime/{RUNTIME_PACKAGE_NAME}",
+        )
+        self.assertEqual(
+            resolve_runtime_download_url(
+                {
+                    "runtime": {
+                        "download_url": (
+                            "https://mirror.example/{release_tag}/{package_name}"
+                        )
+                    }
+                },
+                {},
+            ),
+            RUNTIME_RELEASE_URL.replace(
+                "https://github.com/Yaro-lu/API/releases/download",
+                "https://mirror.example",
+            ),
+        )
+
+    def test_download_url_rejects_unsafe_protocol(self):
+        with self.assertRaisesRegex(ValueError, "HTTP/HTTPS"):
+            resolve_runtime_download_url(
+                {"runtime": {"download_url": "file:///tmp/runtime.7z"}},
+                {},
+            )
+
     def test_archive_requires_portable_dependencies_and_no_nested_root(self):
         members = [path.as_posix() for path in REQUIRED_RUNTIME_PATHS]
         self.assertEqual(missing_archive_entries(members), [])

@@ -11,6 +11,8 @@ Local AI API Gateway — API 服务器
   GET  /health                       → 健康检查（免鉴权）
 """
 import asyncio
+import base64
+import binascii
 import sys
 import json
 import random
@@ -61,6 +63,7 @@ MANAGEMENT_PATHS = {
     "/v1/tunnel/restart",
 }
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+MAX_WORKFLOW_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_PROMPT_CHARS = 100_000
 MAX_TASK_RECORDS = 200
 MAX_REQUEST_RECORDS = 200
@@ -643,6 +646,84 @@ def _bounded_integer(value, *, name: str, default: int, minimum: int, maximum: i
     return result
 
 
+def _decode_workflow_image(value, *, name: str) -> tuple[bytes, str, str]:
+    """Decode a browser data URL after bounding its type and decoded size."""
+    if not isinstance(value, str) or not value.startswith("data:image/"):
+        raise HTTPException(422, detail=f"{name} 必须是 PNG、JPEG 或 WebP 图片")
+    match = re.fullmatch(
+        r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise HTTPException(422, detail=f"{name} 图片数据格式无效")
+    mime_type = match.group(1).lower()
+    encoded = match.group(2)
+    if len(encoded) > ((MAX_WORKFLOW_IMAGE_BYTES + 2) // 3) * 4:
+        raise HTTPException(413, detail=f"{name} 不能超过 {MAX_WORKFLOW_IMAGE_BYTES // (1024 * 1024)} MB")
+    try:
+        image_data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(422, detail=f"{name} 图片数据格式无效") from None
+    if not image_data or len(image_data) > MAX_WORKFLOW_IMAGE_BYTES:
+        raise HTTPException(413, detail=f"{name} 不能超过 {MAX_WORKFLOW_IMAGE_BYTES // (1024 * 1024)} MB")
+
+    extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[mime_type]
+    valid_signature = (
+        (mime_type == "image/png" and image_data.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (mime_type == "image/jpeg" and image_data.startswith(b"\xff\xd8\xff"))
+        or (
+            mime_type == "image/webp"
+            and len(image_data) >= 12
+            and image_data[:4] == b"RIFF"
+            and image_data[8:12] == b"WEBP"
+        )
+    )
+    if not valid_signature:
+        raise HTTPException(422, detail=f"{name} 图片内容与声明格式不一致")
+    return image_data, mime_type, extension
+
+
+def _load_image_body_key(node: dict) -> str:
+    if str(node.get("class_type") or "") != "LoadImage":
+        return ""
+    inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+    metadata = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+    hint = f"{metadata.get('title', '')} {inputs.get('image', '')}".lower()
+    if "start" in hint or "首帧" in hint:
+        return "start_image"
+    if "end" in hint or "尾帧" in hint:
+        return "end_image"
+    return ""
+
+
+def _upload_workflow_images(client, workflow_data: dict, body: dict, task_id: str) -> None:
+    """Upload request images to ComfyUI and bind them to matching LoadImage nodes."""
+    mapped_nodes: dict[str, list[dict]] = {"start_image": [], "end_image": []}
+    for node in workflow_data.values():
+        if not isinstance(node, dict):
+            continue
+        key = _load_image_body_key(node)
+        if key:
+            mapped_nodes[key].append(node)
+
+    labels = {"start_image": "首帧图片", "end_image": "尾帧图片"}
+    prepared: dict[str, tuple[bytes, str, str]] = {}
+    for key, nodes in mapped_nodes.items():
+        if not nodes:
+            continue
+        if not body.get(key):
+            raise HTTPException(422, detail=f"缺少{labels[key]}")
+        prepared[key] = _decode_workflow_image(body[key], name=labels[key])
+
+    for key, (image_data, mime_type, extension) in prepared.items():
+        filename = f"lingjing_{task_id}_{'start' if key == 'start_image' else 'end'}.{extension}"
+        uploaded_name = client.upload_input_image(image_data, filename, mime_type)
+        for node in mapped_nodes[key]:
+            node.setdefault("inputs", {})["image"] = uploaded_name
+        body[key] = uploaded_name
+
+
 def _validated_generation_body(body: dict) -> dict:
     """Return a bounded copy before values reach ComfyUI or local persistence."""
     if not isinstance(body, dict):
@@ -659,6 +740,12 @@ def _validated_generation_body(body: dict) -> dict:
         result["negative_prompt"] = negative_prompt
     raw_width = result.get("width")
     raw_height = result.get("height")
+    size_text = str(result.get("size") or "").strip()
+    dimensions_explicit = (
+        raw_width not in (None, "")
+        or raw_height not in (None, "")
+        or bool(size_text)
+    )
     if raw_width not in (None, "") or raw_height not in (None, ""):
         if raw_width in (None, "") or raw_height in (None, ""):
             raise HTTPException(422, detail="width 和 height 必须同时提供")
@@ -669,7 +756,6 @@ def _validated_generation_body(body: dict) -> dict:
             raw_height, name="height", default=1024, minimum=64, maximum=8192
         )
     else:
-        size_text = str(result.get("size") or "").strip()
         compact_size = size_text.replace(" ", "").upper()
         if size_text and not (
             compact_size in {"1K", "2K", "4K"}
@@ -683,9 +769,18 @@ def _validated_generation_body(body: dict) -> dict:
         raise HTTPException(422, detail="图片总像素不能超过 33554432")
     result["width"] = width
     result["height"] = height
+    result["_dimensions_explicit"] = dimensions_explicit
     result["steps"] = _bounded_integer(
         result.get("steps"), name="steps", default=20, minimum=1, maximum=200
     )
+    if "duration" in result:
+        result["duration"] = _bounded_integer(
+            result.get("duration"), name="duration", default=5, minimum=1, maximum=30
+        )
+    if "fps" in result:
+        result["fps"] = _bounded_integer(
+            result.get("fps"), name="fps", default=16, minimum=1, maximum=60
+        )
     if "seed" in result:
         result["seed"] = _normalize_seed(result.get("seed"))
     return result
@@ -1002,7 +1097,7 @@ def create_app() -> FastAPI:
             if state is not None:
                 state.set_offline()
 
-    app = FastAPI(title="Local AI API Gateway", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Local AI API Gateway", version="1.0.0", lifespan=lifespan)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
     app.add_middleware(SecurityHeadersMiddleware)
@@ -1036,6 +1131,26 @@ def create_app() -> FastAPI:
         steps = body.get("steps", 20)
         width = body.get("width", 1024)
         height = body.get("height", 1024)
+        dimensions_explicit = body.get("_dimensions_explicit") is True
+        requested_duration = body.get("duration")
+        requested_fps = body.get("fps")
+        effective_fps = requested_fps
+        if effective_fps is None:
+            for candidate in workflow_data.values():
+                candidate_inputs = candidate.get("inputs", {}) if isinstance(candidate, dict) else {}
+                if "fps" in candidate_inputs:
+                    try:
+                        effective_fps = max(1, int(float(candidate_inputs["fps"])))
+                    except (TypeError, ValueError, OverflowError):
+                        effective_fps = None
+                    if effective_fps is not None:
+                        break
+        frame_length = None
+        if requested_duration is not None and effective_fps is not None:
+            target_frames = max(1, int(requested_duration) * int(effective_fps))
+            # Wan video latent lengths use the 4n+1 sequence. Pick the nearest
+            # valid length so the UI's seconds control has a real effect.
+            frame_length = max(1, ((target_frames + 1) // 4) * 4 + 1)
 
         for node_id, node in workflow_data.items():
             ctype = node.get("class_type", "")
@@ -1051,11 +1166,13 @@ def create_app() -> FastAPI:
                 inputs["noise_seed"] = seed
             elif ctype == "Flux2Scheduler":
                 inputs["steps"] = steps
-                inputs["width"] = width
-                inputs["height"] = height
+                if dimensions_explicit:
+                    inputs["width"] = width
+                    inputs["height"] = height
             elif ctype == "EmptyFlux2LatentImage":
-                inputs["width"] = width
-                inputs["height"] = height
+                if dimensions_explicit:
+                    inputs["width"] = width
+                    inputs["height"] = height
             elif ctype == "SaveImage":
                 prefix = body.get("filename_prefix", "Flux2-Klein")
                 inputs["filename_prefix"] = prefix
@@ -1063,12 +1180,18 @@ def create_app() -> FastAPI:
                 for text_key in ("prompt", "text", "query", "content", "message", "messages", "user_prompt", "input", "instruction"):
                     if text_key in inputs and isinstance(inputs.get(text_key), str):
                         inputs[text_key] = prompt
-                if "width" in inputs:
+                if dimensions_explicit and "width" in inputs:
                     inputs["width"] = width
-                if "height" in inputs:
+                if dimensions_explicit and "height" in inputs:
                     inputs["height"] = height
                 if "steps" in inputs:
                     inputs["steps"] = steps
+                if requested_fps is not None and "fps" in inputs:
+                    inputs["fps"] = requested_fps
+                if frame_length is not None and "length" in inputs and (
+                    "wan" in ctype.lower() or "video" in ctype.lower()
+                ):
+                    inputs["length"] = frame_length
                 if "seed" in inputs:
                     inputs["seed"] = seed
                 if "noise_seed" in inputs:
@@ -1107,13 +1230,14 @@ def create_app() -> FastAPI:
                 raise HTTPException(500, detail="Workflow JSON 文件不存在")
             with open(wf_json_path, "r", encoding="utf-8") as f:
                 workflow_data = json.load(f)
-            _inject_workflow_params(workflow_data, body)
             comfy_log_path = config.logs_dir / "comfyui.log"
             try:
                 log_offset = comfy_log_path.stat().st_size
             except OSError:
                 log_offset = 0
             client = ComfyUIClient(config.comfyui_url, log_path=comfy_log_path)
+            _upload_workflow_images(client, workflow_data, body, task_id)
+            _inject_workflow_params(workflow_data, body)
             prompt_id = client.queue_prompt(workflow_data)
         except HTTPException:
             with _task_lock:
@@ -1304,7 +1428,7 @@ def create_app() -> FastAPI:
     @app.get("/health")
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "version": "0.2.0"}
+        return {"status": "ok", "version": "1.0.0"}
 
     @app.get("/v1/status")
     def status():
@@ -1360,7 +1484,7 @@ def create_app() -> FastAPI:
 
         return {
             "status": "ok",
-            "version": "0.2.0",
+            "version": "1.0.0",
             "session_id": state.session_id,
             "base_url": public_base_url,
             "local_api": state.local_api,
@@ -1439,6 +1563,7 @@ def create_app() -> FastAPI:
         except Exception:
             body = {}
         task_info = await asyncio.to_thread(_start_workflow_task, workflow_id, body)
+        status_path = f"/v1/tasks/{quote(task_info['task_id'], safe='')}"
         return {
             "id": task_info["task_id"],
             "task_id": task_info["task_id"],
@@ -1447,6 +1572,8 @@ def create_app() -> FastAPI:
             "workflow_id": task_info["workflow_id"],
             "workflow_name": task_info["workflow_name"],
             "prompt_id": task_info["prompt_id"],
+            "status_path": status_path,
+            "status_url": f"{_public_base_url()}{status_path}",
             "message": f"任务已提交，通过 /v1/tasks/{task_info['task_id']} 查询进度",
         }
 

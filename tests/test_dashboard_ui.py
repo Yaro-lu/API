@@ -75,6 +75,8 @@ class DashboardShellTests(unittest.TestCase):
                 app.attributes("-alpha", 0.0)
                 app.update()
 
+                self.assertEqual(app.title(), "灵境造片厂")
+                self.assertIsNotNone(self._find_by_text(app._sidebar, "灵境造片厂"))
                 self.assertEqual(tuple(app._pages), PAGE_IDS)
                 self.assertEqual(tuple(app._nav_buttons), PAGE_IDS)
                 self.assertEqual(
@@ -164,11 +166,151 @@ class DashboardShellTests(unittest.TestCase):
                 texts = set(self._all_text(app._pages["resources"]))
 
                 self.assertIn("运行环境维护", texts)
-                self.assertTrue({"检查环境", "一键安装"} & texts)
+                self.assertTrue({"检查环境", "一键修复"} & texts)
                 self.assertTrue({"修复 / 更新", "本地安装包"} & texts)
                 self.assertIn("模型维护", texts)
                 self.assertIn("导入已有模型", texts)
                 self.assertIn("重新检查", texts)
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_download_action_starts_automatic_pull(self):
+        """One-click repair must try the configured package URL first."""
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+            mock.patch.object(main_gateway, "_runtime_has_package_files", return_value=False),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app._download_runtime = mock.Mock()
+                app._runtime_mirror_url = mock.Mock(
+                    return_value="https://github.com/Yaro-lu/API/releases/download/v1/runtime.7z"
+                )
+
+                app._install_runtime_from_mirror()
+                app.update_idletasks()
+
+                app._download_runtime.assert_called_once_with(
+                    "https://github.com/Yaro-lu/API/releases/download/v1/runtime.7z",
+                    repair_confirmed=False,
+                )
+                popups = [
+                    widget
+                    for widget in app.winfo_children()
+                    if isinstance(widget, tk.Toplevel)
+                    and widget.title() == "自动修复失败"
+                ]
+                self.assertEqual(popups, [])
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_download_failure_opens_copyable_github_dialog(self):
+        """The manual GitHub fallback appears only after automatic pull failure."""
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+
+                app._show_runtime_download_fallback("网络连接失败")
+                app.update_idletasks()
+
+                popups = [
+                    widget
+                    for widget in app.winfo_children()
+                    if isinstance(widget, tk.Toplevel)
+                    and widget.title() == "自动修复失败"
+                ]
+                self.assertEqual(len(popups), 1)
+                popup = popups[0]
+                widgets = list(self._walk_widgets(popup))
+                url_fields = [
+                    widget
+                    for widget in widgets
+                    if isinstance(widget, tk.Entry)
+                    and widget.get() == "https://github.com/Yaro-lu/API"
+                ]
+                self.assertEqual(len(url_fields), 1)
+
+                copy_button = self._find_by_text(popup, "复制地址")
+                self.assertIsNotNone(copy_button)
+                copy_button.invoke()
+                app.update()
+                self.assertEqual(app.clipboard_get(), "https://github.com/Yaro-lu/API")
+                self.assertIsNotNone(self._find_by_text(popup, "自动拉取失败，请手动下载"))
+                self.assertTrue(
+                    any("网络连接失败" in text for text in self._all_text(popup))
+                )
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_network_error_switches_to_manual_fallback(self):
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app._show_runtime_download_fallback = mock.Mock()
+
+                with (
+                    mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+                    mock.patch("urllib.request.urlopen", side_effect=OSError("network unavailable")),
+                ):
+                    app._download_runtime("https://example.invalid/runtime.7z")
+                app.update()
+
+                app._show_runtime_download_fallback.assert_called_once()
+                self.assertIn(
+                    "network unavailable",
+                    app._show_runtime_download_fallback.call_args.args[0],
+                )
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_download_uses_embedded_hash_without_sidecar_asset(self):
+        """A unified two-asset release must fetch the 7z only once."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                response = mock.MagicMock()
+                response.status = 200
+                response.headers = {"Content-Length": "7"}
+                response.read.side_effect = [b"runtime", b""]
+                response.__enter__.return_value = response
+                app._extract_runtime = mock.Mock()
+
+                with (
+                    mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+                    mock.patch.object(main_gateway, "BASE_DIR", Path(tmp)),
+                    mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
+                ):
+                    app._download_runtime("https://example.invalid/runtime.7z")
+
+                self.assertEqual(urlopen.call_count, 1)
+                self.assertEqual(
+                    (Path(tmp) / "cache" / main_gateway.RUNTIME_PACKAGE_NAME).read_bytes(),
+                    b"runtime",
+                )
+                self.assertFalse(
+                    Path(
+                        f"{Path(tmp) / 'cache' / main_gateway.RUNTIME_PACKAGE_NAME}.sha256"
+                    ).exists()
+                )
             finally:
                 app._dashboard_pages.cancel_pending()
                 app.destroy()

@@ -623,7 +623,7 @@ class StaticDashboardPages:
             self._action(runtime_actions, "修复 / 更新", self.app._show_runtime_maintenance, "plain", 94).pack(side="left", padx=(8, 0))
             self._action(runtime_actions, "打开目录", self.app._open_runtime_dir, "plain", 82).pack(side="left", padx=(8, 0))
         else:
-            self._action(runtime_actions, "一键安装", self.app._install_runtime_from_mirror, "primary", 88).pack(side="left")
+            self._action(runtime_actions, "一键修复", self.app._install_runtime_from_mirror, "primary", 88).pack(side="left")
             self._action(runtime_actions, "本地安装包", self.app._select_runtime, "plain", 94).pack(side="left", padx=(8, 0))
             self._action(runtime_actions, "更多方式", self.app._show_runtime_maintenance, "plain", 82).pack(side="left", padx=(8, 0))
 
