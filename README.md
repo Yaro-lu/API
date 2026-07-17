@@ -19,14 +19,26 @@
 - NVIDIA RTX 显卡；本版 CUDA 13 运行环境建议使用 580 或更高版本驱动
 - 模型所需的磁盘空间和显存
 
-完整离线安装包已经包含便携 Python、Python 依赖、ComfyUI 和 Cloudflared，不需要另装 Python，也不会内置模型或用户数据。
+轻量客户端安装包包含打开完整界面所需的便携 Python、Tk 和 7-Zip，不需要用户另装 Python。ComfyUI、Torch、CUDA 与 Cloudflared 位于独立运行环境包中；客户端和环境包都不包含模型或用户数据。
+
+### 发布包结构
+
+```text
+LingJingAI-Setup-0.2.0-win-x64.exe                 轻量客户端
+runtime-nvidia-rtx30plus-cu130-v1.0.0.7z           独立运行环境包
+runtime-nvidia-rtx30plus-cu130-v1.0.0.7z.sha256    环境包校验值
+```
+
+- 轻量客户端可以在全新 Windows 10 上直接打开，并提供环境安装与维护界面。
+- 独立运行环境包只在首次安装、修复或环境版本升级时下载。
+- 模型、配置、日志和生成结果始终与程序及环境分离；更新客户端不会重复下载环境，也不会删除模型。
 
 ### 第一次使用
 
-1. 安装并启动客户端。
-2. 在“模型与环境”中确认运行环境正常，并把模型放入或导入 `models/`。
-3. 在“工作流”中确认需要的工作流显示“可以使用”，选择默认工作流。
-4. 回到“控制台”，复制公网 URL 和 API Key。
+1. 安装并启动轻量客户端。
+2. 在“模型与环境”中一键下载独立运行环境包，或选择本地 `.7z` 环境包安装。
+3. 把模型放入或导入 `models/`，确认所需工作流显示“可以使用”。
+4. 选择默认工作流，回到“控制台”复制公网 URL 和 API Key。
 5. 把 URL 和 Key 填入需要调用本机 AI 的网页或软件。
 
 客户端启动后会自动管理 API、ComfyUI 和临时公网通道。关闭主窗口会结束由客户端启动的后台进程。
@@ -113,12 +125,12 @@ workflows/           内置工作流定义
 tests/               自动化回归测试
 scripts/             环境维护与发布脚本
 installer/           Windows 安装器定义
-requirements-runtime.lock  离线运行环境的完整已审计快照
-runtime/python/      便携 Python（不进入 Git）
-runtime/ComfyUI/     ComfyUI（不进入 Git）
-.venv/Lib/           Python 依赖（不进入 Git）
-bin/                 Cloudflared 等运行组件（不进入 Git）
-models/              用户模型（不进入 Git，也不进入安装包）
+requirements-runtime.lock  独立运行环境的完整已审计快照
+runtime/python/      客户端启动组件；安装完整环境后由环境包维护
+runtime/ComfyUI/     独立环境包内容（不进入 Git）
+.venv/Lib/           独立环境包依赖；轻量包只带 GUI 启动所需最小子集
+bin/                 轻量包带 7-Zip；环境包提供 Cloudflared
+models/              用户模型（不进入 Git，也不包含在任何安装包中）
 ```
 
 ## 安全与隐私
@@ -126,7 +138,7 @@ models/              用户模型（不进入 Git，也不进入安装包）
 - 生成 API Key 和本机管理 Key 权限分离；管理接口不应交给外部调用方。
 - Windows 下的本地凭据使用当前用户 DPAPI 保护，日志不会输出完整 Key。
 - 远程账号服务默认只接受 HTTPS；仅回环地址允许 HTTP 开发调试。
-- 发行脚本使用白名单构建，并拒绝模型、账号会话、请求、日志和生成结果进入安装包。
+- 发行脚本使用白名单构建，并拒绝 ComfyUI、Torch/CUDA、模型、账号会话、请求、日志和生成结果进入轻量安装包。
 - 公网 URL 仍然是互联网入口，请妥善保管 API Key，不要把它提交到代码仓库或公开截图。
 
 ## 发布说明

@@ -10,8 +10,8 @@ set "PYTHONUTF8=1"
 set "PYTHONPATH=%~dp0"
 
 if not exist "runtime\python\python.exe" (
-    echo [启动失败] 运行环境不完整：缺少 runtime\python\python.exe
-    echo 请重新安装完整离线版，或在“模型与环境”页面修复运行环境。
+    echo [启动失败] 客户端启动组件不完整：缺少 runtime\python\python.exe
+    echo 请重新安装轻量客户端。AI 运行环境可在客户端打开后单独安装。
     pause
     exit /b 1
 )

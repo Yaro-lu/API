@@ -2,12 +2,13 @@
 
 <#
 .SYNOPSIS
-Builds a sanitized, model-free, complete offline Windows release.
+Builds a sanitized lightweight Windows client that installs the AI runtime separately.
 
 .DESCRIPTION
-The release is assembled in an allowlisted staging directory. Inno Setup is
-allowed to read only that staging directory, never the live project tree.
-Use -StageOnly to create and audit staging without invoking ISCC.exe.
+The release contains the application, workflows, a pruned portable Python/Tk
+bootstrap and a bundled 7-Zip extractor. ComfyUI, Torch, CUDA, Cloudflared,
+models and user data remain in the separately distributed runtime package.
+Inno Setup reads only the audited staging directory, never the live tree.
 #>
 
 [CmdletBinding()]
@@ -15,6 +16,9 @@ param(
     [string]$Version = "",
     [string]$SourceRoot = "",
     [string]$OutputRoot = "",
+    [string]$BootstrapPythonRoot = "",
+    [string]$BootstrapSitePackagesRoot = "",
+    [string]$SevenZipRoot = "",
     [switch]$StageOnly,
     [string]$ISCCPath = "",
     [switch]$KeepStaging,
@@ -26,6 +30,16 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DefaultSourceRoot = Split-Path -Parent $ScriptDir
+$BootstrapPackageEntries = @(
+    'packaging',
+    'packaging-*.dist-info',
+    'psutil',
+    'psutil-*.dist-info',
+    'pystray',
+    'pystray-*.dist-info',
+    'six.py',
+    'six-*.dist-info'
+)
 
 function Write-Step {
     param([Parameter(Mandatory)][string]$Message)
@@ -76,7 +90,7 @@ function Remove-SafeTree {
 function Test-ExcludedRelativePath {
     param(
         [Parameter(Mandatory)][string]$RelativePath,
-        [Parameter(Mandatory)][ValidateSet("Application", "Workflow", "RuntimePython", "ComfyUI", "Venv")]
+        [Parameter(Mandatory)][ValidateSet("Application", "Workflow", "BootstrapPython")]
         [string]$Profile
     )
 
@@ -99,17 +113,23 @@ function Test-ExcludedRelativePath {
 
     $first = if ($segments.Count) { $segments[0].ToLowerInvariant() } else { "" }
     $mutableRoots = @('models', 'inputs', 'outputs', 'logs', 'tasks', 'temp', 'cache')
-    if ($Profile -in @('Application', 'Workflow', 'RuntimePython') -and $first -in $mutableRoots) {
+    if ($Profile -in @('Application', 'Workflow', 'BootstrapPython') -and $first -in $mutableRoots) {
         return $true
     }
-    if ($Profile -eq 'RuntimePython' -and $first -eq 'scripts') {
-        return $true
-    }
-    if ($Profile -eq 'ComfyUI' -and $first -in @(
-        'models', 'input', 'inputs', 'output', 'outputs', 'temp', 'user',
-        'logs', 'tasks', 'cache'
-    )) {
-        return $true
+    if ($Profile -eq 'BootstrapPython') {
+        if ($first -in @('scripts', 'idlelib', 'turtledemo', 'ensurepip')) {
+            return $true
+        }
+        if ($leaf -match '(?i)^_test.*\.pyd$') {
+            return $true
+        }
+        $portablePackage = $normal.ToLowerInvariant()
+        if ($portablePackage -match '^lib\\site-packages\\(?:diffusers|pip|setuptools|_distutils_hack)(?:[-.\\]|$)') {
+            return $true
+        }
+        if ($portablePackage -eq 'lib\site-packages\distutils-precedence.pth') {
+            return $true
+        }
     }
 
     return $false
@@ -119,7 +139,7 @@ function Copy-AllowlistedTree {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
-        [Parameter(Mandatory)][ValidateSet("Application", "Workflow", "RuntimePython", "ComfyUI", "Venv")]
+        [Parameter(Mandatory)][ValidateSet("Application", "Workflow", "BootstrapPython")]
         [string]$Profile
     )
 
@@ -148,6 +168,78 @@ function Copy-AllowlistedTree {
             Copy-Item -LiteralPath $item.FullName -Destination $target -Force
         }
     }
+}
+
+function Copy-BootstrapPackages {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+        throw "Bootstrap site-packages directory is missing: $Source"
+    }
+    $sourceItems = @(Get-ChildItem -LiteralPath $Source -Force)
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $copied = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($pattern in $BootstrapPackageEntries) {
+        $matches = @($sourceItems | Where-Object { $_.Name -like $pattern })
+        if (-not $matches.Count) {
+            throw "Required bootstrap package entry is missing: $pattern"
+        }
+        foreach ($item in $matches) {
+            if (-not $copied.Add($item.FullName)) {
+                continue
+            }
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reparse points are not allowed in bootstrap packages: $($item.FullName)"
+            }
+            $target = Join-Path $Destination $item.Name
+            if ($item.PSIsContainer) {
+                Copy-AllowlistedTree -Source $item.FullName -Destination $target -Profile Application
+            }
+            else {
+                Copy-RequiredFile -Source $item.FullName -Destination $target
+            }
+        }
+    }
+}
+
+function Resolve-SevenZipRoot {
+    param(
+        [string]$RequestedRoot,
+        [Parameter(Mandatory)][string]$ProjectRoot
+    )
+
+    $candidates = @()
+    if ($RequestedRoot) {
+        $candidates += $RequestedRoot
+    }
+    $candidates += @(
+        (Join-Path $ProjectRoot 'bin'),
+        (Join-Path $env:ProgramFiles '7-Zip'),
+        (Join-Path ${env:ProgramFiles(x86)} '7-Zip')
+    )
+    $command = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        $candidates += Split-Path -Parent $command.Source
+    }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) {
+            continue
+        }
+        $full = Get-FullPath $candidate
+        if (
+            (Test-Path -LiteralPath (Join-Path $full '7z.exe') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $full '7z.dll') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $full 'License.txt') -PathType Leaf)
+        ) {
+            return $full
+        }
+    }
+    throw "7-Zip runtime files were not found. Pass -SevenZipRoot with 7z.exe, 7z.dll and License.txt."
 }
 
 function Copy-RequiredFile {
@@ -183,7 +275,11 @@ function Assert-StagingPolicy {
         '\.(pyc|pyo|pfx|p12|key|token)$',
         '^(models|inputs|outputs|logs|tasks|temp|cache)(/|$)',
         '^runtime/(requests|inputs|outputs|logs|tasks|temp|cache|env-backups|ui-review|workflow_import_tmp)(/|$)',
-        '^runtime/comfyui/(models|input|inputs|output|outputs|temp|user|logs|tasks|cache|\.git)(/|$)',
+        '^runtime/comfyui(/|$)',
+        '^runtime/python/lib/site-packages/(?:diffusers|pip|setuptools|_distutils_hack)(?:[-./]|$)',
+        '^\.venv/share(/|$)',
+        '^\.venv/lib/site-packages/(?:torch|torchaudio|torchvision|triton|nvidia)(?:[-./]|$)',
+        '^bin/cloudflared\.exe$',
         '(^|/)(session|account_session|client_instance|workflow_config|config\.local)\.json$',
         '(^|/)\.(session|workflow_config)\.lock$',
         '(^|/)gateway\.lock$'
@@ -235,20 +331,35 @@ function Resolve-ISCC {
         return $command.Source
     }
     foreach ($candidate in @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+        (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
     )) {
         if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             return $candidate
         }
     }
-    throw "Inno Setup 6 was not found. Install it, pass -ISCCPath, or use -StageOnly."
+    throw "Inno Setup 7 or 6 was not found. Install it, pass -ISCCPath, or use -StageOnly."
 }
 
 $SourceRoot = if ($SourceRoot) { Get-FullPath $SourceRoot } else { Get-FullPath $DefaultSourceRoot }
 if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
     throw "Source root does not exist: $SourceRoot"
 }
+$BootstrapPythonRoot = if ($BootstrapPythonRoot) {
+    Get-FullPath $BootstrapPythonRoot
+}
+else {
+    Get-FullPath (Join-Path $SourceRoot 'runtime\python')
+}
+$BootstrapSitePackagesRoot = if ($BootstrapSitePackagesRoot) {
+    Get-FullPath $BootstrapSitePackagesRoot
+}
+else {
+    Get-FullPath (Join-Path $SourceRoot '.venv\Lib\site-packages')
+}
+$SevenZipRoot = Resolve-SevenZipRoot -RequestedRoot $SevenZipRoot -ProjectRoot $SourceRoot
 
 $versionFile = Join-Path $SourceRoot 'VERSION'
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
@@ -295,12 +406,6 @@ try {
         'app\gui\main_gateway.py',
         'app\gui\assets\app.ico',
         'workflows',
-        'runtime\python\python.exe',
-        'runtime\python\pythonw.exe',
-        'runtime\ComfyUI\main.py',
-        '.venv\Lib\site-packages\torch\__init__.py',
-        '.venv\share',
-        'bin\cloudflared.exe',
         'start.bat',
         'check-env.bat',
         'README.md',
@@ -312,16 +417,21 @@ try {
     if ($missing.Count) {
         throw "Release input is incomplete. Missing: $($missing -join ', ')"
     }
+    foreach ($bootstrapExecutable in @('python.exe', 'pythonw.exe', 'python313._pth')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $BootstrapPythonRoot $bootstrapExecutable) -PathType Leaf)) {
+            throw "Bootstrap Python is incomplete. Missing: $bootstrapExecutable"
+        }
+    }
 
     Write-Step "Copying application allowlist"
     Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'app') -Destination (Join-Path $StageRoot 'app') -Profile Application
     Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'workflows') -Destination (Join-Path $StageRoot 'workflows') -Profile Workflow
-    Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'runtime\python') -Destination (Join-Path $StageRoot 'runtime\python') -Profile RuntimePython
-    Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'runtime\ComfyUI') -Destination (Join-Path $StageRoot 'runtime\ComfyUI') -Profile ComfyUI
-    Copy-AllowlistedTree -Source (Join-Path $SourceRoot '.venv\Lib') -Destination (Join-Path $StageRoot '.venv\Lib') -Profile Venv
-    Copy-AllowlistedTree -Source (Join-Path $SourceRoot '.venv\share') -Destination (Join-Path $StageRoot '.venv\share') -Profile Venv
+    Copy-AllowlistedTree -Source $BootstrapPythonRoot -Destination (Join-Path $StageRoot 'runtime\python') -Profile BootstrapPython
+    Copy-BootstrapPackages -Source $BootstrapSitePackagesRoot -Destination (Join-Path $StageRoot '.venv\Lib\site-packages')
 
-    Copy-RequiredFile -Source (Join-Path $SourceRoot 'bin\cloudflared.exe') -Destination (Join-Path $StageRoot 'bin\cloudflared.exe')
+    Copy-RequiredFile -Source (Join-Path $SevenZipRoot '7z.exe') -Destination (Join-Path $StageRoot 'bin\7z.exe')
+    Copy-RequiredFile -Source (Join-Path $SevenZipRoot '7z.dll') -Destination (Join-Path $StageRoot 'bin\7z.dll')
+    Copy-RequiredFile -Source (Join-Path $SevenZipRoot 'License.txt') -Destination (Join-Path $StageRoot 'bin\7-Zip-License.txt')
     foreach ($rootFile in @(
         'start.bat',
         'check-env.bat',
@@ -348,7 +458,8 @@ try {
         product = 'LingJingAI'
         version = $Version
         platform = 'windows-x64'
-        runtime_layout = 'offline-portable-python-comfyui'
+        runtime_layout = 'bootstrap-python-separate-ai-runtime'
+        environment_included = $false
         models_included = $false
         generated_utc = [DateTime]::UtcNow.ToString('o')
     }
@@ -362,9 +473,12 @@ try {
         'app\gui\assets\app.ico',
         'runtime\python\python.exe',
         'runtime\python\pythonw.exe',
-        'runtime\ComfyUI\main.py',
-        '.venv\Lib\site-packages\torch\__init__.py',
-        'bin\cloudflared.exe',
+        '.venv\Lib\site-packages\psutil\__init__.py',
+        '.venv\Lib\site-packages\pystray\__init__.py',
+        '.venv\Lib\site-packages\six.py',
+        'bin\7z.exe',
+        'bin\7z.dll',
+        'bin\7-Zip-License.txt',
         'start.bat',
         'check-env.bat',
         'README.md',
@@ -434,7 +548,7 @@ try {
         }
     }
 
-    Write-Step "Compiling offline installer"
+    Write-Step "Compiling lightweight bootstrap installer"
     $compilerArgs = @(
         "/DMyAppVersion=$Version",
         "/DStageDir=$StageRoot",

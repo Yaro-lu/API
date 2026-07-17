@@ -1,5 +1,6 @@
-; 灵镜造片厂 — Windows 10 x64 离线安装包
+; 灵镜造片厂 — Windows 10 x64 轻量客户端安装包
 ; 该脚本只能读取 build_release.ps1 生成并审核过的 staging 目录。
+; ComfyUI、Torch、CUDA、Cloudflared 和模型通过独立运行环境包安装。
 
 #ifndef MyAppVersion
   #error MyAppVersion must be supplied by scripts/build_release.ps1
@@ -27,11 +28,12 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
+AppComments=轻量客户端；首次打开后可安装或导入独立 AI 运行环境包
 DefaultDirName={localappdata}\Programs\LingJingAI
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 AllowNoIcons=yes
 DisableProgramGroupPage=yes
@@ -50,6 +52,10 @@ UsePreviousAppDir=yes
 UsePreviousGroup=yes
 CreateUninstallRegKey=yes
 Uninstallable=yes
+VersionInfoDescription=灵镜造片厂轻量客户端
+VersionInfoProductName=灵镜造片厂
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppVersion}
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
