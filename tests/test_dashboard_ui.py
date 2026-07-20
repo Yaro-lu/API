@@ -4,6 +4,7 @@ import threading
 import tkinter as tk
 import unittest
 from pathlib import Path
+from tkinter import ttk
 from unittest import mock
 
 from app.gui import main_gateway
@@ -208,6 +209,158 @@ class DashboardShellTests(unittest.TestCase):
                 app._dashboard_pages.cancel_pending()
                 app.destroy()
 
+    def test_runtime_progress_dialog_uses_neutral_progress_ui(self):
+        """Normal installation must look like progress, never like an error log."""
+        dialog = None
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                dialog = app._create_runtime_progress_dialog(
+                    title="安装运行环境",
+                    heading="正在安装运行环境",
+                    stage="准备安装",
+                    detail="正在读取环境包",
+                )
+                app.update_idletasks()
+
+                progress = dialog["progress"]
+                self.assertIsInstance(progress, ttk.Progressbar)
+                self.assertEqual(str(progress.cget("mode")), "determinate")
+                self.assertEqual(float(progress.cget("maximum")), 100.0)
+                self.assertNotIn(
+                    dialog["stage_label"].cget("fg"),
+                    {C["warn"], C["error"]},
+                )
+                self.assertNotIn(
+                    dialog["detail_label"].cget("fg"),
+                    {C["warn"], C["error"]},
+                )
+                self.assertFalse(
+                    any(
+                        isinstance(widget, tk.Text)
+                        for widget in self._walk_widgets(dialog["popup"])
+                    )
+                )
+
+                app._set_runtime_progress(
+                    dialog,
+                    45,
+                    "安装核心模块",
+                    "Python · ComfyUI · Torch/CUDA · 网络组件",
+                )
+                self.assertEqual(dialog["progress_var"].get(), 45)
+                self.assertEqual(dialog["stage_var"].get(), "安装核心模块")
+                self.assertIn("ComfyUI", dialog["detail_var"].get())
+                self.assertNotIn(
+                    dialog["stage_label"].cget("fg"),
+                    {C["warn"], C["error"]},
+                )
+                self.assertNotIn(
+                    dialog["detail_label"].cget("fg"),
+                    {C["warn"], C["error"]},
+                )
+
+                app._set_runtime_progress(
+                    dialog,
+                    45,
+                    "安装未完成",
+                    "环境包校验失败",
+                    error=True,
+                )
+                self.assertEqual(dialog["stage_var"].get(), "安装未完成")
+                self.assertEqual(dialog["stage_label"].cget("fg"), C["error"])
+
+                app._set_runtime_progress(
+                    dialog,
+                    75,
+                    "验证运行模块",
+                    "正在检查已安装组件",
+                )
+                self.assertNotEqual(dialog["stage_label"].cget("fg"), C["error"])
+                self.assertNotEqual(dialog["detail_label"].cget("fg"), C["error"])
+            finally:
+                try:
+                    if dialog:
+                        dialog["popup"].destroy()
+                except Exception:
+                    pass
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_install_stage_catalog_names_user_facing_modules(self):
+        stages = main_gateway.RUNTIME_INSTALL_STAGES
+        self.assertEqual(tuple(stages), (
+            "prepare",
+            "verify",
+            "inspect",
+            "extract",
+            "validate",
+            "stop_services",
+            "apply",
+        ))
+        self.assertIn("Python", stages["extract"][2])
+        self.assertIn("ComfyUI", stages["extract"][2])
+        self.assertIn("Torch/CUDA", stages["extract"][2])
+        self.assertIn("网络组件", stages["extract"][2])
+        percentages = [stage[0] for stage in stages.values()]
+        self.assertTrue(all(0 <= percent <= 100 for percent in percentages))
+        self.assertTrue(all(
+            earlier < later
+            for earlier, later in zip(percentages, percentages[1:])
+        ))
+
+    def test_runtime_install_reports_each_module_stage_in_order(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        app.after = lambda _delay, callback: callback()
+        app._create_runtime_progress_dialog = mock.Mock(
+            return_value={
+                "popup": mock.MagicMock(),
+                "progress_var": mock.MagicMock(),
+                "stage_var": mock.MagicMock(),
+            }
+        )
+        app._set_runtime_progress = mock.Mock()
+        app._set_runtime_install_stage = mock.Mock()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.run.side_effect = [
+            mock.Mock(returncode=0, stdout="members", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        app._begin_runtime_maintenance = mock.Mock(return_value=(True, set(), ""))
+        app._end_runtime_maintenance = mock.Mock()
+        app._exit_for_runtime_update = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "runtime.7z"
+            package.write_bytes(b"runtime")
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", Path(tmp)),
+                mock.patch.object(main_gateway, "_runtime_has_package_files", return_value=False),
+                mock.patch.object(main_gateway, "verify_runtime_package", return_value=(True, "a", "a")),
+                mock.patch.object(main_gateway, "find_extractor", return_value=Path("7z.exe")),
+                mock.patch.object(main_gateway, "archive_list_command", return_value=["list"]),
+                mock.patch.object(main_gateway, "archive_extract_command", return_value=["extract"]),
+                mock.patch.object(main_gateway, "parse_archive_members", return_value=[]),
+                mock.patch.object(main_gateway, "missing_archive_entries", return_value=[]),
+                mock.patch.object(main_gateway, "invalid_archive_entries", return_value=[]),
+                mock.patch.object(main_gateway, "validate_staged_runtime"),
+                mock.patch.object(main_gateway, "launch_runtime_update", return_value=mock.Mock()),
+                mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+            ):
+                app._extract_runtime(package)
+
+        stages = [
+            call.args[1]
+            for call in app._set_runtime_install_stage.call_args_list
+        ]
+        self.assertEqual(stages, list(main_gateway.RUNTIME_INSTALL_STAGES))
+        app._exit_for_runtime_update.assert_called_once()
+
     def test_runtime_download_failure_opens_copyable_github_dialog(self):
         """The manual GitHub fallback appears only after automatic pull failure."""
         with (
@@ -290,9 +443,13 @@ class DashboardShellTests(unittest.TestCase):
                 response = mock.MagicMock()
                 response.status = 200
                 response.headers = {"Content-Length": "7"}
-                response.read.side_effect = [b"runtime", b""]
+                response.read.side_effect = [b"run", b"time", b""]
                 response.__enter__.return_value = response
                 app._extract_runtime = mock.Mock()
+                original_set_runtime_progress = app._set_runtime_progress
+                app._set_runtime_progress = mock.Mock(
+                    side_effect=original_set_runtime_progress
+                )
 
                 with (
                     mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
@@ -300,6 +457,7 @@ class DashboardShellTests(unittest.TestCase):
                     mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
                 ):
                     app._download_runtime("https://example.invalid/runtime.7z")
+                app.update()
 
                 self.assertEqual(urlopen.call_count, 1)
                 self.assertEqual(
@@ -311,6 +469,12 @@ class DashboardShellTests(unittest.TestCase):
                         f"{Path(tmp) / 'cache' / main_gateway.RUNTIME_PACKAGE_NAME}.sha256"
                     ).exists()
                 )
+                download_percentages = [
+                    call.args[1]
+                    for call in app._set_runtime_progress.call_args_list
+                    if len(call.args) >= 4 and call.args[2] == "下载运行环境"
+                ]
+                self.assertEqual(download_percentages, [42, 100])
             finally:
                 app._dashboard_pages.cancel_pending()
                 app.destroy()

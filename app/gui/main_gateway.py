@@ -127,6 +127,21 @@ F = {
     "mono":   ("Consolas", 9),
     "url":    ("Consolas", 9),
 }
+
+RUNTIME_INSTALL_STAGES = {
+    "prepare": (5, "准备安装", "正在读取运行环境包"),
+    "verify": (15, "校验安装包", "正在验证文件完整性"),
+    "inspect": (30, "检查环境包结构", "正在确认模块和目录是否完整"),
+    "extract": (
+        45,
+        "安装核心模块",
+        "Python · ComfyUI · Torch/CUDA · 网络组件",
+    ),
+    "validate": (75, "验证运行模块", "正在检查已安装组件"),
+    "stop_services": (85, "切换运行环境", "正在安全停止后台服务"),
+    "apply": (95, "应用运行环境", "客户端即将重启并完成安装"),
+}
+
 LAYOUT = {
     "window_w": 1180,
     "window_h": 760,
@@ -4066,24 +4081,126 @@ class GatewayApp(WindowBase):
         ).pack(side="left", padx=(8, 0))
         self._button(actions, "关闭", popup.destroy, "plain", width=72).pack(side="right")
 
-    def _download_runtime(self, url: str, repair_confirmed: bool = False):
+    def _create_runtime_progress_dialog(
+        self,
+        *,
+        title: str,
+        heading: str,
+        stage: str,
+        detail: str,
+    ) -> dict:
+        """Build the quiet, user-facing progress dialog used by runtime setup."""
         popup = tk.Toplevel(self)
-        popup.title("下载运行环境")
-        popup.geometry("430x150")
+        popup.title(title)
+        popup.geometry("480x205")
         popup.configure(bg=C["surface"])
         popup.transient(self)
         popup.grab_set()
         popup.resizable(False, False)
-        self._center_popup(popup, 430, 150)
+        self._center_popup(popup, 480, 205)
 
-        tk.Label(popup, text="正在下载运行环境...", font=F["bold"],
-                 fg=C["text"], bg=C["surface"]).pack(pady=(22, 8))
-        progress_lbl = tk.Label(popup, text="准备下载...", font=F["small"],
-                                fg=C["warn"], bg=C["surface"])
-        progress_lbl.pack()
+        content = tk.Frame(popup, bg=C["surface"])
+        content.pack(fill="both", expand=True, padx=28, pady=24)
+
+        tk.Label(
+            content,
+            text=heading,
+            font=F["title"],
+            fg=C["text"],
+            bg=C["surface"],
+        ).pack(anchor="w")
+
+        stage_var = tk.StringVar(value=stage)
+        stage_label = tk.Label(
+            content,
+            textvariable=stage_var,
+            font=F["bold"],
+            fg=C["text2"],
+            bg=C["surface"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        stage_label.pack(fill="x", pady=(15, 8))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress = ttk.Progressbar(
+            content,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            variable=progress_var,
+            style="Progress.Horizontal.TProgressbar",
+        )
+        progress.pack(fill="x")
+
+        detail_var = tk.StringVar(value=detail)
+        detail_label = tk.Label(
+            content,
+            textvariable=detail_var,
+            font=F["small"],
+            fg=C["muted"],
+            bg=C["surface"],
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        detail_label.pack(fill="x", pady=(9, 0))
+
+        return {
+            "popup": popup,
+            "progress": progress,
+            "progress_var": progress_var,
+            "stage_var": stage_var,
+            "stage_label": stage_label,
+            "detail_var": detail_var,
+            "detail_label": detail_label,
+        }
+
+    def _set_runtime_progress(
+        self,
+        dialog: dict,
+        percent: float,
+        stage: str,
+        detail: str,
+        *,
+        error: bool = False,
+    ):
+        """Update runtime setup progress without exposing command output."""
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                return
+        except Exception:
+            return
+
+        value = max(0.0, min(100.0, float(percent or 0)))
+        dialog["progress_var"].set(value)
+        dialog["stage_var"].set(str(stage or ""))
+        dialog["detail_var"].set(str(detail or ""))
+        dialog["stage_label"].config(fg=C["error"] if error else C["text2"])
+        dialog["detail_label"].config(fg=C["text2"] if error else C["muted"])
+
+    def _set_runtime_install_stage(self, dialog: dict, stage_name: str):
+        percent, stage, detail = RUNTIME_INSTALL_STAGES[stage_name]
+        self._set_runtime_progress(dialog, percent, stage, detail)
+
+    def _download_runtime(self, url: str, repair_confirmed: bool = False):
+        dialog = self._create_runtime_progress_dialog(
+            title="安装运行环境",
+            heading="正在准备运行环境",
+            stage="连接下载源",
+            detail="正在获取环境包信息",
+        )
+        popup = dialog["popup"]
 
         def keep_download_open():
-            progress_lbl.config(text="下载正在进行，完成前请保持窗口开启", fg=C["warn"])
+            self._set_runtime_progress(
+                dialog,
+                dialog["progress_var"].get(),
+                dialog["stage_var"].get(),
+                "下载正在进行，请保持窗口开启",
+            )
 
         def show_download_error(message: str):
             try:
@@ -4126,13 +4243,38 @@ class GatewayApp(WindowBase):
                             downloaded += len(chunk)
                             if total_size:
                                 pct = min(100, int(downloaded * 100 / total_size))
-                                self.after(0, lambda p=pct: progress_lbl.config(text=f"下载中：{p}%"))
+                                size_mb = downloaded / (1024 * 1024)
+                                self.after(
+                                    0,
+                                    lambda p=pct, s=size_mb: self._set_runtime_progress(
+                                        dialog,
+                                        p,
+                                        "下载运行环境",
+                                        f"{p}% · 已下载 {s:.1f} MB",
+                                    ),
+                                )
                             else:
                                 size_mb = downloaded / (1024 * 1024)
-                                self.after(0, lambda s=size_mb: progress_lbl.config(text=f"已下载：{s:.1f} MB"))
+                                self.after(
+                                    0,
+                                    lambda s=size_mb: self._set_runtime_progress(
+                                        dialog,
+                                        0,
+                                        "下载运行环境",
+                                        f"已下载 {s:.1f} MB",
+                                    ),
+                                )
                 partial.replace(target)
                 sidecar.unlink(missing_ok=True)
-                self.after(0, lambda: progress_lbl.config(text="下载完成，准备校验..."))
+                self.after(
+                    0,
+                    lambda: self._set_runtime_progress(
+                        dialog,
+                        100,
+                        "下载完成",
+                        "正在准备校验并安装环境包",
+                    ),
+                )
 
                 self.after(0, popup.destroy)
                 self.after(100, lambda: self._extract_runtime(target, repair_confirmed=repair_confirmed))
@@ -4160,28 +4302,32 @@ class GatewayApp(WindowBase):
                 parent=self,
             ):
                 return
-        # 后台线程解压
-        popup = tk.Toplevel(self)
-        popup.title("安装中")
-        popup.geometry("360x120")
-        popup.configure(bg=C["surface"])
-        popup.transient(self)
-        popup.grab_set()
-        popup.resizable(False, False)
-        self._center_popup(popup, 360, 120)
-
-        tk.Label(popup, text="正在解压运行环境，请稍候...", font=F["bold"],
-                 fg=C["text"], bg=C["surface"]).pack(pady=(20, 8))
-        progress_lbl = tk.Label(popup, text="准备中...", font=F["small"],
-                                fg=C["warn"], bg=C["surface"])
-        progress_lbl.pack()
+        dialog = self._create_runtime_progress_dialog(
+            title="安装运行环境",
+            heading="正在安装运行环境",
+            stage=RUNTIME_INSTALL_STAGES["prepare"][1],
+            detail=RUNTIME_INSTALL_STAGES["prepare"][2],
+        )
+        popup = dialog["popup"]
+        self._set_runtime_install_stage(dialog, "prepare")
 
         def keep_install_open():
-            progress_lbl.config(text="安装正在进行，完成前请保持窗口开启", fg=C["warn"])
+            self._set_runtime_progress(
+                dialog,
+                dialog["progress_var"].get(),
+                dialog["stage_var"].get(),
+                "安装正在进行，请保持窗口开启",
+            )
 
         def show_install_error(message: str):
             try:
-                progress_lbl.config(text=f"失败: {message}", fg=C["error"])
+                self._set_runtime_progress(
+                    dialog,
+                    dialog["progress_var"].get(),
+                    "安装未完成",
+                    str(message),
+                    error=True,
+                )
                 popup.grab_release()
                 popup.protocol("WM_DELETE_WINDOW", popup.destroy)
             except Exception:
@@ -4196,6 +4342,12 @@ class GatewayApp(WindowBase):
 
         popup.protocol("WM_DELETE_WINDOW", keep_install_open)
 
+        def set_install_stage(stage_name: str):
+            self.after(
+                0,
+                lambda name=stage_name: self._set_runtime_install_stage(dialog, name),
+            )
+
         def _do_extract():
             maintenance_started = False
             handoff_started = False
@@ -4208,7 +4360,7 @@ class GatewayApp(WindowBase):
                     raise FileNotFoundError(f"环境包不存在: {package}")
 
                 sidecar = Path(f"{package}.sha256")
-                self.after(0, lambda: progress_lbl.config(text="正在校验可信 SHA256..."))
+                set_install_stage("verify")
                 valid, expected, actual = verify_runtime_package(
                     package,
                     sidecar if sidecar.is_file() else None,
@@ -4222,7 +4374,7 @@ class GatewayApp(WindowBase):
                 if not extractor:
                     raise RuntimeError("未找到可用的 7-Zip 或 Windows tar.exe 解压工具")
 
-                self.after(0, lambda: progress_lbl.config(text="正在检查环境包结构..."))
+                set_install_stage("inspect")
                 list_result = self._process_supervisor.run(
                     "runtime-install",
                     archive_list_command(extractor, package),
@@ -4244,7 +4396,7 @@ class GatewayApp(WindowBase):
                     return
 
                 staging_dir.mkdir(parents=True, exist_ok=False)
-                self.after(0, lambda: progress_lbl.config(text="正在隔离解压并安全检查..."))
+                set_install_stage("extract")
                 result = self._process_supervisor.run(
                     "runtime-install",
                     archive_extract_command(extractor, package, staging_dir),
@@ -4255,16 +4407,17 @@ class GatewayApp(WindowBase):
                 )
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "环境包解压失败")
+                set_install_stage("validate")
                 validate_staged_runtime(staging_dir)
 
-                self.after(0, lambda: progress_lbl.config(text="正在暂停后台服务..."))
+                set_install_stage("stop_services")
                 maintenance_started, running_before, stop_error = self._begin_runtime_maintenance()
                 if not maintenance_started:
                     raise RuntimeError(stop_error or "无法开始运行环境维护")
                 if stop_error:
                     raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
 
-                self.after(0, lambda: progress_lbl.config(text="客户端即将重启并完成环境更新..."))
+                set_install_stage("apply")
                 self._runtime_update_helper_proc = launch_runtime_update(
                     BASE_DIR,
                     staging_dir,
