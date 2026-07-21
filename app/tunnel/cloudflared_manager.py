@@ -99,6 +99,7 @@ class CloudflaredManager:
                 encoding="utf-8",
                 errors="replace",
                 shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception as exc:
             self._desired_running = False

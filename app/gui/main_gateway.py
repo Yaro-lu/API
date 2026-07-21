@@ -13,6 +13,7 @@ import threading
 import time
 import json
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -38,6 +39,7 @@ from app.core.runtime_package import (  # noqa: E402
     REQUIRED_RUNTIME_PATHS,
     RUNTIME_PACKAGE_NAME,
     RUNTIME_HOMEPAGE_URL,
+    SevenZipProgressParser,
     archive_extract_command,
     archive_list_command,
     find_extractor,
@@ -53,7 +55,17 @@ from app.core.runtime_update import (  # noqa: E402
     consume_runtime_update_result,
     launch_runtime_update,
 )
+from app.core.comfyui_update import (  # noqa: E402
+    ComfyUIUpdateError,
+    prepare_comfyui_update,
+)
+from app.core.comfyui_update_worker import (  # noqa: E402
+    consume_update_result as consume_comfyui_update_result,
+    launch_worker as launch_comfyui_update_worker,
+    recover_interrupted_update,
+)
 from app.core.process_supervisor import ProcessSupervisor  # noqa: E402
+from app.engines.comfyui_client import ComfyUIClient  # noqa: E402
 from app.core.model_maintenance import (  # noqa: E402
     MODEL_REQUIREMENTS,
     check_model_groups,
@@ -79,11 +91,19 @@ from app.core.workflow_import import (  # noqa: E402
     extract_zip_safely,
 )
 from app.gui.dashboard_pages import StaticDashboardPages  # noqa: E402
-from app.workflow_registry import WorkflowRegistry  # noqa: E402
+from app.workflow_registry import (  # noqa: E402
+    WorkflowRegistry,
+    merge_workflow_catalog,
+    read_local_workflow_catalog,
+)
 
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
 PROJECT_HOMEPAGE_URL = RUNTIME_HOMEPAGE_URL
+
+
+class _ComfyUIOverlayProcessStillRunning(RuntimeError):
+    """The overlay builder may still own files, so cleanup must not race it."""
 
 # ── 配色 ──────────────────────────────────────────────
 C = {
@@ -134,12 +154,18 @@ RUNTIME_INSTALL_STAGES = {
     "inspect": (30, "检查环境包结构", "正在确认模块和目录是否完整"),
     "extract": (
         45,
-        "安装核心模块",
+        "解压并安装核心模块",
         "Python · ComfyUI · Torch/CUDA · 网络组件",
     ),
     "validate": (75, "验证运行模块", "正在检查已安装组件"),
     "stop_services": (85, "切换运行环境", "正在安全停止后台服务"),
-    "apply": (95, "应用运行环境", "客户端即将重启并完成安装"),
+    "apply": (95, "应用运行环境", "客户端将退出，请手动重新打开，重启后生效"),
+}
+
+RUNTIME_LONG_STAGE_STATUS = {
+    "verify": "正在校验大文件",
+    "inspect": "正在读取压缩包目录",
+    "validate": "正在检查已解压文件",
 }
 
 LAYOUT = {
@@ -164,6 +190,7 @@ API_BASE = f"http://127.0.0.1:{API_PORT}"
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
 SERVER_SYNC_MAX_RETRIES = 3
 _LOOPBACK_SERVER_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_RUNTIME_UPDATE_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 # ══════════════════════════════════════════════════════
@@ -211,9 +238,9 @@ def _comfy_vram_args():
     if mode in ("none", "default", "auto-comfy"):
         return []
     # ComfyUI's DynamicVRAM is the safest common default.  In particular, the
-    # bundled video workflow is larger than 16–24 GB cards and must not be
-    # forced into high-VRAM mode based on card capacity alone.  Advanced users
-    # can still opt in through vram_mode or launch_args above.
+    # bundled workflows still need dynamic offloading on lower-memory cards and
+    # must not be forced into high-VRAM mode based on capacity alone. Advanced
+    # users can still opt in through vram_mode or launch_args above.
     return []
 
 
@@ -589,6 +616,7 @@ class GatewayApp(WindowBase):
         self._runtime_maintenance_lock = threading.RLock()
         self._runtime_maintenance_in_progress = False
         self._runtime_update_helper_proc = None
+        self._comfyui_update_worker_proc = None
         self._model_transfer_lock = threading.RLock()
         self._active_model_transfers = {}
         self._workflow_management_lock = threading.Lock()
@@ -601,6 +629,8 @@ class GatewayApp(WindowBase):
         self._health_poll_generation = 0
         self._shutting_down = False
         self._last_health = {}
+        self._runtime_start_blocked = False
+        self._capture_startup_update_results()
         self._server_session_token = ""
         self._server_user_email = ""
         self._server_url_value = "https://ai.lol-lu.site"
@@ -664,9 +694,13 @@ class GatewayApp(WindowBase):
         self.bind("<Unmap>", self._on_minimize)
 
         # 异步启动序列
-        self._request_backend_start("启动后台")
+        if not self._runtime_start_blocked:
+            self._request_backend_start("启动后台")
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        self.after_idle(self._write_runtime_restart_ack)
+        self.after(600, self._show_comfyui_recovery_result)
         self.after(800, self._show_runtime_update_result)
+        self.after(1000, self._show_comfyui_update_result)
 
     def center(self):
         self.update_idletasks()
@@ -832,6 +866,41 @@ class GatewayApp(WindowBase):
         s.configure("Progress.Horizontal.TProgressbar",
                      background=C["primary"], troughcolor=C["progress_bg"],
                      borderwidth=0, lightcolor=C["primary"], darkcolor=C["primary"])
+        s.layout(
+            "LingJing.Vertical.TScrollbar",
+            [
+                (
+                    "Vertical.Scrollbar.trough",
+                    {
+                        "sticky": "ns",
+                        "children": [
+                            (
+                                "Vertical.Scrollbar.thumb",
+                                {"expand": "1", "sticky": "nswe"},
+                            ),
+                        ],
+                    },
+                ),
+            ],
+        )
+        s.configure(
+            "LingJing.Vertical.TScrollbar",
+            background=C["primary"],
+            troughcolor=C["soft_primary"],
+            bordercolor=C["soft_primary"],
+            lightcolor=C["primary"],
+            darkcolor=C["primary"],
+            relief="flat",
+            borderwidth=0,
+            gripcount=0,
+            width=7,
+        )
+        s.map(
+            "LingJing.Vertical.TScrollbar",
+            background=[("pressed", C["primary2"]), ("active", C["primary2"])],
+            lightcolor=[("pressed", C["primary2"]), ("active", C["primary2"])],
+            darkcolor=[("pressed", C["primary2"]), ("active", C["primary2"])],
+        )
 
     def _card(self, parent, **pack_kwargs):
         if CTK_AVAILABLE:
@@ -1007,6 +1076,14 @@ class GatewayApp(WindowBase):
 
     def _request_backend_start(self, action_name: str = "启动后台") -> bool:
         """Start the full environment/backend sequence as one serialized action."""
+        if self.__dict__.get("_runtime_start_blocked", False):
+            self.after(
+                0,
+                lambda: self._footer_label.config(
+                    text="  自动恢复未完成，请先修复运行环境"
+                ),
+            )
+            return False
         if not self._begin_backend_action(action_name):
             return False
         try:
@@ -2123,9 +2200,51 @@ class GatewayApp(WindowBase):
         self._wf_rows = {}
         self._wf_sections = {}
 
+        scroll_host = tk.Frame(self._wf_frame, bg=C["card"])
+        scroll_host.pack(fill="both", expand=True, padx=(2, 6), pady=(0, 10))
+        self._workflow_canvas = tk.Canvas(
+            scroll_host,
+            bg=C["card"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._workflow_scrollbar = ttk.Scrollbar(
+            scroll_host,
+            orient="vertical",
+            command=self._workflow_canvas.yview,
+            style="LingJing.Vertical.TScrollbar",
+        )
+        self._workflow_scroll_content = tk.Frame(
+            self._workflow_canvas,
+            bg=C["card"],
+        )
+        self._workflow_canvas_window = self._workflow_canvas.create_window(
+            (0, 0),
+            window=self._workflow_scroll_content,
+            anchor="nw",
+        )
+        self._workflow_canvas.configure(
+            yscrollcommand=self._workflow_scrollbar.set,
+        )
+        self._workflow_scrollbar.pack(side="right", fill="y", padx=(5, 1))
+        self._workflow_canvas.pack(side="left", fill="both", expand=True)
+        self._workflow_scroll_content.bind(
+            "<Configure>",
+            lambda _event: self._workflow_canvas.configure(
+                scrollregion=self._workflow_canvas.bbox("all")
+            ),
+        )
+        self._workflow_canvas.bind(
+            "<Configure>",
+            lambda event: self._workflow_canvas.itemconfigure(
+                self._workflow_canvas_window,
+                width=event.width,
+            ),
+        )
+
         def section(title):
-            box = tk.Frame(self._wf_frame, bg=C["card"])
-            box.pack(fill="x", padx=16, pady=(7, 4))
+            box = tk.Frame(self._workflow_scroll_content, bg=C["card"])
+            box.pack(fill="x", padx=(14, 3), pady=(7, 4))
             head = tk.Frame(box, bg=C["card"])
             head.pack(fill="x", pady=(0, 3))
             tk.Label(head, text="⌄", font=F["small"], fg=C["text2"], bg=C["card"]).pack(side="left", padx=(0, 6))
@@ -2139,24 +2258,82 @@ class GatewayApp(WindowBase):
         }
         self._update_model_display()
 
+    def _on_workflow_mousewheel(self, event):
+        canvas = getattr(self, "_workflow_canvas", None)
+        if canvas is None:
+            return None
+        delta = int(getattr(event, "delta", 0) or 0)
+        button = int(getattr(event, "num", 0) or 0)
+        if delta:
+            units = max(1, abs(delta) // 120)
+            direction = -1 if delta > 0 else 1
+        elif button in (4, 5):
+            units = 1
+            direction = -1 if button == 4 else 1
+        else:
+            return None
+        canvas.yview_scroll(direction * units, "units")
+        return "break"
+
+    def _bind_workflow_mousewheel_tree(self, widget):
+        try:
+            if not getattr(widget, "_lingjing_workflow_scroll_bound", False):
+                widget.bind(
+                    "<MouseWheel>",
+                    self._on_workflow_mousewheel,
+                    add="+",
+                )
+                widget.bind(
+                    "<Button-4>",
+                    self._on_workflow_mousewheel,
+                    add="+",
+                )
+                widget.bind(
+                    "<Button-5>",
+                    self._on_workflow_mousewheel,
+                    add="+",
+                )
+                widget._lingjing_workflow_scroll_bound = True
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._bind_workflow_mousewheel_tree(child)
+
     def _update_model_display(self):
         """更新工作流面板中的模型状态。"""
         self._update_workflow_display(self._last_health or {})
 
     def _workflow_group_for_display(self, workflow: dict) -> str:
+        output_type = str(workflow.get("output_type") or "").strip().lower()
+        declared_type = str(
+            workflow.get("workflow_type") or workflow.get("type") or ""
+        ).strip().lower()
+        if output_type in {"image", "video", "text"}:
+            return output_type
+        if declared_type.startswith("video."):
+            return "video"
+        if declared_type.startswith("image."):
+            return "image"
+        if declared_type.startswith("text."):
+            return "text"
         text = " ".join([
-            str(workflow.get("type") or ""),
-            str(workflow.get("output_type") or ""),
+            declared_type,
             str(workflow.get("id") or ""),
             str(workflow.get("name") or ""),
         ]).lower()
         if "video" in text or "flf2v" in text:
             return "video"
-        if "text" in text or "chat" in text or "llm" in text:
+        if "chat" in text or "llm" in text or "文字模型" in text:
             return "text"
         return "image"
 
     def _workflow_model_key(self, workflow: dict) -> str:
+        declared = str(
+            workflow.get("model_group") or workflow.get("modelGroup") or ""
+        ).strip()
+        if declared:
+            return declared
         text = " ".join([
             str(workflow.get("id") or ""),
             str(workflow.get("name") or ""),
@@ -2170,6 +2347,30 @@ class GatewayApp(WindowBase):
         if "qwen" in text or "千问" in text:
             return "Qwen3.5"
         return ""
+
+    def _workflow_capability_meta(self, workflow: dict) -> tuple[str, str, str]:
+        capability = str(workflow.get("capability") or "").strip().lower()
+        declared_type = str(
+            workflow.get("workflow_type") or workflow.get("type") or ""
+        ).strip().lower()
+        if not capability:
+            if declared_type in {"image.text_image_to_image", "image.image_to_image", "image_edit"}:
+                capability = "text_image_to_image"
+            elif "first_last" in declared_type or "flf2v" in declared_type:
+                capability = "first_last_frame"
+            elif declared_type.startswith("text") or "chat" in declared_type:
+                capability = "text_model"
+            else:
+                capability = "text_to_image"
+        styles = {
+            "text_image_to_image": ("文/图生图", "#7c3aed"),
+            "image_to_image": ("图生图", "#7c3aed"),
+            "text_to_image": ("文生图", "#2563eb"),
+            "first_last_frame": ("首尾帧", "#e8790c"),
+            "text_model": ("文本模型", "#0f9f84"),
+        }
+        label, color = styles.get(capability, ("自定义", C["text2"]))
+        return capability, label, color
 
     def _workflow_display_name(self, workflow: dict) -> str:
         return str(workflow.get("name") or workflow.get("label") or workflow.get("id") or "未命名工作流").strip()
@@ -2192,9 +2393,9 @@ class GatewayApp(WindowBase):
             if isinstance(workflow.get(field), (list, tuple, set))
         )
         if missing_count or reported_missing_models:
-            return f"缺失 {missing_count or reported_missing_models} 个模型"
+            return f"缺少 {missing_count or reported_missing_models} 个模型"
         if reported_missing_nodes:
-            return f"缺失 {reported_missing_nodes} 个节点"
+            return f"缺少 {reported_missing_nodes} 个节点"
         dependency_status = str(
             workflow.get("dependency_status") or workflow.get("validation_status") or ""
         ).lower()
@@ -2205,6 +2406,7 @@ class GatewayApp(WindowBase):
     def _add_workflow_row(self, parent_box, workflow: dict, group: str):
         wf_id = str(workflow.get("id") or "").strip()
         title = self._workflow_display_name(workflow)
+        _capability, capability_label, capability_color = self._workflow_capability_meta(workflow)
         available = workflow.get("enabled", True) and self._workflow_model_available(workflow)
         model_key = self._workflow_model_key(workflow)
         status_text = self._workflow_status_text(workflow, available)
@@ -2213,10 +2415,17 @@ class GatewayApp(WindowBase):
 
         row = tk.Frame(parent_box, bg=C["card"])
         row.pack(fill="x", pady=4)
-        row.columnconfigure(0, weight=1)
-        row.columnconfigure(1, weight=0)
+        row.columnconfigure(0, weight=0)
+        row.columnconfigure(1, weight=1)
         row.columnconfigure(2, weight=0)
-        row.columnconfigure(3, weight=0)
+
+        tk.Label(
+            row,
+            text=f"■ {capability_label}",
+            font=F["tiny"],
+            fg=capability_color,
+            bg=C["card"],
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
 
         if CTK_AVAILABLE:
             radio = ctk.CTkRadioButton(
@@ -2252,32 +2461,34 @@ class GatewayApp(WindowBase):
                 disabledforeground=C["muted"],
                 state="normal" if available else "disabled",
             )
-        radio.grid(row=0, column=0, sticky="w")
+        radio.grid(row=0, column=1, columnspan=2, sticky="w")
 
-        dot = tk.Canvas(row, width=9, height=9, bg=C["card"], highlightthickness=0)
-        dot.grid(row=0, column=1, padx=(3, 6), pady=(7, 0), sticky="w")
+        status_box = tk.Frame(row, bg=C["card"])
+        status_box.grid(row=1, column=1, sticky="w", pady=(2, 0))
+        dot = tk.Canvas(status_box, width=9, height=9, bg=C["card"], highlightthickness=0)
+        dot.pack(side="left", padx=(2, 5), pady=(2, 0))
         dot.create_oval(1, 1, 8, 8, fill=status_color, outline="")
 
         status_lbl = tk.Label(
-            row,
+            status_box,
             text=status_text,
             font=F["small"],
             fg=status_color,
             bg=C["card"],
-            anchor="e",
-            justify="right",
-            wraplength=92,
+            anchor="w",
+            justify="left",
+            wraplength=150,
         )
+        status_lbl.pack(side="left")
 
-        if available:
-            params_btn = self._button(row, "查看参数", lambda wf=dict(workflow): self._show_workflow_schema(wf), "plain", width=70)
-            params_btn.grid(row=0, column=2, padx=(4, 6), sticky="e")
-
-        if not available and not loading and model_key:
-            help_btn = self._button(row, "查看", lambda key=model_key: self._show_model_install_help(key), "plain", width=54)
-            help_btn.grid(row=0, column=2, padx=(4, 6), sticky="e")
-
-        status_lbl.grid(row=0, column=3, sticky="e")
+        params_btn = self._button(
+            row,
+            "详情",
+            lambda wf=dict(workflow): self._show_workflow_schema(wf),
+            "plain",
+            width=70,
+        )
+        params_btn.grid(row=1, column=2, padx=(4, 0), sticky="e")
 
         if wf_id:
             self._wf_rows[wf_id] = row
@@ -2298,6 +2509,63 @@ class GatewayApp(WindowBase):
                 items.append(item)
         return items
 
+    @staticmethod
+    def _format_model_size(size_bytes: int) -> str:
+        size = max(0, int(size_bytes or 0))
+        if size >= 1_000_000_000:
+            return f"{size / 1_000_000_000:.1f} GB"
+        if size >= 1_000_000:
+            return f"{size / 1_000_000:.1f} MB"
+        return f"{size} B"
+
+    def _workflow_performance_for_display(self, workflow: dict) -> dict:
+        model_key = self._workflow_model_key(workflow)
+        spec = MODEL_REQUIREMENTS.get(model_key, {})
+        performance = spec.get("performance")
+        if not isinstance(performance, dict):
+            performance = {}
+        total_size = sum(
+            int(item.get("size_bytes") or 0)
+            for item in spec.get("items", [])
+            if isinstance(item, dict)
+        )
+        return {
+            "model_key": model_key,
+            "title": str(spec.get("title") or model_key or "未登记模型"),
+            "performance": performance,
+            "model_size_bytes": total_size,
+        }
+
+    def _format_model_performance_text(self, model_key: str) -> str:
+        info = self._workflow_performance_for_display({"model_group": model_key})
+        performance = info["performance"]
+        if not performance:
+            return "该模型尚未登记硬件要求；下载前请先确认显卡与磁盘空间。"
+        return "\n".join([
+            f"负载等级：{performance.get('level') or '未标注'}    模型文件：{self._format_model_size(info['model_size_bytes'])}",
+            f"最低配置：{performance.get('minimum') or '未标注'}",
+            f"推荐配置：{performance.get('recommended') or '未标注'}",
+            f"推荐参数：{performance.get('preset') or '按工作流默认值'}",
+            f"提示：{performance.get('notes') or '实际速度受分辨率和帧数影响。'}",
+        ])
+
+    def _format_workflow_detail_text(self, workflow: dict) -> str:
+        _capability, capability_label, _color = self._workflow_capability_meta(workflow)
+        info = self._workflow_performance_for_display(workflow)
+        description = str(workflow.get("description") or "暂无简介").strip()
+        lines = [
+            "工作流简介：",
+            f"  {description}",
+            "",
+            f"能力：{capability_label}",
+            f"模型：{info['title']}",
+            self._format_model_performance_text(info["model_key"]),
+            "",
+            "接口参数：",
+            self._format_workflow_schema_text(workflow),
+        ]
+        return "\n".join(lines)
+
     def _show_model_install_help(self, model_key: str):
         missing = self._missing_model_items(model_key)
         popup_w = 840
@@ -2315,6 +2583,16 @@ class GatewayApp(WindowBase):
         tk.Label(panel, text=f"{title}：缺失模型", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=18, pady=(16, 4))
         tk.Label(panel, text="选择需要补齐的模型，客户端会在后台下载并放入对应目录。下载完成后会自动重新检测模型状态。",
                  font=F["normal"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=18, pady=(0, 10))
+        tk.Label(
+            panel,
+            text=self._format_model_performance_text(model_key),
+            font=F["small"],
+            fg=C["text2"],
+            bg=C["card"],
+            justify="left",
+            anchor="w",
+            wraplength=770,
+        ).pack(fill="x", padx=18, pady=(0, 12))
 
         list_outer = tk.Frame(panel, bg=C["card"])
         list_outer.pack(fill="both", expand=True, padx=18, pady=(0, 10))
@@ -2513,10 +2791,15 @@ class GatewayApp(WindowBase):
             return self._model_transfer_key(target) in transfers
 
     def _claim_model_transfer(self, control: dict) -> bool:
+        if self._runtime_maintenance_active():
+            return False
         lock, transfers = self._model_transfer_state()
         key = self._model_transfer_key(control["target"])
         with lock:
-            if self.__dict__.get("_model_import_in_progress", False):
+            if (
+                self._runtime_maintenance_active()
+                or self.__dict__.get("_model_import_in_progress", False)
+            ):
                 return False
             owner = transfers.get(key)
             if owner is not None and owner is not control:
@@ -3079,10 +3362,12 @@ class GatewayApp(WindowBase):
         return "\n".join(lines)
 
     def _show_workflow_schema(self, workflow: dict):
-        text = self._format_workflow_schema_text(workflow)
+        text = self._format_workflow_detail_text(workflow)
         title = self._workflow_display_name(workflow)
+        model_key = self._workflow_model_key(workflow)
+        missing_models = self._missing_model_items(model_key) if model_key else []
         popup = tk.Toplevel(self)
-        popup.title(f"工作流参数 - {title}")
+        popup.title(f"工作流详情 - {title}")
         popup.geometry("760x560")
         popup.configure(bg=C["bg"])
         popup.transient(self)
@@ -3090,8 +3375,8 @@ class GatewayApp(WindowBase):
         self._center_popup(popup, 760, 560)
 
         panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
-        tk.Label(panel, text=f"{title}：入参 / 出参", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=20, pady=(18, 6))
-        tk.Label(panel, text="这里展示客户端对服务端暴露的调用协议；优先使用工作流自带 schema，缺失时使用通用结构。",
+        tk.Label(panel, text=f"{title}：用途与性能要求", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=20, pady=(18, 6))
+        tk.Label(panel, text="包含模型用途、机器配置和客户端对服务端暴露的入参 / 出参。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=20, pady=(0, 12))
 
         box = tk.Text(
@@ -3119,9 +3404,20 @@ class GatewayApp(WindowBase):
         def copy_text():
             self.clipboard_clear()
             self.clipboard_append(text)
-            self._footer_label.config(text="  已复制工作流参数")
+            self._footer_label.config(text="  已复制工作流详情")
 
-        self._button(actions, "复制参数", copy_text, "primary").pack(side="left", ipadx=12, ipady=5)
+        self._button(actions, "复制详情", copy_text, "primary").pack(side="left", ipadx=12, ipady=5)
+        if missing_models:
+            def show_downloads():
+                popup.destroy()
+                self._show_model_install_help(model_key)
+
+            self._button(actions, "下载缺失模型", show_downloads, "plain").pack(
+                side="left",
+                padx=(8, 0),
+                ipadx=12,
+                ipady=5,
+            )
         self._button(actions, "关闭", popup.destroy, "plain").pack(side="right", ipadx=12, ipady=5)
 
     def _load_json_file(self, path: Path, max_bytes: int = 64 * 1024 * 1024) -> dict:
@@ -3523,11 +3819,14 @@ class GatewayApp(WindowBase):
         self._footer_label.config(text=f"  工作流已导入：{result.get('name')}")
 
     def _begin_workflow_operation(self, name: str) -> bool:
-        if self._shutting_down:
+        if self._shutting_down or self._runtime_maintenance_active():
             return False
         if not self._workflow_management_lock.acquire(blocking=False):
             current = self._workflow_operation_name or "工作流操作"
             self._footer_label.config(text=f"  {current}正在进行，请稍候")
+            return False
+        if self._shutting_down or self._runtime_maintenance_active():
+            self._workflow_management_lock.release()
             return False
         self._workflow_operation_name = str(name or "工作流操作")
         return True
@@ -3970,7 +4269,8 @@ class GatewayApp(WindowBase):
         repairing = _runtime_has_package_files()
         if repairing and not messagebox.askyesno(
             "安装或修复运行环境",
-            "安装过程中会暂时停止 ComfyUI、API 和公网连接，完成后自动重新启动。\n\n"
+            "安装过程中会暂时停止 ComfyUI、API 和公网连接。完成准备后客户端将退出，"
+            "请手动重新打开，重启后生效。\n\n"
             "模型、工作流和生成结果不会被删除。是否继续？",
             parent=self,
         ):
@@ -4167,6 +4467,8 @@ class GatewayApp(WindowBase):
         error: bool = False,
     ):
         """Update runtime setup progress without exposing command output."""
+        if error:
+            self._stop_runtime_progress_activity(dialog)
         popup = dialog.get("popup")
         try:
             if popup is None or not popup.winfo_exists():
@@ -4181,9 +4483,252 @@ class GatewayApp(WindowBase):
         dialog["stage_label"].config(fg=C["error"] if error else C["text2"])
         dialog["detail_label"].config(fg=C["text2"] if error else C["muted"])
 
-    def _set_runtime_install_stage(self, dialog: dict, stage_name: str):
+    @staticmethod
+    def _format_runtime_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds or 0))
+        minutes, remaining_seconds = divmod(total, 60)
+        return f"{minutes:02d}:{remaining_seconds:02d}"
+
+    def _stop_runtime_progress_activity(self, dialog: dict):
+        dialog["_activity_token"] = None
+        callback_id = dialog.pop("_activity_after_id", None)
+        if callback_id is not None:
+            try:
+                self.after_cancel(callback_id)
+            except Exception:
+                pass
+        progress = dialog.get("progress")
+        if progress is not None:
+            try:
+                progress.stop()
+                progress.configure(mode="determinate")
+            except Exception:
+                pass
+        for key in (
+            "_activity_started_at",
+            "_activity_base_detail",
+            "_activity_status",
+            "_activity_progress_queue",
+            "_activity_percent",
+            "_activity_last_progress_at",
+        ):
+            dialog.pop(key, None)
+
+    def _refresh_runtime_stage_activity(self, dialog: dict, token: object) -> bool:
+        if dialog.get("_activity_token") != token:
+            return False
+        if self._shutting_down or self._runtime_maintenance_active():
+            return False
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                self._stop_runtime_progress_activity(dialog)
+                return False
+        except Exception:
+            self._stop_runtime_progress_activity(dialog)
+            return False
+
+        now = time.monotonic()
+        started_at = float(dialog.get("_activity_started_at", now))
+        elapsed = self._format_runtime_elapsed(now - started_at)
+        base_detail = str(dialog.get("_activity_base_detail") or "")
+        status = str(dialog.get("_activity_status") or "处理中")
+        dialog["detail_var"].set(f"{base_detail}\n{status} · 已用时 {elapsed}")
+        dialog["detail_label"].config(fg=C["muted"])
+        return True
+
+    def _start_runtime_stage_activity(
+        self,
+        dialog: dict,
+        stage_name: str,
+        *,
+        token: object | None = None,
+    ) -> object:
+        activity_token = token or uuid.uuid4().hex
+        dialog["_activity_token"] = activity_token
+        dialog["_activity_started_at"] = time.monotonic()
+        dialog["_activity_base_detail"] = RUNTIME_INSTALL_STAGES[stage_name][2]
+        dialog["_activity_status"] = RUNTIME_LONG_STAGE_STATUS[stage_name]
+        progress = dialog.get("progress")
+        if progress is not None:
+            progress.configure(mode="indeterminate")
+            progress.start(12)
+
+        if not self._refresh_runtime_stage_activity(dialog, activity_token):
+            return activity_token
+
+        def tick():
+            if dialog.get("_activity_token") != activity_token:
+                return
+            dialog["_activity_after_id"] = None
+            if not self._refresh_runtime_stage_activity(dialog, activity_token):
+                return
+            if dialog.get("_activity_token") != activity_token:
+                return
+            try:
+                dialog["_activity_after_id"] = self.after(1000, tick)
+            except Exception:
+                dialog["_activity_after_id"] = None
+
+        try:
+            dialog["_activity_after_id"] = self.after(1000, tick)
+        except Exception:
+            dialog["_activity_after_id"] = None
+        return activity_token
+
+    def _refresh_runtime_extract_activity(self, dialog: dict, token: object) -> bool:
+        if dialog.get("_activity_token") != token:
+            return False
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                self._stop_runtime_progress_activity(dialog)
+                return False
+        except Exception:
+            self._stop_runtime_progress_activity(dialog)
+            return False
+
+        progress_updates = dialog.get("_activity_progress_queue")
+        latest_percent = None
+        if progress_updates is not None:
+            while True:
+                try:
+                    latest_percent = progress_updates.get_nowait()
+                except queue.Empty:
+                    break
+            if latest_percent is not None:
+                self._report_runtime_extract_progress(
+                    dialog,
+                    token,
+                    latest_percent,
+                    refresh=False,
+                )
+                if dialog.get("_activity_token") != token:
+                    return False
+
+        now = time.monotonic()
+        started_at = float(dialog.get("_activity_started_at", now))
+        elapsed = self._format_runtime_elapsed(now - started_at)
+        percent = dialog.get("_activity_percent")
+        try:
+            process_running = self._process_supervisor.is_running("runtime-install")
+        except Exception:
+            process_running = False
+
+        if percent is None:
+            status = "解压进程运行中" if process_running else "正在启动解压进程"
+        else:
+            status = f"解压进度 {int(percent)}%"
+            last_progress_at = float(dialog.get("_activity_last_progress_at", now))
+            if process_running and now - last_progress_at >= 90:
+                status += " · 仍在处理，磁盘较慢时需要更久"
+            elif not process_running and int(percent) < 100:
+                status += " · 正在完成文件写入"
+
+        base_detail = str(dialog.get("_activity_base_detail") or "")
+        dialog["detail_var"].set(f"{base_detail}\n{status} · 已用时 {elapsed}")
+        dialog["detail_label"].config(fg=C["muted"])
+        return True
+
+    def _start_runtime_extract_activity(
+        self,
+        dialog: dict,
+        *,
+        token: object | None = None,
+        progress_queue=None,
+    ) -> object:
+        activity_token = token or uuid.uuid4().hex
+        dialog["_activity_token"] = activity_token
+        dialog["_activity_started_at"] = time.monotonic()
+        dialog["_activity_base_detail"] = RUNTIME_INSTALL_STAGES["extract"][2]
+        dialog["_activity_progress_queue"] = progress_queue or queue.SimpleQueue()
+        dialog["_activity_percent"] = None
+        dialog["_activity_last_progress_at"] = dialog["_activity_started_at"]
+        progress = dialog.get("progress")
+        if progress is not None:
+            progress.configure(mode="indeterminate")
+            progress.start(12)
+
+        if not self._refresh_runtime_extract_activity(dialog, activity_token):
+            return activity_token
+
+        def tick():
+            if dialog.get("_activity_token") != activity_token:
+                return
+            dialog["_activity_after_id"] = None
+            if not self._refresh_runtime_extract_activity(dialog, activity_token):
+                return
+            if dialog.get("_activity_token") != activity_token:
+                return
+            try:
+                dialog["_activity_after_id"] = self.after(1000, tick)
+            except Exception:
+                dialog["_activity_after_id"] = None
+
+        try:
+            dialog["_activity_after_id"] = self.after(1000, tick)
+        except Exception:
+            dialog["_activity_after_id"] = None
+        return activity_token
+
+    def _report_runtime_extract_progress(
+        self,
+        dialog: dict,
+        token: object,
+        percent: int,
+        *,
+        refresh: bool = True,
+    ):
+        if dialog.get("_activity_token") != token:
+            return
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                self._stop_runtime_progress_activity(dialog)
+                return
+        except Exception:
+            self._stop_runtime_progress_activity(dialog)
+            return
+        value = max(0, min(100, int(percent)))
+        previous = dialog.get("_activity_percent")
+        dialog["_activity_percent"] = value
+        if previous != value:
+            dialog["_activity_last_progress_at"] = time.monotonic()
+        progress = dialog.get("progress")
+        if progress is not None:
+            progress.stop()
+            progress.configure(mode="determinate")
+        extract_start = RUNTIME_INSTALL_STAGES["extract"][0]
+        validate_start = RUNTIME_INSTALL_STAGES["validate"][0]
+        overall = extract_start + ((validate_start - extract_start) * value / 100)
+        dialog["progress_var"].set(overall)
+        if refresh:
+            self._refresh_runtime_extract_activity(dialog, token)
+
+    def _set_runtime_install_stage(
+        self,
+        dialog: dict,
+        stage_name: str,
+        *,
+        activity_token: object | None = None,
+        activity_queue=None,
+    ):
+        self._stop_runtime_progress_activity(dialog)
         percent, stage, detail = RUNTIME_INSTALL_STAGES[stage_name]
         self._set_runtime_progress(dialog, percent, stage, detail)
+        if stage_name == "extract":
+            return self._start_runtime_extract_activity(
+                dialog,
+                token=activity_token,
+                progress_queue=activity_queue,
+            )
+        if stage_name in RUNTIME_LONG_STAGE_STATUS:
+            return self._start_runtime_stage_activity(
+                dialog,
+                stage_name,
+                token=activity_token,
+            )
+        return None
 
     def _download_runtime(self, url: str, repair_confirmed: bool = False):
         dialog = self._create_runtime_progress_dialog(
@@ -4220,6 +4765,40 @@ class GatewayApp(WindowBase):
                 target = cache_dir / RUNTIME_PACKAGE_NAME
                 partial = target.with_name(f"{target.name}.part")
                 sidecar = Path(f"{target}.sha256")
+
+                if target.is_file():
+                    self.after(
+                        0,
+                        lambda: self._set_runtime_progress(
+                            dialog,
+                            0,
+                            "校验本地缓存",
+                            "检测到已下载的环境包，正在校验完整性",
+                        ),
+                    )
+                    cached_valid, _expected, _actual = verify_runtime_package(
+                        target,
+                        sidecar if sidecar.is_file() else None,
+                    )
+                    if cached_valid:
+                        self.after(
+                            0,
+                            lambda: self._set_runtime_progress(
+                                dialog,
+                                100,
+                                "缓存校验完成",
+                                "环境包完整，跳过重复下载",
+                            ),
+                        )
+                        self.after(0, popup.destroy)
+                        self.after(
+                            100,
+                            lambda: self._extract_runtime(
+                                target,
+                                repair_confirmed=repair_confirmed,
+                            ),
+                        )
+                        return
 
                 resume_at = partial.stat().st_size if partial.exists() else 0
                 headers = {"User-Agent": "LingJing-Desktop/1.0.0"}
@@ -4297,7 +4876,8 @@ class GatewayApp(WindowBase):
         if _runtime_has_package_files() and not repair_confirmed:
             if not messagebox.askyesno(
                 "安装或修复运行环境",
-                "安装过程中会暂时停止 ComfyUI、API 和公网连接，完成后自动重新启动。\n\n"
+                "安装过程中会暂时停止 ComfyUI、API 和公网连接。完成准备后客户端将退出，"
+                "请手动重新打开，重启后生效。\n\n"
                 "模型、工作流和生成结果不会被删除。是否继续？",
                 parent=self,
             ):
@@ -4342,10 +4922,19 @@ class GatewayApp(WindowBase):
 
         popup.protocol("WM_DELETE_WINDOW", keep_install_open)
 
-        def set_install_stage(stage_name: str):
+        def set_install_stage(
+            stage_name: str,
+            activity_token: object | None = None,
+            activity_queue=None,
+        ):
             self.after(
                 0,
-                lambda name=stage_name: self._set_runtime_install_stage(dialog, name),
+                lambda name=stage_name, token=activity_token, updates=activity_queue: self._set_runtime_install_stage(
+                    dialog,
+                    name,
+                    activity_token=token,
+                    activity_queue=updates,
+                ),
             )
 
         def _do_extract():
@@ -4375,13 +4964,18 @@ class GatewayApp(WindowBase):
                     raise RuntimeError("未找到可用的 7-Zip 或 Windows tar.exe 解压工具")
 
                 set_install_stage("inspect")
+                list_options = {
+                    "cwd": str(BASE_DIR),
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": 180,
+                }
+                if extractor[0] == "7z":
+                    list_options.update(encoding="utf-8", errors="strict")
                 list_result = self._process_supervisor.run(
                     "runtime-install",
                     archive_list_command(extractor, package),
-                    cwd=str(BASE_DIR),
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
+                    **list_options,
                 )
                 if list_result.returncode != 0:
                     raise RuntimeError(list_result.stderr.strip() or "无法读取环境包目录")
@@ -4396,19 +4990,83 @@ class GatewayApp(WindowBase):
                     return
 
                 staging_dir.mkdir(parents=True, exist_ok=False)
-                set_install_stage("extract")
-                result = self._process_supervisor.run(
-                    "runtime-install",
-                    archive_extract_command(extractor, package, staging_dir),
-                    cwd=str(BASE_DIR),
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
+                extract_activity_token = uuid.uuid4().hex
+                extract_progress_updates = queue.SimpleQueue()
+                set_install_stage(
+                    "extract",
+                    extract_activity_token,
+                    extract_progress_updates,
                 )
+                extract_command = archive_extract_command(extractor, package, staging_dir)
+                try:
+                    if extractor[0] == "7z":
+                        progress_parser = SevenZipProgressParser()
+
+                        def report_extract_output(chunk: bytes):
+                            for progress_percent in progress_parser.feed(chunk):
+                                if self._shutting_down:
+                                    return
+                                extract_progress_updates.put(progress_percent)
+
+                        result = self._process_supervisor.run_observed(
+                            "runtime-install",
+                            extract_command,
+                            cwd=str(BASE_DIR),
+                            timeout=3600,
+                            on_stdout=report_extract_output,
+                        )
+                        for progress_percent in progress_parser.finish():
+                            extract_progress_updates.put(progress_percent)
+                    else:
+                        result = self._process_supervisor.run(
+                            "runtime-install",
+                            extract_command,
+                            cwd=str(BASE_DIR),
+                            capture_output=True,
+                            text=True,
+                            timeout=3600,
+                        )
+                except subprocess.TimeoutExpired as exc:
+                    try:
+                        extractor_still_running = self._process_supervisor.is_running(
+                            "runtime-install"
+                        )
+                    except Exception:
+                        extractor_still_running = True
+                    if extractor_still_running:
+                        raise RuntimeError(
+                            "环境包解压超时，但解压进程无法安全停止；"
+                            "客户端已保留暂存文件，请退出客户端后重试。"
+                        ) from exc
+                    raise RuntimeError(
+                        "环境包解压超过 60 分钟，已安全停止；"
+                        "请检查磁盘空间、压缩包完整性或杀毒软件扫描。"
+                    ) from exc
                 if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "环境包解压失败")
+                    stderr = result.stderr
+                    stdout = result.stdout
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                    if isinstance(stdout, bytes):
+                        stdout = stdout.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                    raise RuntimeError(
+                        str(stderr).strip()
+                        or str(stdout).strip()
+                        or "环境包解压失败"
+                    )
                 set_install_stage("validate")
                 validate_staged_runtime(staging_dir)
+
+                if not self._show_runtime_manual_restart_notice(popup):
+                    if self._shutting_down:
+                        return
+                    raise RuntimeError("未能显示手动重启提示，运行环境尚未切换")
 
                 set_install_stage("stop_services")
                 maintenance_started, running_before, stop_error = self._begin_runtime_maintenance()
@@ -4438,23 +5096,198 @@ class GatewayApp(WindowBase):
                     can_restore = bool(running_before) and _check_runtime_exists()
                     self._end_runtime_maintenance(restart=can_restore)
                 if not handoff_started and staging_dir.exists():
-                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    try:
+                        extractor_still_running = self._process_supervisor.is_running(
+                            "runtime-install"
+                        )
+                    except Exception:
+                        extractor_still_running = True
+                    if not extractor_still_running:
+                        shutil.rmtree(staging_dir, ignore_errors=True)
 
         threading.Thread(target=_do_extract, daemon=True).start()
 
+    def _show_runtime_manual_restart_notice(self, popup) -> bool:
+        """Tell the user why the GUI will exit before starting the handoff."""
+        completed = threading.Event()
+        state = {"shown": False}
+
+        def show_notice():
+            try:
+                if self._shutting_down:
+                    return
+                try:
+                    popup.grab_release()
+                except Exception:
+                    pass
+                messagebox.showinfo(
+                    "运行环境已准备完成",
+                    "客户端将退出以完成运行环境切换。\n\n"
+                    "程序不会自动重启，请等待片刻后手动重新打开“灵境造片厂”。\n"
+                    "重新打开后环境生效。",
+                    parent=popup,
+                )
+                state["shown"] = not self._shutting_down
+            finally:
+                completed.set()
+
+        try:
+            self.after(0, show_notice)
+        except Exception:
+            return False
+        while not completed.wait(0.1):
+            if self._shutting_down:
+                return False
+        return bool(state["shown"])
+
+    def _write_runtime_restart_ack(self) -> bool:
+        """Confirm that the replacement GUI reached its first Tk event-loop turn."""
+        operation_id = str(
+            os.environ.get("LINGJING_RUNTIME_UPDATE_OPERATION_ID") or ""
+        ).strip().lower()
+        if not _RUNTIME_UPDATE_OPERATION_ID_RE.fullmatch(operation_id):
+            return False
+        result = self.__dict__.get("_pending_runtime_update_result")
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("operation_id") or "").strip().lower() != operation_id:
+            return False
+
+        runtime_dir = BASE_DIR / "runtime"
+        ack_path = runtime_dir / f"runtime-update-ready-{operation_id}.json"
+        temporary = runtime_dir / f"runtime-update-ready-{operation_id}.tmp"
+        payload = {
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "pid": os.getpid(),
+            "ready_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(ack_path)
+            os.environ.pop("LINGJING_RUNTIME_UPDATE_OPERATION_ID", None)
+            return True
+        except OSError as exc:
+            print(f"[RuntimeUpdate] failed to write restart acknowledgement: {exc}")
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    def _capture_startup_update_results(self):
+        """Consume updater results before any backend can touch a damaged runtime."""
+        try:
+            recovery_result = recover_interrupted_update(BASE_DIR)
+        except Exception as exc:
+            recovery_result = {
+                "status": "recovery_incomplete",
+                "success": False,
+                "message": f"无法检查上次中断的 ComfyUI 更新：{exc}",
+            }
+        try:
+            runtime_result = consume_runtime_update_result(BASE_DIR)
+        except Exception:
+            runtime_result = None
+        try:
+            comfyui_result = consume_comfyui_update_result(BASE_DIR)
+        except Exception:
+            comfyui_result = None
+        self._pending_comfyui_recovery_result = recovery_result
+        self._pending_runtime_update_result = runtime_result
+        self._pending_comfyui_update_result = comfyui_result
+        self._startup_update_results_preconsumed = True
+        runtime_record = runtime_result if isinstance(runtime_result, dict) else {}
+        comfyui_record = comfyui_result if isinstance(comfyui_result, dict) else {}
+        recovery_record = recovery_result if isinstance(recovery_result, dict) else {}
+        runtime_code = str(runtime_record.get("result_code") or "")
+        comfyui_status = str(comfyui_record.get("status") or "")
+        recovery_status = str(recovery_record.get("status") or "")
+        self._runtime_start_blocked = bool(
+            runtime_code == "install_failed_rollback_incomplete"
+            or comfyui_status == "rollback_incomplete"
+            or recovery_status in {"recovery_incomplete", "recovery_in_progress"}
+        )
+
+    def _close_for_active_comfyui_update(self):
+        """Release this temporary GUI without touching the detached updater."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._anim_running = False
+        self._heartbeat_run = False
+        self._poll_run = False
+        _release_instance_lock()
+        self._complete_destroy()
+
+    def _show_comfyui_recovery_result(self):
+        if not self.__dict__.get("_startup_update_results_preconsumed", False):
+            return
+        result = self.__dict__.pop("_pending_comfyui_recovery_result", None)
+        if not isinstance(result, dict):
+            return
+        status = str(result.get("status") or "")
+        if status == "no_recovery_needed":
+            return
+        if status == "recovery_in_progress":
+            messagebox.showinfo(
+                "ComfyUI 后台更新仍在进行",
+                "后台更新仍在进行，请关闭当前临时窗口，完成后会自动重启；"
+                "若未重启再手动打开。",
+                parent=self,
+            )
+            self._close_for_active_comfyui_update()
+            return
+        message = str(result.get("message") or "").strip().replace("\x00", "")[:1200]
+        if status in {"recovered", "completed"}:
+            messagebox.showinfo(
+                "ComfyUI 更新恢复完成",
+                message or "已安全完成上次中断的 ComfyUI 更新恢复。",
+                parent=self,
+            )
+            return
+        errors = result.get("errors") or []
+        if not isinstance(errors, (list, tuple)):
+            errors = [errors]
+        details = "\n".join(str(item or "")[:320] for item in errors[:4] if item)
+        text = message or "上次中断的 ComfyUI 更新未能完整恢复。"
+        if details:
+            text += f"\n\n详细信息：\n{details[:1000]}"
+        text += "\n\n为避免启动损坏环境，后台服务未自动启动，请先修复运行环境。"
+        messagebox.showerror("ComfyUI 自动恢复未完成", text, parent=self)
+
+    def _take_startup_update_result(self, name: str):
+        if self.__dict__.get("_startup_update_results_preconsumed", False):
+            return self.__dict__.pop(f"_pending_{name}_update_result", None)
+        consumer = (
+            consume_runtime_update_result
+            if name == "runtime"
+            else consume_comfyui_update_result
+        )
+        return consumer(BASE_DIR)
+
     def _show_runtime_update_result(self):
         """Report the detached updater result once the restarted GUI is ready."""
-        result = consume_runtime_update_result(BASE_DIR)
+        result = self._take_startup_update_result("runtime")
         if not result:
             return
         code = str(result.get("result_code") or "")
         detail = str(result.get("message") or "").strip()
         messages = {
             "installed": "运行环境安装完成。",
-            "installed_restart_failed": "运行环境已安装，但自动重启失败；本次为手动启动。",
+            "installed_restart_failed": "运行环境已安装；本次为手动启动，环境已经生效。",
+            "preflight_failed": "运行环境安装未开始，更新助手检查失败。",
+            "preflight_failed_restart_failed": (
+                "运行环境安装未开始；请手动重新打开客户端。"
+            ),
             "install_failed_rolled_back": "运行环境安装失败，旧环境已恢复。",
             "install_failed_rollback_incomplete": (
                 "运行环境安装失败，自动回滚也未完成；环境备份已保留。"
+                "为避免启动损坏环境，后台服务未自动启动，请先修复运行环境。"
             ),
         }
         message = messages.get(code, "运行环境更新已完成。")
@@ -4464,6 +5297,76 @@ class GatewayApp(WindowBase):
             messagebox.showinfo("运行环境更新", message, parent=self)
         else:
             messagebox.showerror("运行环境更新失败", message, parent=self)
+
+    @staticmethod
+    def _comfyui_update_result_warnings(result: dict) -> str:
+        """Return a bounded, readable summary of post-transaction cleanup issues."""
+        entries: list[str] = []
+        fields = (
+            ("清理提示", result.get("cleanup_warnings")),
+            ("回滚提示", result.get("rollback_errors")),
+            ("清单清理", result.get("manifest_cleanup_error")),
+        )
+        for label, value in fields:
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for item in values[:4]:
+                text = str(item or "").strip().replace("\x00", "")
+                if text:
+                    entries.append(f"{label}：{text[:360]}")
+                if len(entries) >= 8:
+                    break
+            if len(entries) >= 8:
+                break
+        if not entries:
+            return ""
+        return "\n".join(entries)[:1800]
+
+    def _show_comfyui_update_result(self):
+        """Report the detached ComfyUI transaction after the client restarts."""
+        result = self._take_startup_update_result("comfyui")
+        if not result:
+            return
+        status = str(result.get("status") or "")
+        detail = (
+            str(result.get("error") or result.get("message") or "")
+            .strip()
+            .replace("\x00", "")[:1200]
+        )
+        metadata = result.get("release_metadata")
+        version = ""
+        if isinstance(metadata, dict):
+            version = str(metadata.get("version") or "").strip()
+        restart_error = (
+            str(result.get("restart_error") or "").strip().replace("\x00", "")[:600]
+        )
+        warning_summary = self._comfyui_update_result_warnings(result)
+        if status == "installed":
+            message = "ComfyUI 核心更新完成"
+            if version:
+                message += f"，当前版本为 v{version}"
+            message += "。\n\n模型、自定义节点、工作流和用户数据均已保留。"
+            if restart_error:
+                message += f"\n\n自动重启未完成：{restart_error}"
+            if warning_summary:
+                message += f"\n\n更新已完成，但有以下清理提示：\n{warning_summary}"
+                messagebox.showwarning("ComfyUI 更新完成（有提示）", message, parent=self)
+            else:
+                messagebox.showinfo("ComfyUI 更新完成", message, parent=self)
+            return
+        if status == "failed_rolled_back":
+            message = "ComfyUI 更新未完成，旧版本已自动恢复。"
+        elif status == "rollback_incomplete":
+            message = (
+                "ComfyUI 更新失败，且自动恢复未完整完成。请不要继续生成，"
+                "先使用“修复运行环境”。"
+            )
+        else:
+            message = "ComfyUI 更新未完成，本地环境未被替换。"
+        if detail:
+            message += f"\n\n详细信息：{detail}"
+        if warning_summary:
+            message += f"\n\n清理与回滚提示：\n{warning_summary}"
+        messagebox.showerror("ComfyUI 更新失败", message, parent=self)
 
     def _exit_for_runtime_update(self, popup=None):
         """Close this process so the external helper can replace mapped DLLs."""
@@ -4484,8 +5387,8 @@ class GatewayApp(WindowBase):
         finally:
             lock.release()
 
-    def _begin_runtime_maintenance(self) -> tuple[bool, set[str], str]:
-        """Reserve runtime replacement and stop services without a launch race."""
+    def _reserve_runtime_maintenance(self) -> tuple[bool, set[str], str]:
+        """Reserve one maintenance transaction without blocking the Tk thread."""
         with self._runtime_maintenance_lock:
             if self._shutting_down:
                 return False, set(), "客户端正在退出"
@@ -4497,6 +5400,13 @@ class GatewayApp(WindowBase):
                 for role in ("comfyui", "api")
                 if self._process_supervisor.is_running(role)
             }
+        return True, running_before, ""
+
+    def _begin_runtime_maintenance(self) -> tuple[bool, set[str], str]:
+        """Reserve runtime replacement and stop services without a launch race."""
+        reserved, running_before, reserve_error = self._reserve_runtime_maintenance()
+        if not reserved:
+            return False, running_before, reserve_error
         try:
             error = self._stop_runtime_for_maintenance()
         except Exception as exc:
@@ -5044,6 +5954,14 @@ class GatewayApp(WindowBase):
         workflows = self._last_health.get("workflows") or []
         if isinstance(workflows, int):
             workflows = []
+        if not workflows:
+            try:
+                workflows = read_local_workflow_catalog(
+                    BASE_DIR / "workflows",
+                    BASE_DIR / "runtime" / "workflow_config.json",
+                )
+            except (OSError, ValueError):
+                workflows = []
         models = []
         model_groups = {"image": [], "video": [], "text": []}
         for wf in workflows:
@@ -5054,6 +5972,8 @@ class GatewayApp(WindowBase):
                 "name": wf.get("name", wf.get("id", "")),
                 "label": wf.get("name", wf.get("id", "")),
                 "type": wf.get("type", ""),
+                "capability": wf.get("capability", ""),
+                "model_group": wf.get("model_group", ""),
                 "available": wf.get("enabled", True) and self._workflow_model_available(wf),
                 "workflowId": wf.get("id", ""),
                 "input_schema": wf.get("input_schema") or {},
@@ -5115,6 +6035,9 @@ class GatewayApp(WindowBase):
             if isinstance(value, str) and value.strip():
                 return False
 
+        model_key = self._workflow_model_key(workflow)
+        if model_key:
+            return self._model_status.get(model_key) == "完整"
         workflow_id = str(workflow.get("id") or "").lower()
         workflow_name = str(workflow.get("name") or workflow.get("label") or "").lower()
         text = f"{workflow_id} {workflow_name}"
@@ -5441,6 +6364,450 @@ class GatewayApp(WindowBase):
         tk.Label(note, text="导入后可在“查看参数”中检查英文调用名称、公开输入、输出节点和工作流结构。", font=F["small"], fg=C["text2"], bg=C["hover"]).pack(anchor="w", padx=12, pady=(0, 9))
         self._button(panel, "开始添加工作流", lambda: (popup.destroy(), self._show_workflow_upload_dialog()), "primary", width=132).pack(anchor="e", padx=24, pady=(0, 18))
 
+    @staticmethod
+    def _comfyui_update_task_active(health: dict | None) -> bool:
+        task = (health or {}).get("current_task") or {}
+        return str(task.get("status") or "").strip().lower() in {
+            "reserving",
+            "queued",
+            "pending",
+            "submitted",
+            "running",
+        }
+
+    @staticmethod
+    def _activity_lock_busy(lock) -> bool:
+        if lock is None:
+            return False
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+            return False
+        return True
+
+    def _comfyui_update_local_activity_reason(self) -> str:
+        """Inspect local writers after the maintenance reservation is held."""
+        if self._comfyui_update_task_active(self.__dict__.get("_last_health", {})):
+            return "当前有生成任务正在提交或执行"
+        if self._activity_lock_busy(self.__dict__.get("_backend_action_lock")):
+            name = self.__dict__.get("_backend_action_name") or "后台操作"
+            return f"{name}正在进行"
+        if self._activity_lock_busy(self.__dict__.get("_workflow_management_lock")):
+            name = self.__dict__.get("_workflow_operation_name") or "工作流导入或维护"
+            return f"{name}正在进行"
+        lock, transfers = self._model_transfer_state()
+        with lock:
+            if self.__dict__.get("_model_import_in_progress", False):
+                return "模型导入正在进行"
+            if transfers:
+                return "模型下载或维护正在进行"
+        return ""
+
+    def _comfyui_update_live_queue_reason(self) -> str:
+        """Query ComfyUI itself; cached API health is not authoritative here."""
+        try:
+            payload = ComfyUIClient(COMFY_BASE).get_queue_status()
+        except Exception as exc:
+            try:
+                owned_running = self._process_supervisor.is_running("comfyui")
+            except Exception:
+                owned_running = True
+            if owned_running:
+                return f"无法实时确认 ComfyUI 队列是否空闲：{str(exc)[:240]}"
+            return ""
+        if not isinstance(payload, dict):
+            return "ComfyUI 返回了无法识别的队列状态"
+        running = payload.get("queue_running") or []
+        pending = payload.get("queue_pending") or []
+        if not isinstance(running, (list, tuple)) or not isinstance(
+            pending, (list, tuple)
+        ):
+            return "ComfyUI 返回了无法识别的队列状态"
+        count = len(running) + len(pending)
+        if count:
+            return f"ComfyUI 队列中还有 {count} 个生成任务"
+        return ""
+
+    def _stop_api_submission_for_comfyui_update(self) -> str:
+        """Close the local submission path before the final live queue check."""
+        error = self._process_supervisor.terminate("api", timeout=8)
+        if not self._process_supervisor.is_running("api"):
+            self._api_proc = None
+        port_ready, port_error = self._process_supervisor.prepare_port(API_PORT)
+        errors = [value for value in (error, "" if port_ready else port_error) if value]
+        return "；".join(errors)
+
+    def _quiesce_comfyui_for_update(self) -> str:
+        """Reserve local writers, close API submissions, then recheck live work."""
+        for check in (
+            self._comfyui_update_local_activity_reason,
+            self._comfyui_update_live_queue_reason,
+        ):
+            reason = check()
+            if reason:
+                return reason
+        stop_error = self._stop_api_submission_for_comfyui_update()
+        if stop_error:
+            raise RuntimeError(f"API 服务未能安全停止：{stop_error}")
+        for check in (
+            self._comfyui_update_local_activity_reason,
+            self._comfyui_update_live_queue_reason,
+        ):
+            reason = check()
+            if reason:
+                return reason
+        return ""
+
+    def _set_comfyui_update_progress(
+        self,
+        dialog: dict,
+        percent: float,
+        stage: str,
+        detail: str,
+        *,
+        indeterminate: bool = False,
+        error: bool = False,
+    ):
+        self._stop_runtime_progress_activity(dialog)
+        self._set_runtime_progress(dialog, percent, stage, detail, error=error)
+        if indeterminate and not error:
+            progress = dialog.get("progress")
+            if progress is not None:
+                progress.configure(mode="indeterminate")
+                progress.start(12)
+
+    @staticmethod
+    def _comfyui_update_operation_id(staging_core: Path) -> str:
+        match = re.fullmatch(
+            r"\.comfyui-update-staging-([0-9a-f]{32})",
+            Path(staging_core).name,
+        )
+        if not match:
+            raise ValueError("ComfyUI 更新暂存目录名称无效")
+        return match.group(1)
+
+    def _write_comfyui_update_manifest(self, prepared) -> Path:
+        base = BASE_DIR.resolve()
+        staging = Path(prepared.staging_core).resolve(strict=False)
+        if staging.parent != base:
+            raise ValueError("ComfyUI 更新暂存目录不在客户端目录内")
+        operation_id = self._comfyui_update_operation_id(staging)
+        manifest = base / f".comfyui-update-manifest-{operation_id}.json"
+        temporary = base / f".comfyui-update-manifest-{operation_id}.json.tmp"
+        if os.path.lexists(str(manifest)) or os.path.lexists(str(temporary)):
+            raise FileExistsError("ComfyUI 更新清单已存在，请重新尝试")
+        payload = prepared.to_manifest()
+        payload["status"] = "ready"
+        payload["overlay_command"] = []
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return manifest
+
+    @staticmethod
+    def _cleanup_comfyui_update_paths(prepared=None, manifest: Path | None = None):
+        """Remove only updater-owned direct children after a pre-handoff failure."""
+        base = BASE_DIR.resolve()
+        candidates: list[Path] = []
+        if prepared is not None:
+            for value in (
+                getattr(prepared, "staging_core", None),
+                getattr(prepared, "dependency_overlay", None),
+                getattr(prepared, "overlay_requirements_file", None),
+            ):
+                if value:
+                    candidates.append(Path(value))
+        if manifest is not None:
+            candidates.append(Path(manifest))
+        allowed = re.compile(
+            r"^\.comfyui-update-(?:staging|overlay)-[0-9a-f]{32}$|"
+            r"^\.comfyui-update-(?:requirements|manifest)-[0-9a-f]{32}\.json$|"
+            r"^\.comfyui-update-requirements-[0-9a-f]{32}\.txt$"
+        )
+        for candidate in candidates:
+            resolved = candidate.resolve(strict=False)
+            if resolved.parent != base or not allowed.fullmatch(resolved.name):
+                continue
+            if candidate.is_symlink() or (
+                hasattr(candidate, "is_junction") and candidate.is_junction()
+            ):
+                continue
+            try:
+                if candidate.is_dir():
+                    shutil.rmtree(candidate)
+                else:
+                    candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _run_comfyui_overlay_prepare(self, command: list[str]):
+        """Run pip with termination-aware semantics before staged files may be removed."""
+        try:
+            return self._process_supervisor.run_observed(
+                "comfyui-update-prepare",
+                list(command),
+                cwd=str(BASE_DIR),
+                env={
+                    **os.environ,
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONUTF8": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                timeout=900,
+            )
+        except Exception as exc:
+            try:
+                still_running = self._process_supervisor.is_running(
+                    "comfyui-update-prepare"
+                )
+            except Exception:
+                still_running = True
+            if still_running:
+                raise _ComfyUIOverlayProcessStillRunning(
+                    "官方组件准备进程仍在运行，无法确认文件已释放；"
+                    "客户端已保留暂存文件，请退出客户端后再重试。"
+                ) from exc
+            raise
+
+    def _start_comfyui_update(self):
+        """Download and transactionally install the latest official stable Core."""
+        if self._shutting_down:
+            return
+        if self._comfyui_update_task_active(self._last_health):
+            messagebox.showinfo(
+                "暂不能更新 ComfyUI",
+                "当前有生成任务正在执行。请等待任务完成后再点击更新。",
+                parent=self,
+            )
+            return
+        live_core = BASE_DIR / "runtime" / "ComfyUI"
+        if not (live_core / "comfyui_version.py").is_file():
+            messagebox.showinfo(
+                "请先安装运行环境",
+                "当前没有可更新的内置 ComfyUI，请先使用“修复运行环境”安装环境包。",
+                parent=self,
+            )
+            self._open_runtime_maintenance()
+            return
+        if os.path.lexists(str(live_core / ".git")):
+            messagebox.showinfo(
+                "未自动更新用户管理的 ComfyUI",
+                "检测到这个 ComfyUI 由 Git 管理。为避免覆盖你的分支或修改，"
+                "客户端不会自动更新它。",
+                parent=self,
+            )
+            return
+
+        reserved, running_before, reserve_error = self._reserve_runtime_maintenance()
+        if not reserved:
+            messagebox.showinfo(
+                "环境维护正在进行",
+                reserve_error or "已有环境维护任务正在进行，请稍候。",
+                parent=self,
+            )
+            return
+
+        try:
+            dialog = self._create_runtime_progress_dialog(
+                title="更新 ComfyUI",
+                heading="正在更新 ComfyUI 核心",
+                stage="准备更新",
+                detail="正在安全停止本地服务",
+            )
+        except Exception:
+            self._end_runtime_maintenance(restart=False)
+            raise
+        popup = dialog["popup"]
+        self._set_comfyui_update_progress(
+            dialog,
+            5,
+            "准备更新",
+            "正在安全停止本地服务",
+            indeterminate=True,
+        )
+
+        def keep_update_open():
+            self._set_comfyui_update_progress(
+                dialog,
+                dialog["progress_var"].get(),
+                dialog["stage_var"].get(),
+                "更新正在进行，请保持窗口开启",
+                indeterminate=True,
+            )
+
+        popup.protocol("WM_DELETE_WINDOW", keep_update_open)
+
+        def post_progress(
+            percent: float,
+            stage: str,
+            detail: str,
+            *,
+            indeterminate: bool = False,
+        ):
+            self._post_to_ui(
+                lambda: self._set_comfyui_update_progress(
+                    dialog,
+                    percent,
+                    stage,
+                    detail,
+                    indeterminate=indeterminate,
+                )
+            )
+
+        def finish_without_handoff(
+            title: str,
+            message: str,
+            *,
+            error: bool = False,
+            open_runtime_maintenance: bool = False,
+        ):
+            def finish_on_ui():
+                self._end_runtime_maintenance(restart=bool(running_before))
+                self._stop_runtime_progress_activity(dialog)
+                try:
+                    popup.grab_release()
+                    popup.destroy()
+                except Exception:
+                    pass
+                if error:
+                    messagebox.showerror(title, message, parent=self)
+                else:
+                    messagebox.showinfo(title, message, parent=self)
+                if open_runtime_maintenance:
+                    self.after(700, self._open_runtime_maintenance)
+
+            self._post_to_ui(finish_on_ui)
+
+        def update_worker():
+            prepared = None
+            manifest = None
+            handoff_started = False
+            cleanup_safe = True
+            try:
+                activity_reason = self._quiesce_comfyui_for_update()
+                if activity_reason:
+                    finish_without_handoff(
+                        "暂不能更新 ComfyUI",
+                        f"{activity_reason}。请等待当前操作完成后再点击更新。",
+                    )
+                    return
+                stop_error = self._stop_runtime_for_maintenance()
+                if stop_error:
+                    raise RuntimeError(f"后台服务未能安全停止：{stop_error}")
+                post_progress(
+                    12,
+                    "检查官方稳定版",
+                    "正在连接 ComfyUI 官方发布源",
+                    indeterminate=True,
+                )
+
+                def report_download(done: int, total: int | None):
+                    if total and total > 0:
+                        percent = 18 + min(1.0, done / total) * 32
+                        detail = (
+                            f"已下载 {done / 1024 / 1024:.1f} / "
+                            f"{total / 1024 / 1024:.1f} MB"
+                        )
+                        post_progress(percent, "下载官方核心", detail)
+                    else:
+                        detail = f"已下载 {done / 1024 / 1024:.1f} MB"
+                        post_progress(
+                            18,
+                            "下载官方核心",
+                            detail,
+                            indeterminate=True,
+                        )
+
+                prepared = prepare_comfyui_update(
+                    BASE_DIR,
+                    progress_callback=report_download,
+                )
+                if prepared.status == "up_to_date":
+                    version = str(prepared.release_metadata.get("version") or "")
+                    finish_without_handoff(
+                        "ComfyUI 已是最新版",
+                        f"当前已是官方最新稳定版 v{version}。" if version else "当前已是官方最新稳定版。",
+                    )
+                    return
+                if prepared.status == "full_environment_required":
+                    reasons = "\n".join(prepared.dependency_plan.reasons[:5])
+                    detail = f"\n\n原因：\n{reasons}" if reasons else ""
+                    finish_without_handoff(
+                        "需要更新完整运行环境",
+                        "这个版本涉及 Torch/CUDA 或未审核依赖，已停止核心更新。"
+                        "请改用“修复运行环境”安装对应环境包。"
+                        + detail,
+                        open_runtime_maintenance=True,
+                    )
+                    return
+
+                if prepared.status == "overlay_build_required":
+                    post_progress(
+                        58,
+                        "准备官方组件",
+                        "正在下载并校验与新版配套的官方 wheel",
+                        indeterminate=True,
+                    )
+                    overlay_result = self._run_comfyui_overlay_prepare(
+                        list(prepared.overlay_command)
+                    )
+                    if overlay_result.returncode != 0:
+                        raw_detail = overlay_result.stderr or overlay_result.stdout or b""
+                        detail = (
+                            raw_detail.decode("utf-8", errors="replace")
+                            if isinstance(raw_detail, bytes)
+                            else str(raw_detail)
+                        ).strip()
+                        raise RuntimeError(detail[-2000:] or "官方组件准备失败")
+                    if prepared.overlay_requirements_file:
+                        Path(prepared.overlay_requirements_file).unlink(missing_ok=True)
+                elif prepared.status != "ready":
+                    raise ComfyUIUpdateError(f"无法处理更新状态：{prepared.status}")
+
+                post_progress(
+                    82,
+                    "准备安全切换",
+                    "核心与官方组件已就绪，客户端即将重启验证",
+                )
+                manifest = self._write_comfyui_update_manifest(prepared)
+                self._comfyui_update_worker_proc = launch_comfyui_update_worker(
+                    manifest,
+                    restart_client=BASE_DIR / "runtime" / "python" / "pythonw.exe",
+                    parent_pid=os.getpid(),
+                )
+                handoff_started = True
+                self._post_to_ui(lambda: self._exit_for_runtime_update(popup))
+            except _ComfyUIOverlayProcessStillRunning as exc:
+                cleanup_safe = False
+                finish_without_handoff(
+                    "ComfyUI 更新未完成",
+                    "更新尚未应用，本地 ComfyUI 保持原样。\n\n"
+                    f"详细信息：{exc}",
+                    error=True,
+                )
+            except Exception as exc:
+                if cleanup_safe:
+                    self._cleanup_comfyui_update_paths(prepared, manifest)
+                finish_without_handoff(
+                    "ComfyUI 更新失败",
+                    "更新未应用，本地 ComfyUI 保持原样。\n\n"
+                    f"详细信息：{exc}",
+                    error=True,
+                )
+            finally:
+                if not handoff_started and self._shutting_down and cleanup_safe:
+                    self._cleanup_comfyui_update_paths(prepared, manifest)
+
+        threading.Thread(target=update_worker, daemon=True).start()
+
     def _install_runtime(self):
         """Compatibility entry: installation now lives in the maintenance center."""
         self._open_runtime_maintenance()
@@ -5529,6 +6896,9 @@ class GatewayApp(WindowBase):
         self._button(footer, "关闭", close_popup, "plain", width=72).pack(side="right")
 
     def _import_models(self):
+        if self._runtime_maintenance_active():
+            self._footer_label.config(text="  正在维护运行环境，请稍候")
+            return
         if self._model_import_in_progress:
             self._footer_label.config(text="  已有模型导入任务正在运行，请稍候")
             return
@@ -5562,7 +6932,11 @@ class GatewayApp(WindowBase):
         models_dir = BASE_DIR / "models"
         transfer_lock, transfers = self._model_transfer_state()
         with transfer_lock:
-            if transfers or self._model_import_in_progress:
+            if (
+                self._runtime_maintenance_active()
+                or transfers
+                or self._model_import_in_progress
+            ):
                 self._footer_label.config(text="  另一个模型维护任务已开始，请稍候")
                 return
             self._model_import_in_progress = True
@@ -5722,6 +7096,14 @@ class GatewayApp(WindowBase):
     def _begin_backend_action(self, action_name: str) -> bool:
         """Reserve one service lifecycle action without blocking the UI."""
         if self._shutting_down:
+            return False
+        if self.__dict__.get("_runtime_start_blocked", False):
+            self.after(
+                0,
+                lambda: self._footer_label.config(
+                    text="  自动恢复未完成，请先修复运行环境"
+                ),
+            )
             return False
         if self._runtime_maintenance_active():
             self.after(
@@ -6305,9 +7687,23 @@ class GatewayApp(WindowBase):
         """按本地 API 返回的工作流列表动态刷新界面。"""
         if not hasattr(self, "_wf_sections"):
             return
-        workflows = data.get("workflows") if isinstance(data, dict) else []
-        if isinstance(workflows, int) or not isinstance(workflows, list):
-            workflows = []
+        previous_scroll = 0.0
+        if hasattr(self, "_workflow_canvas"):
+            try:
+                previous_scroll = self._workflow_canvas.yview()[0]
+            except (IndexError, tk.TclError):
+                previous_scroll = 0.0
+        remote_workflows = data.get("workflows") if isinstance(data, dict) else []
+        if isinstance(remote_workflows, int) or not isinstance(remote_workflows, list):
+            remote_workflows = []
+        try:
+            local_workflows = read_local_workflow_catalog(
+                BASE_DIR / "workflows",
+                BASE_DIR / "runtime" / "workflow_config.json",
+            )
+        except (OSError, ValueError):
+            local_workflows = []
+        workflows = merge_workflow_catalog(local_workflows, remote_workflows)
 
         for box in self._wf_sections.values():
             for child in box.winfo_children()[1:]:
@@ -6365,6 +7761,19 @@ class GatewayApp(WindowBase):
                 self._workflow_mode.set(first_valid_id or "")
         if hasattr(self, "_model_hint_label"):
             self._model_hint_label.config(text="")
+        if hasattr(self, "_workflow_scroll_content"):
+            self._bind_workflow_mousewheel_tree(self._workflow_scroll_content)
+
+            def restore_scroll_position():
+                try:
+                    self._workflow_canvas.configure(
+                        scrollregion=self._workflow_canvas.bbox("all")
+                    )
+                    self._workflow_canvas.yview_moveto(previous_scroll)
+                except tk.TclError:
+                    pass
+
+            self.after_idle(restore_scroll_position)
 
     # ══════════════════════════════════════════════════════
     # 系统托盘

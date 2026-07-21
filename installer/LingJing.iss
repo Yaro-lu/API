@@ -65,6 +65,34 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; StageDir 已由 build_release.ps1 做过白名单复制、敏感信息扫描和成员校验。
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[UninstallDelete]
+; 这些目录可在首次安装后由环境修复、模型下载或工作流导入继续写入。
+; 只删除 {app} 下明确的客户端自有目录，根目录 outputs 不在卸载清单中。
+Type: filesandordirs; Name: "{app}\.venv"
+Type: filesandordirs; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\bin"
+Type: filesandordirs; Name: "{app}\cache"
+Type: filesandordirs; Name: "{app}\models"
+Type: filesandordirs; Name: "{app}\runtime"
+Type: filesandordirs; Name: "{app}\workflows"
+
+; 清理意外中断的环境安装和 ComfyUI 更新事务残留。
+Type: filesandordirs; Name: "{app}\.runtime-install-staging-*"
+Type: filesandordirs; Name: "{app}\.runtime-install-backup-*"
+Type: filesandordirs; Name: "{app}\.comfyui-update-staging-*"
+Type: filesandordirs; Name: "{app}\.comfyui-update-overlay-*"
+Type: filesandordirs; Name: "{app}\.comfyui-update-backup-*"
+Type: files; Name: "{app}\.comfyui-update-requirements-*.txt"
+Type: files; Name: "{app}\.comfyui-update-release-*.zip"
+Type: files; Name: "{app}\.comfyui-update-release-*.zip.part"
+Type: files; Name: "{app}\.comfyui-update-manifest-*.json"
+Type: files; Name: "{app}\.comfyui-update-manifest-*.json.tmp"
+Type: files; Name: "{app}\.comfyui-update-journal-*.json"
+
+; 本地放在客户端根目录的官方环境包及其校验文件也属于可重新下载内容。
+Type: files; Name: "{app}\runtime-nvidia-*.7z"
+Type: files; Name: "{app}\runtime-nvidia-*.7z.sha256"
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 

@@ -15,7 +15,9 @@ from app.core.runtime_package import (
     REQUIRED_RUNTIME_PATHS,
     missing_runtime_paths,
 )
+from app.core.model_maintenance import MODEL_REQUIREMENTS
 from app.core.workflow_dependencies import workflow_dependency_report
+from app.workflow_registry import merge_workflow_catalog, read_local_workflow_catalog
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -67,6 +69,11 @@ class StaticDashboardPages:
                     {
                         "id": item.get("id"),
                         "name": item.get("name"),
+                        "description": item.get("description"),
+                        "capability": item.get("capability"),
+                        "model_group": item.get("model_group"),
+                        "workflow_type": item.get("workflow_type"),
+                        "output_type": item.get("output_type"),
                         "type": item.get("type") or item.get("output_type"),
                         "enabled": item.get("enabled", True),
                         "available": item.get("available"),
@@ -109,6 +116,39 @@ class StaticDashboardPages:
     def _body(self, page) -> tk.Frame:
         body = tk.Frame(page, bg=self.c["bg"])
         body.pack(fill="both", expand=True, padx=18, pady=(4, 14))
+        return body
+
+    def _scrollable_body(self, page) -> tk.Frame:
+        """Return a full-width body that remains usable at the minimum window height."""
+        scrollbar = tk.Scrollbar(page, orient="vertical")
+        scrollbar.pack(side="right", fill="y", pady=(4, 14))
+        canvas = tk.Canvas(
+            page,
+            bg=self.c["bg"],
+            highlightthickness=0,
+            bd=0,
+            yscrollcommand=scrollbar.set,
+        )
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=canvas.yview)
+
+        content = tk.Frame(canvas, bg=self.c["bg"])
+        body = tk.Frame(content, bg=self.c["bg"])
+        body.pack(fill="x", expand=True, padx=18, pady=(4, 14))
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(content_window, width=event.width),
+        )
+        canvas.bind(
+            "<MouseWheel>",
+            lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"),
+        )
+        body._scroll_canvas = canvas
         return body
 
     def _card(self, parent, height: int | None = None):
@@ -264,77 +304,30 @@ class StaticDashboardPages:
 
     def _workflow_records(self) -> list[dict]:
         health = getattr(self.app, "_last_health", {})
-        workflows = health.get("workflows") if isinstance(health, dict) else None
-        if isinstance(workflows, list) and workflows:
-            return [dict(item) for item in workflows if isinstance(item, dict)]
-
-        records = []
-        workflows_dir = BASE_DIR / "workflows"
-        if not workflows_dir.exists():
-            return records
-        configured = {}
-        default_workflow_id = ""
-        config_path = BASE_DIR / "runtime" / "workflow_config.json"
+        remote = health.get("workflows") if isinstance(health, dict) else None
+        if not isinstance(remote, list):
+            remote = []
         try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            if isinstance(config, dict):
-                default_workflow_id = str(config.get("default_workflow_id") or "")
-                configured = {
-                    str(item.get("id") or ""): item
-                    for item in config.get("workflows", [])
-                    if isinstance(item, dict) and item.get("id")
-                }
-        except (OSError, json.JSONDecodeError, TypeError):
-            configured = {}
-        for folder in sorted(workflows_dir.iterdir()):
-            manifest_path = folder / "manifest.json"
-            if not folder.is_dir() or not manifest_path.exists():
-                continue
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                records.append(
-                    {
-                        "id": folder.name,
-                        "name": folder.name,
-                        "enabled": False,
-                        "output_type": "",
-                        "manifest_error": True,
-                    }
-                )
-                continue
-            workflow_type = str(manifest.get("type") or "").lower()
-            if workflow_type.startswith("text"):
-                output_type = "text"
-            elif workflow_type.startswith("video"):
-                output_type = "video"
-            elif workflow_type.startswith("image"):
-                output_type = "image"
-            else:
-                output_type = str(manifest.get("output_type") or "")
-            records.append(
-                {
-                    **manifest,
-                    **configured.get(str(manifest.get("id") or folder.name), {}),
-                    "id": str(manifest.get("id") or folder.name),
-                    "name": str(manifest.get("name") or folder.name),
-                    "enabled": configured.get(str(manifest.get("id") or folder.name), {}).get(
-                        "enabled", manifest.get("enabled", True)
-                    ),
-                    "output_type": output_type,
-                    "workflow_json": f"{folder.name}/workflow.json" if (folder / "workflow.json").exists() else "",
-                    "is_default": str(manifest.get("id") or folder.name) == default_workflow_id,
-                }
+            local = read_local_workflow_catalog(
+                BASE_DIR / "workflows",
+                BASE_DIR / "runtime" / "workflow_config.json",
             )
-        return records
+        except (OSError, ValueError):
+            local = []
+        return merge_workflow_catalog(local, remote)
 
     def _workflow_type_label(self, workflow: dict) -> tuple[str, str, str]:
-        text = str(workflow.get("output_type") or workflow.get("type") or "").lower()
-        if "video" in text:
-            return "影", "视频", "warn"
-        if "text" in text or "chat" in text:
-            return "文", "文字", "primary"
-        return "图", "图片", "success"
+        try:
+            _key, label, color = self.app._workflow_capability_meta(workflow)
+        except Exception:
+            label, color = "自定义", self.c["text2"]
+        if color == "#e8790c":
+            tone = "warn"
+        elif color == "#0f9f84":
+            tone = "success"
+        else:
+            tone = "primary"
+        return "■", label, tone
 
     def _workflow_state(self, workflow: dict) -> tuple[str, str, str, str]:
         if workflow.get("manifest_error") or not workflow.get("workflow_json", True):
@@ -415,7 +408,7 @@ class StaticDashboardPages:
         self._section_heading(
             body,
             "我的工作流",
-            "已识别的模型状态会自动更新",
+            "点击详情查看用途、显存、内存与推荐参数",
             actions=[
                 ("添加教程", self.app._show_workflow_tutorial, "plain"),
                 ("＋ 添加工作流", self.app._show_workflow_upload_dialog, "primary"),
@@ -466,16 +459,10 @@ class StaticDashboardPages:
                     "success": self.c["success"],
                     "warn": self.c["warn"],
                 }[type_tone]
-                tone_bg = {
-                    "primary": self.c["soft_primary"],
-                    "success": self.c["soft_success"],
-                    "warn": self.c["soft_warn"],
-                }[type_tone]
                 row = tk.Frame(rows_parent, bg=self.c["card"])
                 row.pack(fill="x", padx=14, pady=(9 if index == 0 else 6, 6))
-                tk.Label(row, text=glyph, font=self.f["bold"], fg=tone_fg, bg=tone_bg, width=3, pady=6).pack(side="left")
                 name_box = tk.Frame(row, bg=self.c["card"], width=180, height=44)
-                name_box.pack(side="left", padx=(11, 0), fill="x", expand=True)
+                name_box.pack(side="left", fill="x", expand=True)
                 name_box.pack_propagate(False)
                 name_line = tk.Frame(name_box, bg=self.c["card"])
                 name_line.pack(fill="x", anchor="w")
@@ -483,11 +470,18 @@ class StaticDashboardPages:
                     workflow.get("name") or workflow.get("id") or "未命名工作流",
                     18,
                 )
+                tk.Label(
+                    name_line,
+                    text=f"{glyph} {kind}",
+                    font=self.f["tiny"],
+                    fg=tone_fg,
+                    bg=self.c["card"],
+                ).pack(side="left", padx=(0, 7))
                 tk.Label(name_line, text=display_name, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
                 if workflow.get("is_default"):
                     self._badge(name_line, "默认", "primary").pack(side="left", padx=(7, 0))
-                tk.Label(name_box, text=self._short_text(workflow.get("id"), 24), font=self.f["mono"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
-                tk.Label(row, text=kind, width=6, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
+                intro = workflow.get("description") or workflow.get("id") or "暂无简介"
+                tk.Label(name_box, text=self._short_text(intro, 32), font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(anchor="w")
                 detail_box = tk.Frame(row, bg=self.c["card"], width=174, height=44)
                 detail_box.pack(side="left", padx=(4, 8))
                 detail_box.pack_propagate(False)
@@ -504,7 +498,7 @@ class StaticDashboardPages:
                     ).pack(side="right", padx=(6, 0))
                 self._action(
                     row,
-                    "查看参数",
+                    "详情",
                     lambda item=dict(workflow): self.app._show_workflow_schema(item),
                     "plain",
                     78,
@@ -563,12 +557,16 @@ class StaticDashboardPages:
 
     # ── models and environment ─────────────────────────────
     def _build_resources(self, page):
-        body = self._body(page)
+        body = self._scrollable_body(page)
+        # Keep the complete maintenance page inside the documented 700 px
+        # minimum window on Windows display scaling, where Tk may round two
+        # pixels upward compared with the nominal widget heights.
+        body.pack_configure(pady=(4, 12))
         runtime_state, runtime_missing = self._runtime_status()
         runtime_ok = runtime_state == "ready"
         environment_check = getattr(self.app, "_environment_status", {})
         model_status = getattr(self.app, "_model_status", {})
-        model_keys = ("Qwen3.5", "Flux2", "Wan2.1")
+        model_keys = tuple(MODEL_REQUIREMENTS)
         ready_models = sum(1 for key in model_keys if model_status.get(key) == "完整")
         missing_count = sum(len((model_status.get("missing") or {}).get(key) or []) for key in model_keys)
 
@@ -636,19 +634,32 @@ class StaticDashboardPages:
                 ("重新检查", lambda: self.app._start_background_model_recheck(), "primary"),
             ],
         )
-        models_card = self._card(body, 198)
+        models_card = self._card(body, max(198, 22 + len(model_keys) * 28))
         models_card.pack(fill="x", pady=(0, 14))
         labels = {
-            "Qwen3.5": ("Qwen 3.5 文字生成", "文字", "文", "primary"),
-            "Flux2": ("Flux 2 图片生成", "图片", "图", "success"),
-            "Wan2.1": ("Wan 2.1 视频生成", "视频", "影", "warn"),
+            "Qwen3.5": ("Qwen 3.5 文字生成", "文本模型", "文", "primary"),
+            "Flux2": ("FLUX.2 Klein 9B", "文生图", "图", "success"),
+            "Flux2 Klein 4B": ("FLUX.2 Klein 4B", "文/图生图", "图", "primary"),
+            "Z-Image": ("Z-Image Turbo", "文生图", "图", "success"),
+            "Wan2.1": ("WAN2.1 VACE 1.3B", "首尾帧", "影", "warn"),
+            "Wan2.1 FLF2V 14B": ("WAN2.1 14B（原工作流）", "首尾帧", "影", "warn"),
+            "LTX-2.3": ("LTX-2.3 22B", "首尾帧", "影", "warn"),
+            "Wan2.1 Fun 1.3B": ("WAN2.1-Fun 1.3B", "首尾帧", "影", "warn"),
         }
         for index, key in enumerate(model_keys):
-            title, kind, glyph, tone = labels[key]
+            title, kind, glyph, tone = labels.get(
+                key,
+                (
+                    str(MODEL_REQUIREMENTS.get(key, {}).get("title") or key),
+                    "模型",
+                    "模",
+                    "primary",
+                ),
+            )
             missing = list((model_status.get("missing") or {}).get(key) or [])
             ready = model_status.get(key) == "完整"
             row = tk.Frame(models_card, bg=self.c["card"])
-            row.pack(fill="x", padx=14, pady=(9 if index == 0 else 7, 7))
+            row.pack(fill="x", padx=14, pady=(5 if index == 0 else 3, 3))
             icon_bg = {
                 "primary": self.c["soft_primary"],
                 "success": self.c["soft_success"],
@@ -659,12 +670,8 @@ class StaticDashboardPages:
                 "success": self.c["success"],
                 "warn": self.c["warn"],
             }[tone]
-            tk.Label(row, text=glyph, font=self.f["bold"], fg=icon_fg, bg=icon_bg, width=3, pady=6).pack(side="left")
-            name_box = tk.Frame(row, bg=self.c["card"])
-            name_box.pack(side="left", fill="x", expand=True, padx=(11, 0))
-            tk.Label(name_box, text=title, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w")
-            note = "模型完整，可以直接使用" if ready else f"缺少：{'、'.join(missing[:2])}{'…' if len(missing) > 2 else ''}"
-            tk.Label(name_box, text=note, font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w")
+            tk.Label(row, text=glyph, font=self.f["bold"], fg=icon_fg, bg=icon_bg, width=3, pady=2).pack(side="left")
+            tk.Label(row, text=title, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left", fill="x", expand=True, padx=(11, 0))
             tk.Label(row, text=kind, width=7, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
             self._badge(row, "完整" if ready else f"缺少 {len(missing)} 个", "success" if ready else "warn").pack(side="left", padx=(6, 10))
             if not ready:
@@ -690,7 +697,7 @@ class StaticDashboardPages:
 
     # ── settings ───────────────────────────────────────────
     def _build_settings(self, page):
-        body = self._body(page)
+        body = self._scrollable_body(page)
         self._section_heading(body, "访问与安全", "用于其他软件调用本客户端")
         access = self._card(body, 94)
         access.pack(fill="x", pady=(0, 14))
@@ -706,6 +713,42 @@ class StaticDashboardPages:
         access_actions.pack(side="right", padx=16)
         self._action(access_actions, "修改密钥", self.app._edit_api_key, "plain", 84).pack(side="left", padx=(0, 8))
         self._action(access_actions, "复制密钥", self.app._copy_api_key, "primary", 84).pack(side="left")
+
+        self._section_heading(body, "环境维护", "核心组件可以单独更新")
+        maintenance = self._card(body, 94)
+        maintenance.pack(fill="x", pady=(0, 14))
+        maintenance_left = tk.Frame(maintenance, bg=self.c["card"])
+        maintenance_left.pack(side="left", fill="both", expand=True, padx=16, pady=13)
+        tk.Label(
+            maintenance_left,
+            text="ComfyUI 核心维护",
+            font=self.f["h2"],
+            fg=self.c["text"],
+            bg=self.c["card"],
+        ).pack(anchor="w")
+        tk.Label(
+            maintenance_left,
+            text="只更新 ComfyUI 核心，不影响模型、自定义节点和用户数据。",
+            font=self.f["small"],
+            fg=self.c["text2"],
+            bg=self.c["card"],
+        ).pack(anchor="w", pady=(6, 0))
+        maintenance_actions = tk.Frame(maintenance, bg=self.c["card"])
+        maintenance_actions.pack(side="right", padx=16)
+        self._action(
+            maintenance_actions,
+            "修复运行环境",
+            self.app._show_runtime_maintenance,
+            "plain",
+            104,
+        ).pack(side="left", padx=(0, 8))
+        self._action(
+            maintenance_actions,
+            "一键更新 ComfyUI",
+            self.app._start_comfyui_update,
+            "primary",
+            132,
+        ).pack(side="left")
 
         self._section_heading(body, "文件存放位置", "当前随项目保存，点击即可打开查看")
         paths_card = self._card(body, 188)
@@ -762,3 +805,14 @@ class StaticDashboardPages:
             tk.Label(row, text=label, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
             tk.Label(row, text=value, font=self.f["small"], fg=self.c["text"], bg=self.c["card"]).pack(side="right")
         self._action(advanced, "打开配置文件", self.app._open_runtime_config, "plain", 106).pack(anchor="e", padx=16, pady=(7, 0))
+
+        settings_canvas = body._scroll_canvas
+
+        def scroll_settings(event):
+            settings_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        stack = [body]
+        while stack:
+            widget = stack.pop()
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            stack.extend(widget.winfo_children())

@@ -8,6 +8,9 @@ from app.core.runtime_package import (
     RUNTIME_PACKAGE_SHA256,
     RUNTIME_RELEASE_URL,
     REQUIRED_RUNTIME_PATHS,
+    SevenZipProgressParser,
+    archive_extract_command,
+    archive_list_command,
     install_staged_runtime,
     invalid_archive_entries,
     load_runtime_release_manifest,
@@ -24,6 +27,38 @@ from app.core.runtime_package import (
 
 
 class RuntimePackageContractTests(unittest.TestCase):
+    def test_seven_zip_progress_parser_handles_cr_and_split_chunks(self):
+        parser = SevenZipProgressParser()
+
+        self.assertEqual(parser.feed(b"Scanning\r  0%\r 1"), [0])
+        self.assertEqual(parser.feed(b"0%\rnoise\r 99%\r100%\r"), [10, 99, 100])
+        self.assertEqual(parser.feed(b" 250%\r"), [])
+        self.assertEqual(parser.feed(b"77%"), [])
+        self.assertEqual(parser.finish(), [77])
+
+    def test_seven_zip_extract_command_enables_streamed_progress(self):
+        command = archive_extract_command(
+            ("7z", "7z.exe"),
+            Path("runtime.7z"),
+            Path("staging"),
+        )
+
+        self.assertIn("-bsp1", command)
+        self.assertIn("-bso0", command)
+        self.assertIn("-bse2", command)
+        self.assertIn("-sccUTF-8", command)
+
+    def test_seven_zip_list_command_uses_machine_readable_output(self):
+        command = archive_list_command(
+            ("7z", "7z.exe"),
+            Path("runtime.7z"),
+        )
+
+        self.assertEqual(
+            command,
+            ["7z.exe", "l", "-slt", "-sccUTF-8", "runtime.7z"],
+        )
+
     def test_source_controlled_release_manifest_is_consistent(self):
         manifest = load_runtime_release_manifest()
 
@@ -185,16 +220,46 @@ class RuntimePackageContractTests(unittest.TestCase):
             ],
         )
 
-    def test_7z_compact_listing_preserves_member_paths_with_spaces(self):
+    def test_7z_technical_listing_handles_solid_entries_and_spaces(self):
         listing = (
-            "2026-07-16 10:30:00 ....A 123 100 runtime/python/python.exe\n"
-            "2026-07-16 10:30:01 ....A 456 300 runtime/ComfyUI/models/my model.bin\n"
+            "Path = D:\\cache\\runtime.7z\n"
+            "Type = 7z\n"
+            "Physical Size = 2026780758\n"
+            "\n"
+            "----------\n"
+            "Path = runtime\\python\\python.exe\n"
+            "Size = 105816\n"
+            "Packed Size = \n"
+            "\n"
+            "Path = runtime\\ComfyUI\\main.py\n"
+            "Size = 24470\n"
+            "Packed Size = \n"
+            "\n"
+            "Path = .venv\\Lib\\site-packages\\torch\\__init__.py\n"
+            "Size = 105847\n"
+            "Packed Size = \n"
+            "\n"
+            "Path = bin\\cloudflared.exe\n"
+            "Size = 54166424\n"
+            "Packed Size = \n"
+            "\n"
+            "Path = runtime\\ComfyUI\\models\\my model.bin\n"
+            "Size = 456\n"
+            "Packed Size = \n"
         )
 
+        members = parse_archive_members(("7z", "7z.exe"), listing)
         self.assertEqual(
-            parse_archive_members(("7z", "7z.exe"), listing),
-            ["runtime/python/python.exe", "runtime/ComfyUI/models/my model.bin"],
+            members,
+            [
+                "runtime/python/python.exe",
+                "runtime/ComfyUI/main.py",
+                ".venv/Lib/site-packages/torch/__init__.py",
+                "bin/cloudflared.exe",
+                "runtime/ComfyUI/models/my model.bin",
+            ],
         )
+        self.assertEqual(missing_archive_entries(members), [])
 
     def test_sha256_sidecar_is_parsed_and_verified(self):
         with tempfile.TemporaryDirectory() as tmp:

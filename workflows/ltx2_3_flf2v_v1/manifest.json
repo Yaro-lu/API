@@ -1,0 +1,47 @@
+{
+  "id": "ltx2_3_flf2v_v1",
+  "name": "LTX-2.3 Keyframe Interpolation",
+  "type": "video.first_last_to_video",
+  "engine": "comfyui",
+  "version": "1.0.0",
+  "capability": "first_last_frame",
+  "model_group": "LTX-2.3",
+  "description": "高质量关键帧插值：用首帧和尾帧生成带同步音频的平滑过渡视频，适合高显存设备",
+  "input_schema": {
+    "summary": "上传首帧和尾帧，填写场景、镜头及声音提示词后生成插值视频。",
+    "required": [
+      "prompt",
+      "start_image",
+      "end_image"
+    ],
+    "optional": [
+      "negative_prompt",
+      "width",
+      "height",
+      "duration",
+      "fps",
+      "frames",
+      "seed"
+    ],
+    "inputs": [
+      {
+        "name": "prompt",
+        "type": "text",
+        "label": "场景、镜头与声音提示词",
+        "required": true
+      },
+      {
+        "name": "start_image",
+        "type": "image",
+        "label": "首帧图片",
+        "required": true
+      },
+      {
+        "name": "end_image",
+        "type": "image",
+        "label": "尾帧图片",
+        "required": true
+      }
+    ]
+  }
+}

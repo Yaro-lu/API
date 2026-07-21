@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "repository_url": "https://github.com/Comfy-Org/ComfyUI",
+  "latest_release_url": "https://api.github.com/repos/Comfy-Org/ComfyUI/releases/latest",
+  "pypi_index_url": "https://pypi.org/simple",
+  "zipball_host": "api.github.com",
+  "download_redirect_hosts": [
+    "api.github.com",
+    "codeload.github.com"
+  ],
+  "required_core_paths": [
+    "main.py",
+    "requirements.txt",
+    "pyproject.toml",
+    "comfyui_version.py",
+    "LICENSE"
+  ],
+  "protected_paths": [
+    ".git",
+    ".venv",
+    "venv",
+    "models",
+    "custom_nodes",
+    "extra_model_paths.yaml",
+    "user",
+    "input",
+    "inputs",
+    "output",
+    "outputs",
+    "temp",
+    "cache",
+    "logs",
+    "tasks"
+  ],
+  "overlay_packages": [
+    "comfyui-frontend-package",
+    "comfyui-workflow-templates",
+    "comfyui-embedded-docs",
+    "comfy-kitchen",
+    "comfy-aimdo"
+  ],
+  "overlay_transitive_prefixes": [
+    "comfyui-workflow-templates-"
+  ],
+  "blocked_runtime_packages": [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "xformers",
+    "triton"
+  ],
+  "blocked_package_prefixes": [
+    "nvidia-",
+    "cuda-"
+  ],
+  "max_release_json_bytes": 1048576,
+  "max_archive_bytes": 1073741824,
+  "max_archive_members": 30000,
+  "max_member_bytes": 536870912,
+  "max_extracted_bytes": 3221225472
+}

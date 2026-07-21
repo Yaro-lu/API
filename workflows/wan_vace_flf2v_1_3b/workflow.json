@@ -1,0 +1,326 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "wan2.1_vace_1.3B_fp16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Wan2.1 VACE 1.3B"
+    }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load UMT5"
+    }
+  },
+  "3": {
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Wan VAE"
+    }
+  },
+  "4": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，水印，画面静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋，残缺，多余的手指，画得不好的手部，画得不好的脸部，畸形，毁容，肢体变形，手指融合，杂乱的背景，三条腿，倒着走",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "image": "start_frame.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Start Frame"
+    }
+  },
+  "7": {
+    "inputs": {
+      "image": "end_frame.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load End Frame"
+    }
+  },
+  "8": {
+    "inputs": {
+      "value": 1.0,
+      "width": 480,
+      "height": 832
+    },
+    "class_type": "SolidMask",
+    "_meta": {
+      "title": "Transition Mask"
+    }
+  },
+  "9": {
+    "inputs": {
+      "mask": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "MaskToImage",
+    "_meta": {
+      "title": "Transition Mask Image"
+    }
+  },
+  "10": {
+    "inputs": {
+      "image": [
+        "9",
+        0
+      ],
+      "amount": 47
+    },
+    "class_type": "RepeatImageBatch",
+    "_meta": {
+      "title": "Repeat Transition Frames (length - 2)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "images.image0": [
+        "6",
+        0
+      ],
+      "images.image1": [
+        "10",
+        0
+      ],
+      "images.image2": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "BatchImagesNode",
+    "_meta": {
+      "title": "First + Transition + Last Frames"
+    }
+  },
+  "12": {
+    "inputs": {
+      "value": 0.0,
+      "width": 480,
+      "height": 832
+    },
+    "class_type": "SolidMask",
+    "_meta": {
+      "title": "Locked Frame Mask"
+    }
+  },
+  "13": {
+    "inputs": {
+      "mask": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "MaskToImage",
+    "_meta": {
+      "title": "Locked Frame Mask Image"
+    }
+  },
+  "14": {
+    "inputs": {
+      "images.image0": [
+        "13",
+        0
+      ],
+      "images.image1": [
+        "10",
+        0
+      ],
+      "images.image2": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "BatchImagesNode",
+    "_meta": {
+      "title": "First/Last Control Mask Batch"
+    }
+  },
+  "15": {
+    "inputs": {
+      "image": [
+        "14",
+        0
+      ],
+      "channel": "red"
+    },
+    "class_type": "ImageToMask",
+    "_meta": {
+      "title": "VACE Control Masks"
+    }
+  },
+  "16": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "shift": 8.0
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "Wan Model Sampling"
+    }
+  },
+  "17": {
+    "inputs": {
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ],
+      "width": 480,
+      "height": 832,
+      "length": 49,
+      "batch_size": 1,
+      "strength": 1.0,
+      "control_video": [
+        "11",
+        0
+      ],
+      "control_masks": [
+        "15",
+        0
+      ]
+    },
+    "class_type": "WanVaceToVideo",
+    "_meta": {
+      "title": "Wan VACE First-Last Frame Conditioning"
+    }
+  },
+  "18": {
+    "inputs": {
+      "model": [
+        "16",
+        0
+      ],
+      "positive": [
+        "17",
+        0
+      ],
+      "negative": [
+        "17",
+        1
+      ],
+      "latent_image": [
+        "17",
+        2
+      ],
+      "seed": 0,
+      "control_after_generate": "randomize",
+      "steps": 20,
+      "cfg": 6.0,
+      "sampler_name": "uni_pc",
+      "scheduler": "simple",
+      "denoise": 1.0
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "VACE Sampler"
+    }
+  },
+  "19": {
+    "inputs": {
+      "samples": [
+        "18",
+        0
+      ],
+      "trim_amount": [
+        "17",
+        3
+      ]
+    },
+    "class_type": "TrimVideoLatent",
+    "_meta": {
+      "title": "Trim Reference Latent"
+    }
+  },
+  "20": {
+    "inputs": {
+      "samples": [
+        "19",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "Decode Video"
+    }
+  },
+  "21": {
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ],
+      "fps": 16.0,
+      "bit_depth": 8
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Create Video"
+    }
+  },
+  "22": {
+    "inputs": {
+      "filename_prefix": "video/lingjing_vace_flf2v",
+      "format": "auto",
+      "codec": "h264",
+      "video": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "Save Video"
+    }
+  }
+}

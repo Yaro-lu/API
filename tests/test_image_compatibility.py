@@ -204,6 +204,11 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         (video_workflow_dir / "workflow.json").write_text(
             json.dumps(
                 {
+                    "5": {
+                        "class_type": "CLIPTextEncode",
+                        "inputs": {"text": "默认负面提示词"},
+                        "_meta": {"title": "CLIP Text Encode (Negative Prompt)"},
+                    },
                     "9": {
                         "class_type": "LoadImage",
                         "inputs": {"image": "start_frame.png", "upload": "image"},
@@ -215,8 +220,12 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         "_meta": {"title": "Load End Frame"},
                     },
                     "14": {
-                        "class_type": "WanFirstLastFrameToVideo",
-                        "inputs": {"length": 33, "width": 720, "height": 1280},
+                        "class_type": "WanVaceToVideo",
+                        "inputs": {"length": 49, "width": 480, "height": 832},
+                    },
+                    "19": {
+                        "class_type": "RepeatImageBatch",
+                        "inputs": {"image": ["9", 0], "amount": 47},
                     },
                     "17": {
                         "class_type": "CreateVideo",
@@ -234,7 +243,72 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             enabled=True,
             description="",
         )
-        FakeRegistry.workflow_defs = [image_workflow, text_workflow, video_workflow]
+        ltx_workflow_dir = self.base / "workflows" / "ltx2_3_flf2v_v1"
+        ltx_workflow_dir.mkdir(parents=True)
+        (ltx_workflow_dir / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "1": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "start_frame.png"},
+                        "_meta": {"title": "Load First Frame"},
+                    },
+                    "2": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "end_frame.png"},
+                        "_meta": {"title": "Load Last Frame"},
+                    },
+                    "3": {
+                        "class_type": "CLIPTextEncode",
+                        "inputs": {"text": "默认提示词"},
+                        "_meta": {"title": "CLIP Text Encode (Positive Prompt)"},
+                    },
+                    "4": {
+                        "class_type": "RandomNoise",
+                        "inputs": {"noise_seed": 0},
+                    },
+                    "5": {
+                        "class_type": "ImageScale",
+                        "inputs": {"width": 1280, "height": 720},
+                    },
+                    "6": {
+                        "class_type": "EmptyLTXVLatentVideo",
+                        "inputs": {
+                            "width": 1280,
+                            "height": 720,
+                            "length": 126,
+                        },
+                    },
+                    "7": {
+                        "class_type": "LTXVEmptyLatentAudio",
+                        "inputs": {"frames_number": 126, "frame_rate": 24},
+                    },
+                    "8": {
+                        "class_type": "LTXVConditioning",
+                        "inputs": {"frame_rate": 24},
+                    },
+                    "9": {
+                        "class_type": "CreateVideo",
+                        "inputs": {"fps": 25.0},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        ltx_workflow = SimpleNamespace(
+            id="ltx2_3_flf2v_v1",
+            name="LTX-2.3",
+            folder=ltx_workflow_dir,
+            output_type="video",
+            enabled=True,
+            description="",
+        )
+        FakeRegistry.workflow_defs = [
+            image_workflow,
+            text_workflow,
+            video_workflow,
+            ltx_workflow,
+        ]
         FakeComfyUIClient.release.clear()
         FakeComfyUIClient.started.clear()
         FakeComfyUIClient.queue_entered.clear()
@@ -373,11 +447,105 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queued["9"]["inputs"]["image"].startswith("api-input/lingjing_task_"))
         self.assertTrue(queued["10"]["inputs"]["image"].startswith("api-input/lingjing_task_"))
         self.assertEqual(queued["14"]["inputs"]["length"], 81)
-        self.assertEqual(queued["14"]["inputs"]["width"], 720)
-        self.assertEqual(queued["14"]["inputs"]["height"], 1280)
+        self.assertEqual(queued["19"]["inputs"]["amount"], 79)
+        self.assertEqual(queued["14"]["inputs"]["width"], 480)
+        self.assertEqual(queued["14"]["inputs"]["height"], 832)
         self.assertEqual(queued["17"]["inputs"]["fps"], 16.0)
+        self.assertEqual(queued["5"]["inputs"]["text"], "默认负面提示词")
         request_record = next(self.fake_config.requests_dir.glob("task_*.json"))
         self.assertNotIn("data:image", request_record.read_text(encoding="utf-8"))
+
+    async def test_vace_video_duration_keeps_latent_and_transition_batches_aligned(self):
+        frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/wan_flf2v_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "镜头缓慢横移",
+                "start_image": frame_data_url,
+                "end_image": frame_data_url,
+                "duration": 8,
+                "seed": 11,
+                "negative_prompt": "自定义负面提示词",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertEqual(queued["14"]["inputs"]["length"], 129)
+        self.assertEqual(queued["19"]["inputs"]["amount"], 127)
+        self.assertEqual(queued["17"]["inputs"]["fps"], 16.0)
+        self.assertEqual(queued["5"]["inputs"]["text"], "自定义负面提示词")
+
+    async def test_ltx_duration_and_fps_keep_video_and_audio_latents_aligned(self):
+        frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/ltx2_3_flf2v_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "镜头从首帧平滑过渡到尾帧",
+                "start_image": frame_data_url,
+                "end_image": frame_data_url,
+                "duration": 4,
+                "fps": 20,
+                "width": 960,
+                "height": 544,
+                "seed": 13,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertEqual(queued["6"]["inputs"]["length"], 81)
+        self.assertEqual(queued["7"]["inputs"]["frames_number"], 81)
+        self.assertEqual(queued["7"]["inputs"]["frame_rate"], 20)
+        self.assertEqual(queued["8"]["inputs"]["frame_rate"], 20)
+        self.assertEqual(queued["9"]["inputs"]["fps"], 20)
+        self.assertEqual(queued["5"]["inputs"]["width"], 960)
+        self.assertEqual(queued["5"]["inputs"]["height"], 544)
+        self.assertEqual(queued["6"]["inputs"]["width"], 960)
+        self.assertEqual(queued["6"]["inputs"]["height"], 544)
+        self.assertEqual(queued["3"]["inputs"]["text"], "镜头从首帧平滑过渡到尾帧")
+        self.assertEqual(queued["4"]["inputs"]["noise_seed"], 13)
+
+    async def test_ltx_explicit_frames_override_duration_and_reuse_workflow_fps(self):
+        frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/ltx2_3_flf2v_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "固定输出帧数",
+                "start_image": frame_data_url,
+                "end_image": frame_data_url,
+                "duration": 9,
+                "frames": 130,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertEqual(queued["6"]["inputs"]["length"], 130)
+        self.assertEqual(queued["7"]["inputs"]["frames_number"], 130)
+        self.assertEqual(queued["7"]["inputs"]["frame_rate"], 25)
+        self.assertEqual(queued["8"]["inputs"]["frame_rate"], 25)
+        self.assertEqual(queued["9"]["inputs"]["fps"], 25)
+
+    def test_frames_validation_accepts_only_one_to_one_thousand(self):
+        self.assertEqual(server._validated_generation_body({"frames": 1})["frames"], 1)
+        self.assertEqual(server._validated_generation_body({"frames": 1000})["frames"], 1000)
+        self.assertNotIn("frames", server._validated_generation_body({"frames": None}))
+
+        for invalid in (0, 1001, True, "not-an-integer"):
+            with self.subTest(frames=invalid):
+                with self.assertRaises(server.HTTPException) as raised:
+                    server._validated_generation_body({"frames": invalid})
+                self.assertEqual(raised.exception.status_code, 422)
 
     async def test_video_request_rejects_missing_or_fake_frames_before_upload(self):
         frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")

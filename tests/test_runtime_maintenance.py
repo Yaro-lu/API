@@ -618,6 +618,460 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         self.assertFalse(app._poll_run)
         app._complete_destroy.assert_called_once_with(popup)
 
+    def test_restarted_gui_writes_matching_runtime_ready_ack(self):
+        app = self._app()
+        operation_id = "f" * 32
+        app._pending_runtime_update_result = {
+            "operation_id": operation_id,
+            "result_code": "installed",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            main_gateway, "BASE_DIR", Path(tmp)
+        ), mock.patch.dict(
+            main_gateway.os.environ,
+            {"LINGJING_RUNTIME_UPDATE_OPERATION_ID": operation_id},
+            clear=False,
+        ):
+            app._write_runtime_restart_ack()
+            ack_path = (
+                Path(tmp)
+                / "runtime"
+                / f"runtime-update-ready-{operation_id}.json"
+            )
+            payload = json.loads(ack_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["operation_id"], operation_id)
+        self.assertEqual(payload["pid"], main_gateway.os.getpid())
+
+
+    def test_comfyui_update_task_guard_covers_all_active_states(self):
+        for status in ("reserving", "queued", "pending", "submitted", "running"):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    GatewayApp._comfyui_update_task_active(
+                        {"current_task": {"status": status}}
+                    )
+                )
+        self.assertFalse(
+            GatewayApp._comfyui_update_task_active(
+                {"current_task": {"status": "completed"}}
+            )
+        )
+
+    def test_comfyui_update_reads_live_queue_when_cached_health_is_idle(self):
+        app = self._app()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.is_running.return_value = True
+        client = mock.Mock()
+        client.get_queue_status.return_value = {
+            "queue_running": [[1, "prompt-live"]],
+            "queue_pending": [],
+        }
+
+        with mock.patch.object(main_gateway, "ComfyUIClient", return_value=client):
+            reason = app._comfyui_update_live_queue_reason()
+
+        self.assertIn("1 个", reason)
+        client.get_queue_status.assert_called_once_with()
+
+    def test_comfyui_update_rechecks_local_activity_after_api_is_stopped(self):
+        app = self._app()
+        app._comfyui_update_local_activity_reason = mock.Mock(
+            side_effect=["", "模型下载正在进行"]
+        )
+        app._comfyui_update_live_queue_reason = mock.Mock(return_value="")
+        app._stop_api_submission_for_comfyui_update = mock.Mock(return_value="")
+
+        reason = app._quiesce_comfyui_for_update()
+
+        self.assertEqual(reason, "模型下载正在进行")
+        app._stop_api_submission_for_comfyui_update.assert_called_once_with()
+        self.assertEqual(app._comfyui_update_live_queue_reason.call_count, 1)
+
+    def test_comfyui_update_rechecks_live_queue_after_api_is_stopped(self):
+        app = self._app()
+        app._comfyui_update_local_activity_reason = mock.Mock(return_value="")
+        app._comfyui_update_live_queue_reason = mock.Mock(
+            side_effect=["", "ComfyUI 队列中还有 1 个生成任务"]
+        )
+        app._stop_api_submission_for_comfyui_update = mock.Mock(return_value="")
+
+        reason = app._quiesce_comfyui_for_update()
+
+        self.assertIn("1 个", reason)
+        app._stop_api_submission_for_comfyui_update.assert_called_once_with()
+        self.assertEqual(app._comfyui_update_live_queue_reason.call_count, 2)
+
+    def test_runtime_reservation_blocks_new_workflow_and_model_maintenance(self):
+        app = self._app()
+        app._workflow_management_lock = threading.Lock()
+        app._workflow_operation_name = ""
+        app._model_transfer_lock = threading.RLock()
+        app._active_model_transfers = {}
+        app._model_import_in_progress = False
+        app._footer_label = mock.Mock()
+        app._runtime_maintenance_in_progress = True
+
+        self.assertFalse(app._begin_workflow_operation("工作流导入"))
+        self.assertFalse(
+            app._claim_model_transfer({"target": Path("models/test.safetensors")})
+        )
+        self.assertFalse(app._workflow_management_lock.locked())
+        self.assertEqual(app._active_model_transfers, {})
+
+    def test_startup_preconsumes_incomplete_results_and_blocks_backend(self):
+        app = self._app()
+        app._footer_label = mock.Mock()
+        app.after = mock.Mock()
+        runtime_result = {
+            "success": False,
+            "result_code": "install_failed_rollback_incomplete",
+            "message": "runtime locked",
+        }
+        comfy_result = {
+            "success": False,
+            "status": "rollback_incomplete",
+            "error": "core locked",
+        }
+        with (
+            mock.patch.object(
+                main_gateway,
+                "recover_interrupted_update",
+                return_value={"status": "no_recovery_needed", "success": True},
+            ) as recover,
+            mock.patch.object(
+                main_gateway, "consume_runtime_update_result", return_value=runtime_result
+            ) as consume_runtime,
+            mock.patch.object(
+                main_gateway, "consume_comfyui_update_result", return_value=comfy_result
+            ) as consume_comfy,
+            mock.patch.object(main_gateway.messagebox, "showerror") as showerror,
+        ):
+            app._capture_startup_update_results()
+            self.assertFalse(app._request_backend_start("启动后台"))
+            app._show_runtime_update_result()
+            app._show_comfyui_update_result()
+            app._show_runtime_update_result()
+            app._show_comfyui_update_result()
+
+        self.assertTrue(app._runtime_start_blocked)
+        recover.assert_called_once_with(main_gateway.BASE_DIR)
+        consume_runtime.assert_called_once_with(main_gateway.BASE_DIR)
+        consume_comfy.assert_called_once_with(main_gateway.BASE_DIR)
+        self.assertEqual(showerror.call_count, 2)
+
+    def test_incomplete_interrupted_recovery_blocks_startup_and_prompts_repair(self):
+        app = self._app()
+        recovery = {
+            "status": "recovery_incomplete",
+            "success": False,
+            "message": "旧核心仍被占用",
+            "errors": ["backup locked"],
+        }
+        with (
+            mock.patch.object(
+                main_gateway, "recover_interrupted_update", return_value=recovery
+            ) as recover,
+            mock.patch.object(
+                main_gateway, "consume_runtime_update_result", return_value=None
+            ),
+            mock.patch.object(
+                main_gateway, "consume_comfyui_update_result", return_value=None
+            ),
+            mock.patch.object(main_gateway.messagebox, "showerror") as showerror,
+        ):
+            app._capture_startup_update_results()
+            app._show_comfyui_recovery_result()
+            app._show_comfyui_recovery_result()
+
+        self.assertTrue(app._runtime_start_blocked)
+        recover.assert_called_once_with(main_gateway.BASE_DIR)
+        showerror.assert_called_once()
+        self.assertIn("先修复运行环境", showerror.call_args.args[1])
+
+    def test_completed_interrupted_recovery_allows_startup_and_prompts_once(self):
+        app = self._app()
+        recovery = {
+            "status": "recovered",
+            "success": True,
+            "message": "旧核心已安全恢复",
+        }
+        with (
+            mock.patch.object(
+                main_gateway, "recover_interrupted_update", return_value=recovery
+            ),
+            mock.patch.object(
+                main_gateway, "consume_runtime_update_result", return_value=None
+            ),
+            mock.patch.object(
+                main_gateway, "consume_comfyui_update_result", return_value=None
+            ),
+            mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo,
+        ):
+            app._capture_startup_update_results()
+            app._show_comfyui_recovery_result()
+            app._show_comfyui_recovery_result()
+
+        self.assertFalse(app._runtime_start_blocked)
+        showinfo.assert_called_once()
+        self.assertIn("旧核心已安全恢复", showinfo.call_args.args[1])
+
+    def test_active_detached_recovery_blocks_backend_prompts_and_closes_once(self):
+        app = self._app()
+        app._anim_running = True
+        app._heartbeat_run = True
+        app._poll_run = True
+        app._footer_label = mock.Mock()
+        app.after = lambda _delay, callback: callback()
+        app._complete_destroy = mock.Mock()
+        app._process_supervisor = mock.Mock()
+        recovery = {
+            "status": "recovery_in_progress",
+            "success": False,
+            "in_progress": True,
+            "message": "ComfyUI 更新仍在进行",
+        }
+        with (
+            mock.patch.object(
+                main_gateway, "recover_interrupted_update", return_value=recovery
+            ),
+            mock.patch.object(
+                main_gateway, "consume_runtime_update_result", return_value=None
+            ),
+            mock.patch.object(
+                main_gateway, "consume_comfyui_update_result", return_value=None
+            ),
+            mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo,
+            mock.patch.object(main_gateway, "_release_instance_lock") as release_lock,
+        ):
+            app._capture_startup_update_results()
+            self.assertFalse(app._request_backend_start("启动后台"))
+            app._show_comfyui_recovery_result()
+            app._show_comfyui_recovery_result()
+
+        self.assertTrue(app._runtime_start_blocked)
+        self.assertTrue(app._shutting_down)
+        showinfo.assert_called_once()
+        self.assertIn("后台更新仍在进行", showinfo.call_args.args[1])
+        self.assertIn("若未重启再手动打开", showinfo.call_args.args[1])
+        release_lock.assert_called_once_with()
+        app._complete_destroy.assert_called_once_with()
+        app._process_supervisor.shutdown_all.assert_not_called()
+
+    def test_overlay_timeout_keeps_staging_when_process_cannot_be_stopped(self):
+        app = self._app()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.run_observed.side_effect = RuntimeError(
+            "后台进程超时后无法安全停止"
+        )
+        app._process_supervisor.is_running.return_value = True
+
+        with self.assertRaisesRegex(
+            main_gateway._ComfyUIOverlayProcessStillRunning,
+            "保留暂存",
+        ):
+            app._run_comfyui_overlay_prepare(["python", "-c", "fixed"])
+
+        app._process_supervisor.run.assert_not_called()
+
+    def test_comfyui_update_result_reports_automatic_rollback(self):
+        app = self._app()
+        result = {
+            "status": "failed_rolled_back",
+            "success": False,
+            "rolled_back": True,
+            "error": "probe failed",
+            "cleanup_warnings": ["备份目录仍被占用"],
+            "rollback_errors": ["回滚检查提示"],
+            "manifest_cleanup_error": "清单待下次启动清理",
+        }
+        with (
+            mock.patch.object(
+                main_gateway,
+                "consume_comfyui_update_result",
+                return_value=result,
+            ),
+            mock.patch.object(main_gateway.messagebox, "showerror") as showerror,
+        ):
+            app._show_comfyui_update_result()
+
+        title, message = showerror.call_args.args
+        self.assertEqual(title, "ComfyUI 更新失败")
+        self.assertIn("旧版本已自动恢复", message)
+        self.assertIn("probe failed", message)
+        self.assertIn("备份目录仍被占用", message)
+        self.assertIn("回滚检查提示", message)
+        self.assertIn("清单待下次启动清理", message)
+
+    def test_comfyui_update_success_surfaces_bounded_cleanup_warnings(self):
+        app = self._app()
+        result = {
+            "status": "installed",
+            "success": True,
+            "cleanup_warnings": ["旧备份仍被占用", "x" * 5000],
+            "rollback_errors": ["回滚日志提示"],
+            "manifest_cleanup_error": "清单文件稍后删除",
+        }
+        with (
+            mock.patch.object(
+                main_gateway,
+                "consume_comfyui_update_result",
+                return_value=result,
+            ),
+            mock.patch.object(main_gateway.messagebox, "showwarning") as showwarning,
+            mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo,
+        ):
+            app._show_comfyui_update_result()
+
+        showinfo.assert_not_called()
+        title, message = showwarning.call_args.args
+        self.assertIn("有提示", title)
+        self.assertIn("旧备份仍被占用", message)
+        self.assertIn("回滚日志提示", message)
+        self.assertIn("清单文件稍后删除", message)
+        self.assertLess(len(message), 2400)
+
+    def test_comfyui_update_handoff_uses_parent_wait_and_ready_manifest(self):
+        app = self._app()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.is_running.side_effect = lambda role: role == "comfyui"
+        app._stop_runtime_for_maintenance = mock.Mock(return_value="")
+        app._quiesce_comfyui_for_update = mock.Mock(return_value="")
+        app._exit_for_runtime_update = mock.Mock()
+        app._post_to_ui = lambda callback, delay=0: (callback(), True)[1]
+        app.after = mock.Mock()
+
+        popup = mock.MagicMock()
+        popup.winfo_exists.return_value = True
+        progress_var = mock.Mock()
+        progress_var.get.return_value = 0
+        dialog = {
+            "popup": popup,
+            "progress": mock.Mock(),
+            "progress_var": progress_var,
+            "stage_var": mock.Mock(),
+            "stage_label": mock.Mock(),
+            "detail_var": mock.Mock(),
+            "detail_label": mock.Mock(),
+        }
+        app._create_runtime_progress_dialog = mock.Mock(return_value=dialog)
+
+        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+            base = Path(tmp)
+            live = base / "runtime" / "ComfyUI"
+            live.mkdir(parents=True)
+            (live / "comfyui_version.py").write_text(
+                '__version__ = "0.27.0"\n',
+                encoding="utf-8",
+            )
+            staging = base / f".comfyui-update-staging-{'a' * 32}"
+            staging.mkdir()
+            prepared = mock.Mock()
+            prepared.status = "ready"
+            prepared.staging_core = staging
+            prepared.dependency_overlay = None
+            prepared.overlay_requirements_file = None
+            prepared.overlay_command = ()
+            prepared.release_metadata = {"version": "0.28.0"}
+            prepared.dependency_plan.reasons = ()
+            prepared.to_manifest.return_value = {
+                "schema_version": 1,
+                "status": "ready",
+                "base_dir": str(base),
+                "staging_core": str(staging),
+                "dependency_overlay": "",
+                "release_metadata": {
+                    "repository_url": "https://github.com/Comfy-Org/ComfyUI",
+                    "tag_name": "v0.28.0",
+                    "version": "0.28.0",
+                    "release_id": 1,
+                    "archive_sha256": "b" * 64,
+                },
+            }
+
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(
+                    main_gateway,
+                    "prepare_comfyui_update",
+                    return_value=prepared,
+                ),
+                mock.patch.object(
+                    main_gateway,
+                    "launch_comfyui_update_worker",
+                    return_value=mock.sentinel.worker,
+                ) as launch_worker,
+                mock.patch.object(main_gateway.os, "getpid", return_value=4321),
+                mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+            ):
+                app._start_comfyui_update()
+
+            manifest = base / f".comfyui-update-manifest-{'a' * 32}.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "ready")
+            launch_worker.assert_called_once_with(
+                manifest,
+                restart_client=base / "runtime" / "python" / "pythonw.exe",
+                parent_pid=4321,
+            )
+            app._exit_for_runtime_update.assert_called_once_with(popup)
+            self.assertTrue(app._runtime_maintenance_in_progress)
+
+            with mock.patch.object(main_gateway, "BASE_DIR", base):
+                app._cleanup_comfyui_update_paths(prepared, manifest)
+            self.assertFalse(manifest.exists())
+            self.assertFalse(staging.exists())
+
+    def test_comfyui_update_race_cancellation_restores_services(self):
+        app = self._app()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.is_running.side_effect = lambda role: role in {
+            "comfyui",
+            "api",
+        }
+        app._quiesce_comfyui_for_update = mock.Mock(
+            return_value="ComfyUI 队列中还有 1 个生成任务"
+        )
+        app._stop_runtime_for_maintenance = mock.Mock(return_value="")
+        app._end_runtime_maintenance = mock.Mock()
+        app._post_to_ui = lambda callback, delay=0: (callback(), True)[1]
+        app.after = mock.Mock()
+        app._set_comfyui_update_progress = mock.Mock()
+        app._stop_runtime_progress_activity = mock.Mock()
+        popup = mock.MagicMock()
+        dialog = {
+            "popup": popup,
+            "progress": mock.Mock(),
+            "progress_var": mock.Mock(),
+            "stage_var": mock.Mock(),
+            "stage_label": mock.Mock(),
+            "detail_var": mock.Mock(),
+            "detail_label": mock.Mock(),
+        }
+        app._create_runtime_progress_dialog = mock.Mock(return_value=dialog)
+
+        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+            base = Path(tmp)
+            live = base / "runtime" / "ComfyUI"
+            live.mkdir(parents=True)
+            (live / "comfyui_version.py").write_text(
+                '__version__ = "0.27.0"\n', encoding="utf-8"
+            )
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(main_gateway, "prepare_comfyui_update") as prepare,
+                mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo,
+                mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+            ):
+                app._start_comfyui_update()
+
+        app._stop_runtime_for_maintenance.assert_not_called()
+        prepare.assert_not_called()
+        app._end_runtime_maintenance.assert_called_once_with(restart=True)
+        self.assertIn("暂不能更新", showinfo.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

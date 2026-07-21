@@ -1,0 +1,10 @@
+{
+  "id": "wan_vace_flf2v_1_3b",
+  "name": "WAN2.1 VACE 1.3B",
+  "type": "video.first_last_to_video",
+  "engine": "comfyui",
+  "version": "1.1.0",
+  "capability": "first_last_frame",
+  "model_group": "Wan2.1",
+  "description": "轻量 480P 首帧+尾帧转视频工作流，面向 8GB 及以上显存"
+}

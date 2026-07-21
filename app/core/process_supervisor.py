@@ -162,7 +162,17 @@ class ProcessSupervisor:
                 raise RuntimeError("客户端正在退出，已拒绝启动新的后台进程")
             if os.name == "nt":
                 flags = int(popen_kwargs.pop("creationflags", 0))
-                popen_kwargs["creationflags"] = flags | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+                incompatible = (
+                    getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                )
+                if not flags & incompatible:
+                    flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                popen_kwargs["creationflags"] = flags | getattr(
+                    subprocess,
+                    "CREATE_SUSPENDED",
+                    0x00000004,
+                )
             process = subprocess.Popen(args, **popen_kwargs)
             record = None
             try:
@@ -216,6 +226,130 @@ class ProcessSupervisor:
         finally:
             if record is not None and process.poll() is not None:
                 self._release_completed(record)
+
+        completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+        if check:
+            completed.check_returncode()
+        return completed
+
+    def run_observed(
+        self,
+        role: str,
+        args,
+        *,
+        timeout=None,
+        check=False,
+        tick_interval=0.5,
+        on_stdout=None,
+        on_stderr=None,
+        on_tick=None,
+        **popen_kwargs,
+    ):
+        """Run a managed binary process while streaming output and liveness ticks."""
+        if any(
+            popen_kwargs.get(name)
+            for name in ("text", "universal_newlines", "encoding", "errors")
+        ):
+            raise ValueError("run_observed only supports binary subprocess output")
+        if popen_kwargs.get("stdout") is not None or popen_kwargs.get("stderr") is not None:
+            raise ValueError("run_observed manages stdout/stderr pipes")
+
+        interval = max(0.02, float(tick_interval or 0.5))
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+        process = self.launch(role, args, **popen_kwargs)
+        record = self._record_for_process(process)
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        reader_errors: list[BaseException] = []
+
+        def read_stream(stream, chunks, callback):
+            try:
+                read_chunk = getattr(stream, "read1", stream.read)
+                while True:
+                    chunk = read_chunk(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if callback is not None:
+                        try:
+                            callback(chunk)
+                        except Exception:
+                            pass
+            except BaseException as exc:
+                reader_errors.append(exc)
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=(process.stdout, stdout_chunks, on_stdout),
+                name=f"{role}-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=(process.stderr, stderr_chunks, on_stderr),
+                name=f"{role}-stderr",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        started_at = time.monotonic()
+        next_tick_at = started_at
+        timed_out = False
+        termination_error = ""
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                elapsed = max(0.0, now - started_at)
+                if timeout is not None and elapsed >= float(timeout):
+                    timed_out = True
+                    if record is not None:
+                        termination_error = self._terminate_one(record, timeout=3.0)
+                    else:
+                        try:
+                            process.kill()
+                            process.wait(timeout=3)
+                        except Exception as exc:
+                            termination_error = str(exc)
+                    break
+                if on_tick is not None and now >= next_tick_at:
+                    try:
+                        on_tick(elapsed)
+                    except Exception:
+                        pass
+                    next_tick_at = now + interval
+                time.sleep(min(0.05, interval))
+        finally:
+            process_finished = process.poll() is not None
+            reader_join_timeout = 3 if process_finished else 0
+            for reader in readers:
+                reader.join(timeout=reader_join_timeout)
+            if process_finished:
+                # ``Popen`` does not close PIPE handles for callers that read
+                # them directly.  Once the child has exited and both readers
+                # have consumed EOF, close our copies explicitly so repeated
+                # extraction checks cannot leak Windows handles.
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+            if record is not None and process_finished:
+                self._release_completed(record)
+
+        stdout = b"".join(stdout_chunks)
+        stderr = b"".join(stderr_chunks)
+        if timed_out:
+            if process.poll() is None:
+                detail = termination_error or f"PID {process.pid} 仍在运行"
+                raise RuntimeError(f"后台进程超时后无法安全停止：{detail}")
+            raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
+        if reader_errors:
+            raise RuntimeError(f"读取后台进程输出失败: {reader_errors[0]}")
 
         completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
         if check:
@@ -433,6 +567,14 @@ class ProcessSupervisor:
             process.wait(timeout=0.5)
         except Exception:
             pass
+        if process.poll() is not None:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(process, stream_name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
     def _terminate_without_job(self, record: OwnedProcess, timeout: float) -> str:
         """Fallback using already-owned process objects, never a raw PID kill."""

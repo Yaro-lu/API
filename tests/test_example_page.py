@@ -79,6 +79,17 @@ class LocalExamplePageContractTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, page)
 
+    def test_image_flow_exposes_optional_reference_image_for_capable_models(self):
+        page = self.page()
+        for marker in (
+            'id="imageReference"',
+            'id="imageReferenceField"',
+            'modelAcceptsInput(model, "image")',
+            "body.image = referenceImage",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, page)
+
     def test_authenticated_follow_up_urls_are_pinned_to_client_origin(self):
         page = self.page()
         self.assertIn("if (target.origin === base.origin) return target.href", page)

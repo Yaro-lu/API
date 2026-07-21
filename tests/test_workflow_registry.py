@@ -4,10 +4,38 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.workflow_registry import WorkflowRegistry
+from app.workflow_registry import (
+    WorkflowRegistry,
+    merge_workflow_catalog,
+    read_local_workflow_catalog,
+)
 
 
 class WorkflowRegistryTests(unittest.TestCase):
+    def test_catalog_merge_keeps_local_workflows_and_overlays_live_status(self):
+        local = [
+            {
+                "id": "image-local",
+                "name": "本地图片",
+                "type": "image.text_to_image",
+                "capability": "text_to_image",
+                "model_group": "Image Model",
+            },
+            {"id": "missing-local", "name": "缺模型也要显示"},
+        ]
+        remote = [
+            {"id": "image-local", "name": "", "available": False, "missing_models": ["a.safetensors"]},
+            {"id": "remote-only", "name": "用户工作流", "available": True},
+        ]
+
+        merged = merge_workflow_catalog(local, remote)
+
+        self.assertEqual([item["id"] for item in merged], ["image-local", "missing-local", "remote-only"])
+        self.assertEqual(merged[0]["name"], "本地图片")
+        self.assertEqual(merged[0]["capability"], "text_to_image")
+        self.assertFalse(merged[0]["available"])
+        self.assertEqual(merged[0]["missing_models"], ["a.safetensors"])
+
     @staticmethod
     def _workflow(root: Path, workflow_id: str, *, enabled=True, output_type="image") -> Path:
         folder = root / workflow_id
@@ -143,6 +171,72 @@ class WorkflowRegistryTests(unittest.TestCase):
 
             self.assertEqual(config.read_bytes(), previous)
             self.assertEqual(list(config.parent.glob(".workflow_config.json.*.tmp")), [])
+
+    def test_manifest_metadata_survives_scan_save_and_reload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            workflows = base / "workflows"
+            workflows.mkdir()
+            folder = self._workflow(workflows, "klein")
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "type": "image.text_image_to_image",
+                    "capability": "text_image_to_image",
+                    "model_group": "Flux2 Klein 4B",
+                    "workflow_variants": {
+                        "text_to_image": "workflow_t2i.json",
+                        "image_to_image": "workflow.json",
+                        "unsafe": "../outside.json",
+                    },
+                }
+            )
+            (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (folder / "workflow_t2i.json").write_text("{}", encoding="utf-8")
+            config = base / "runtime" / "workflow_config.json"
+
+            registry = WorkflowRegistry(config, workflows)
+            reloaded = WorkflowRegistry(config, workflows)
+            workflow = reloaded.get("klein")
+
+            self.assertEqual(workflow.workflow_type, "image.text_image_to_image")
+            self.assertEqual(workflow.capability, "text_image_to_image")
+            self.assertEqual(workflow.model_group, "Flux2 Klein 4B")
+            self.assertEqual(
+                workflow.workflow_variants,
+                {
+                    "text_to_image": "workflow_t2i.json",
+                    "image_to_image": "workflow.json",
+                },
+            )
+
+    def test_local_catalog_lists_missing_model_workflows_without_writing_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            workflows = base / "workflows"
+            workflows.mkdir()
+            folder = self._workflow(workflows, "missing_model")
+            (folder / "workflow.json").write_text(
+                json.dumps(
+                    {
+                        "1": {
+                            "class_type": "UNETLoader",
+                            "inputs": {"unet_name": "not-installed.safetensors"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = base / "runtime" / "workflow_config.json"
+
+            records = read_local_workflow_catalog(workflows, config)
+
+            self.assertEqual([item["id"] for item in records], ["missing_model"])
+            self.assertEqual(
+                records[0]["dependencies"]["models"][0]["name"],
+                "not-installed.safetensors",
+            )
+            self.assertFalse(config.exists())
 
 
 if __name__ == "__main__":

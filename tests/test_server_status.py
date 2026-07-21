@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -217,6 +218,95 @@ class ServerStatusTests(unittest.TestCase):
         self.assertIsNone(first)
         self.assertEqual(second, {"SaveImage", "LoadImage"})
         self.assertEqual(get.call_count, 2)
+
+    def test_image_edit_type_and_metadata_are_published(self):
+        workflow = WorkflowDef(
+            id="klein",
+            name="Klein",
+            output_type="image",
+            workflow_type="image.text_image_to_image",
+            capability="text_image_to_image",
+            model_group="Flux2 Klein 4B",
+            workflow_variants={
+                "text_to_image": "workflow_t2i.json",
+                "image_to_image": "workflow.json",
+            },
+        )
+        self.assertEqual(
+            server._workflow_type(
+                workflow.id,
+                workflow.output_type,
+                workflow.workflow_type,
+            ),
+            "image_edit",
+        )
+
+    def test_workflow_variant_selects_t2i_without_image_and_edit_with_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "klein"
+            folder.mkdir()
+            (folder / "workflow.json").write_text("{}", encoding="utf-8")
+            (folder / "workflow_t2i.json").write_text("{}", encoding="utf-8")
+            workflow = WorkflowDef(
+                id="klein",
+                folder_name="klein",
+                workflow_variants={
+                    "text_to_image": "workflow_t2i.json",
+                    "image_to_image": "workflow.json",
+                },
+            )
+            workflow._workflows_dir = folder.parent
+
+            self.assertEqual(
+                server._workflow_json_path_for_body(workflow, {}).name,
+                "workflow_t2i.json",
+            )
+            self.assertEqual(
+                server._workflow_json_path_for_body(workflow, {"image": "data"}).name,
+                "workflow.json",
+            )
+
+    def test_generic_reference_image_upload_is_bound_to_load_image(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"test"
+        body = {
+            "image": "data:image/png;base64,"
+            + base64.b64encode(png).decode("ascii")
+        }
+        workflow = {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": "input.png"},
+                "_meta": {"title": "Load Input Image"},
+            }
+        }
+        client = mock.Mock()
+        client.upload_input_image.return_value = "uploaded.png"
+
+        server._upload_workflow_images(client, workflow, body, "task")
+
+        self.assertEqual(workflow["1"]["inputs"]["image"], "uploaded.png")
+        client.upload_input_image.assert_called_once()
+
+    def test_workflow_steps_are_marked_explicit_only_when_supplied(self):
+        implicit = server._validated_generation_body({"prompt": "hello"})
+        explicit = server._validated_generation_body(
+            {"prompt": "hello", "steps": 8}
+        )
+        self.assertFalse(implicit["_steps_explicit"])
+        self.assertEqual(implicit["steps"], 20)
+        self.assertTrue(explicit["_steps_explicit"])
+        self.assertEqual(explicit["steps"], 8)
+
+    def test_manual_sigmas_report_the_real_distilled_step_count(self):
+        workflow = {
+            "1": {
+                "class_type": "ManualSigmas",
+                "inputs": {
+                    "sigmas": "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+                },
+            }
+        }
+        self.assertEqual(server._workflow_step_count(workflow), 8)
 
 
 if __name__ == "__main__":

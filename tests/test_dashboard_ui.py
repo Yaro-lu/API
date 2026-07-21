@@ -20,6 +20,61 @@ PAGE_IDS = (
 )
 
 
+class ManualAfterScheduler:
+    def __init__(self):
+        self.callbacks = {}
+        self.cancelled = []
+        self._next_id = 0
+
+    def after(self, delay, callback):
+        if delay <= 0:
+            callback()
+            return None
+        self._next_id += 1
+        callback_id = f"after-{self._next_id}"
+        self.callbacks[callback_id] = callback
+        return callback_id
+
+    def after_cancel(self, callback_id):
+        self.cancelled.append(callback_id)
+        self.callbacks.pop(callback_id, None)
+
+    def pop_next(self):
+        callback_id = next(iter(self.callbacks))
+        return callback_id, self.callbacks.pop(callback_id)
+
+
+class FakeVariable:
+    def __init__(self, value=None):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeWidget:
+    def __init__(self, **options):
+        self.options = dict(options)
+        self.started = False
+
+    def config(self, **options):
+        self.options.update(options)
+
+    configure = config
+
+    def cget(self, name):
+        return self.options.get(name)
+
+    def start(self, _interval=None):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+
 class DashboardShellTests(unittest.TestCase):
     @staticmethod
     def _find_by_text(root, text):
@@ -65,6 +120,20 @@ class DashboardShellTests(unittest.TestCase):
         for child in children:
             yield from DashboardShellTests._walk_widgets(child)
 
+    @staticmethod
+    def _fake_runtime_dialog():
+        popup = mock.Mock()
+        popup.winfo_exists.return_value = True
+        return {
+            "popup": popup,
+            "progress": FakeWidget(mode="determinate"),
+            "progress_var": FakeVariable(0),
+            "stage_var": FakeVariable(""),
+            "stage_label": FakeWidget(fg=C["text2"]),
+            "detail_var": FakeVariable(""),
+            "detail_label": FakeWidget(fg=C["muted"]),
+        }
+
     def test_dashboard_shell_builds_and_switches_all_pages(self):
         """The static shell must not require backend threads to render."""
         with (
@@ -80,6 +149,20 @@ class DashboardShellTests(unittest.TestCase):
                 self.assertIsNotNone(self._find_by_text(app._sidebar, "灵境造片厂"))
                 self.assertEqual(tuple(app._pages), PAGE_IDS)
                 self.assertEqual(tuple(app._nav_buttons), PAGE_IDS)
+                self.assertGreaterEqual(
+                    len(app._wf_rows),
+                    6,
+                    "Bundled workflows must remain visible before the API starts",
+                )
+                overview_text = set(self._all_text(app._wf_frame))
+                for label in ("文/图生图", "文生图", "首尾帧", "文本模型"):
+                    self.assertTrue(
+                        any(text.endswith(label) for text in overview_text),
+                        label,
+                    )
+                self.assertTrue(
+                    any(text.startswith("缺少 ") and text.endswith(" 个模型") for text in overview_text)
+                )
                 self.assertEqual(
                     tuple(app._light_groups),
                     ("server", "env", "comfyui", "tunnel", "api"),
@@ -172,6 +255,110 @@ class DashboardShellTests(unittest.TestCase):
                 self.assertIn("模型维护", texts)
                 self.assertIn("导入已有模型", texts)
                 self.assertIn("重新检查", texts)
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_settings_page_exposes_comfyui_update_and_runtime_repair(self):
+        update_comfyui = mock.Mock()
+        repair_runtime = mock.Mock()
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+            mock.patch.object(
+                GatewayApp,
+                "_start_comfyui_update",
+                update_comfyui,
+            ),
+            mock.patch.object(
+                GatewayApp,
+                "_show_runtime_maintenance",
+                repair_runtime,
+            ),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app._show_page("settings")
+                app.update_idletasks()
+                settings = app._pages["settings"]
+                texts = set(self._all_text(settings))
+
+                self.assertIn("环境维护", texts)
+                self.assertIn("一键更新 ComfyUI", texts)
+                self.assertIn("修复运行环境", texts)
+                self.assertIn(
+                    "只更新 ComfyUI 核心，不影响模型、自定义节点和用户数据。",
+                    texts,
+                )
+
+                self._find_by_text(settings, "一键更新 ComfyUI").invoke()
+                self._find_by_text(settings, "修复运行环境").invoke()
+                update_comfyui.assert_called_once_with()
+                repair_runtime.assert_called_once_with()
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_overview_workflow_catalog_has_a_reachable_vertical_scrollbar(self):
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app.geometry("1090x700")
+                app._last_health = {
+                    "workflows": [
+                        {
+                            "id": f"scroll_fixture_{index}",
+                            "name": f"滚动测试工作流 {index}",
+                            "enabled": True,
+                            "available": True,
+                            "output_type": "video",
+                            "dependency_status": "ready",
+                            "nodes_verified": True,
+                        }
+                        for index in range(18)
+                    ]
+                }
+                app._update_workflow_display(app._last_health)
+                app.update()
+
+                canvas = app._workflow_canvas
+                scrollbar = app._workflow_scrollbar
+                bbox = canvas.bbox("all")
+                self.assertTrue(scrollbar.winfo_ismapped())
+                self.assertEqual(
+                    str(scrollbar.cget("style")),
+                    "LingJing.Vertical.TScrollbar",
+                )
+                scrollbar_style = ttk.Style(app)
+                scrollbar_layout = repr(
+                    scrollbar_style.layout("LingJing.Vertical.TScrollbar")
+                ).lower()
+                self.assertNotIn("uparrow", scrollbar_layout)
+                self.assertNotIn("downarrow", scrollbar_layout)
+                self.assertLessEqual(
+                    int(scrollbar_style.lookup("LingJing.Vertical.TScrollbar", "width")),
+                    8,
+                )
+                self.assertTrue(str(canvas.cget("yscrollcommand")))
+                self.assertIsNotNone(bbox)
+                self.assertGreater(bbox[3] - bbox[1], canvas.winfo_height())
+
+                before = canvas.yview()
+                result = app._on_workflow_mousewheel(
+                    mock.Mock(delta=-120, num=None)
+                )
+                app.update_idletasks()
+                self.assertEqual(result, "break")
+                self.assertGreater(canvas.yview()[0], before[0])
+
+                canvas.yview_moveto(0)
+                row_child = app._workflow_scroll_content.winfo_children()[0]
+                self.assertTrue(str(row_child.bind("<MouseWheel>")))
             finally:
                 app._dashboard_pages.cancel_pending()
                 app.destroy()
@@ -313,6 +500,159 @@ class DashboardShellTests(unittest.TestCase):
             for earlier, later in zip(percentages, percentages[1:])
         ))
 
+    def test_runtime_extract_activity_updates_elapsed_and_reschedules(self):
+        app = object.__new__(GatewayApp)
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.is_running.side_effect = [False, True, True]
+        dialog = self._fake_runtime_dialog()
+        clock = {"value": 0.0}
+
+        with mock.patch.object(
+            main_gateway.time,
+            "monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            app._set_runtime_install_stage(dialog, "extract")
+            self.assertTrue(dialog["progress"].started)
+            self.assertEqual(dialog["progress"].cget("mode"), "indeterminate")
+            self.assertIn("正在启动解压进程", dialog["detail_var"].get())
+
+            clock["value"] = 1.0
+            _, first_tick = scheduler.pop_next()
+            first_tick()
+            self.assertIn("解压进程运行中", dialog["detail_var"].get())
+            self.assertIn("00:01", dialog["detail_var"].get())
+
+            clock["value"] = 2.0
+            _, second_tick = scheduler.pop_next()
+            second_tick()
+            self.assertIn("00:02", dialog["detail_var"].get())
+            self.assertEqual(len(scheduler.callbacks), 1)
+
+    def test_runtime_verify_activity_updates_elapsed_and_reschedules(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        dialog = self._fake_runtime_dialog()
+        clock = {"value": 0.0}
+
+        with mock.patch.object(
+            main_gateway.time,
+            "monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            app._set_runtime_install_stage(dialog, "verify")
+            self.assertTrue(dialog["progress"].started)
+            self.assertEqual(dialog["progress"].cget("mode"), "indeterminate")
+            self.assertIn("正在校验大文件", dialog["detail_var"].get())
+
+            clock["value"] = 1.0
+            _, first_tick = scheduler.pop_next()
+            first_tick()
+            self.assertIn("00:01", dialog["detail_var"].get())
+            self.assertEqual(len(scheduler.callbacks), 1)
+
+    def test_runtime_extract_progress_switches_to_real_percentage(self):
+        app = object.__new__(GatewayApp)
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        app._process_supervisor = mock.Mock()
+        dialog = self._fake_runtime_dialog()
+
+        with mock.patch.object(main_gateway.time, "monotonic", return_value=0.0):
+            app._set_runtime_install_stage(dialog, "extract")
+            dialog["_activity_progress_queue"].put(50)
+            _, progress_tick = scheduler.pop_next()
+            progress_tick()
+
+        self.assertFalse(dialog["progress"].started)
+        self.assertEqual(dialog["progress"].cget("mode"), "determinate")
+        self.assertEqual(dialog["progress_var"].get(), 60)
+        self.assertIn("解压进度 50%", dialog["detail_var"].get())
+        self.assertIn("00:00", dialog["detail_var"].get())
+
+    def test_runtime_activity_stale_tick_cannot_overwrite_next_stage(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        app._process_supervisor = mock.Mock()
+        dialog = self._fake_runtime_dialog()
+
+        with mock.patch.object(main_gateway.time, "monotonic", return_value=0.0):
+            app._set_runtime_install_stage(dialog, "extract")
+            callback_id, stale_tick = next(iter(scheduler.callbacks.items()))
+            app._set_runtime_install_stage(dialog, "validate")
+
+            self.assertIn(callback_id, scheduler.cancelled)
+            self.assertEqual(len(scheduler.callbacks), 1)
+            validate_callbacks = dict(scheduler.callbacks)
+            self.assertEqual(dialog["stage_var"].get(), "验证运行模块")
+            expected_detail = dialog["detail_var"].get()
+
+            stale_tick()
+            self.assertEqual(dialog["stage_var"].get(), "验证运行模块")
+            self.assertEqual(dialog["detail_var"].get(), expected_detail)
+            self.assertEqual(scheduler.callbacks, validate_callbacks)
+
+    def test_runtime_activity_stops_when_popup_is_destroyed(self):
+        app = object.__new__(GatewayApp)
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        app._process_supervisor = mock.Mock()
+        dialog = self._fake_runtime_dialog()
+
+        with mock.patch.object(main_gateway.time, "monotonic", return_value=0.0):
+            activity_token = app._set_runtime_install_stage(dialog, "extract")
+            _, stale_tick = next(iter(scheduler.callbacks.items()))
+            dialog["popup"].winfo_exists.return_value = False
+            app._report_runtime_extract_progress(dialog, activity_token, 55)
+            stale_tick()
+
+        self.assertIsNone(dialog.get("_activity_token"))
+        self.assertEqual(scheduler.callbacks, {})
+
+    def test_runtime_failure_stops_activity_and_stays_red(self):
+        app = object.__new__(GatewayApp)
+        scheduler = ManualAfterScheduler()
+        app.after = scheduler.after
+        app.after_cancel = scheduler.after_cancel
+        app._process_supervisor = mock.Mock()
+        dialog = self._fake_runtime_dialog()
+
+        with mock.patch.object(main_gateway.time, "monotonic", return_value=0.0):
+            activity_token = app._set_runtime_install_stage(dialog, "extract")
+            callback_id, stale_tick = next(iter(scheduler.callbacks.items()))
+            app._set_runtime_progress(
+                dialog,
+                45,
+                "安装未完成",
+                "环境包解压失败",
+                error=True,
+            )
+
+            self.assertIn(callback_id, scheduler.cancelled)
+            self.assertFalse(dialog["progress"].started)
+            self.assertEqual(dialog["progress"].cget("mode"), "determinate")
+            self.assertEqual(dialog["stage_var"].get(), "安装未完成")
+            self.assertEqual(dialog["stage_label"].cget("fg"), C["error"])
+
+            stale_tick()
+            app._report_runtime_extract_progress(dialog, activity_token, 88)
+            self.assertEqual(dialog["stage_var"].get(), "安装未完成")
+            self.assertEqual(dialog["detail_var"].get(), "环境包解压失败")
+            self.assertEqual(dialog["stage_label"].cget("fg"), C["error"])
+            self.assertEqual(dialog["progress_var"].get(), 45)
+            self.assertEqual(scheduler.callbacks, {})
+
     def test_runtime_install_reports_each_module_stage_in_order(self):
         app = object.__new__(GatewayApp)
         app._shutting_down = False
@@ -326,6 +666,7 @@ class DashboardShellTests(unittest.TestCase):
         )
         app._set_runtime_progress = mock.Mock()
         app._set_runtime_install_stage = mock.Mock()
+        app._dashboard_pages = mock.Mock()
         app._process_supervisor = mock.Mock()
         app._process_supervisor.run.side_effect = [
             mock.Mock(returncode=0, stdout="members", stderr=""),
@@ -334,6 +675,7 @@ class DashboardShellTests(unittest.TestCase):
         app._begin_runtime_maintenance = mock.Mock(return_value=(True, set(), ""))
         app._end_runtime_maintenance = mock.Mock()
         app._exit_for_runtime_update = mock.Mock()
+        app._show_runtime_manual_restart_notice = mock.Mock(return_value=True)
 
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp) / "runtime.7z"
@@ -342,7 +684,11 @@ class DashboardShellTests(unittest.TestCase):
                 mock.patch.object(main_gateway, "BASE_DIR", Path(tmp)),
                 mock.patch.object(main_gateway, "_runtime_has_package_files", return_value=False),
                 mock.patch.object(main_gateway, "verify_runtime_package", return_value=(True, "a", "a")),
-                mock.patch.object(main_gateway, "find_extractor", return_value=Path("7z.exe")),
+                mock.patch.object(
+                    main_gateway,
+                    "find_extractor",
+                    return_value=("tar", "tar.exe"),
+                ),
                 mock.patch.object(main_gateway, "archive_list_command", return_value=["list"]),
                 mock.patch.object(main_gateway, "archive_extract_command", return_value=["extract"]),
                 mock.patch.object(main_gateway, "parse_archive_members", return_value=[]),
@@ -359,7 +705,103 @@ class DashboardShellTests(unittest.TestCase):
             for call in app._set_runtime_install_stage.call_args_list
         ]
         self.assertEqual(stages, list(main_gateway.RUNTIME_INSTALL_STAGES))
+        app._show_runtime_manual_restart_notice.assert_called_once()
         app._exit_for_runtime_update.assert_called_once()
+
+    def test_runtime_install_tells_user_to_restart_manually(self):
+        _progress, stage, detail = main_gateway.RUNTIME_INSTALL_STAGES["apply"]
+
+        self.assertIn("应用运行环境", stage)
+        self.assertIn("手动", detail)
+        self.assertIn("重启后生效", detail)
+
+    def test_runtime_repair_confirmations_never_promise_automatic_restart(self):
+        source = Path(main_gateway.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn(
+            "安装过程中会暂时停止 ComfyUI、API 和公网连接，完成后自动重新启动",
+            source,
+        )
+        self.assertGreaterEqual(source.count("请手动重新打开，重启后生效"), 2)
+
+    def test_runtime_install_notice_explains_manual_restart_before_exit(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        app.after = lambda _delay, callback: callback()
+        popup = mock.Mock()
+
+        with mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo:
+            shown = app._show_runtime_manual_restart_notice(popup)
+
+        self.assertTrue(shown)
+        popup.grab_release.assert_called_once_with()
+        title, message = showinfo.call_args.args
+        self.assertIn("运行环境已准备完成", title)
+        self.assertIn("不会自动重启", message)
+        self.assertIn("手动重新打开", message)
+        self.assertIs(showinfo.call_args.kwargs["parent"], popup)
+
+    def test_runtime_install_preserves_staging_when_extractor_cannot_stop(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        app._dashboard_pages = mock.Mock()
+        app._last_health = {}
+        app.after = lambda _delay, callback: callback()
+        app._create_runtime_progress_dialog = mock.Mock(
+            return_value={
+                "popup": mock.MagicMock(),
+                "progress_var": mock.MagicMock(),
+                "stage_var": mock.MagicMock(),
+            }
+        )
+        app._set_runtime_progress = mock.Mock()
+        app._set_runtime_install_stage = mock.Mock()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.run.return_value = mock.Mock(
+            returncode=0,
+            stdout="members",
+            stderr="",
+        )
+        app._process_supervisor.run_observed.side_effect = RuntimeError(
+            "后台进程超时后无法安全停止"
+        )
+        app._process_supervisor.is_running.side_effect = (
+            lambda role: role == "runtime-install"
+        )
+        app._end_runtime_maintenance = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            package = base / "runtime.7z"
+            package.write_bytes(b"runtime")
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(main_gateway, "_runtime_has_package_files", return_value=False),
+                mock.patch.object(main_gateway, "_check_runtime_exists", return_value=False),
+                mock.patch.object(main_gateway, "verify_runtime_package", return_value=(True, "a", "a")),
+                mock.patch.object(main_gateway, "find_extractor", return_value=("7z", "7z.exe")),
+                mock.patch.object(main_gateway, "archive_list_command", return_value=["list"]),
+                mock.patch.object(main_gateway, "archive_extract_command", return_value=["extract"]),
+                mock.patch.object(main_gateway, "parse_archive_members", return_value=[]),
+                mock.patch.object(main_gateway, "missing_archive_entries", return_value=[]),
+                mock.patch.object(main_gateway, "invalid_archive_entries", return_value=[]),
+                mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+            ):
+                app._extract_runtime(package)
+
+            staging = list(base.glob(".runtime-install-staging-*"))
+            self.assertEqual(len(staging), 1)
+            self.assertTrue(staging[0].is_dir())
+            list_call = app._process_supervisor.run.call_args
+            self.assertEqual(list_call.kwargs["encoding"], "utf-8")
+            self.assertEqual(list_call.kwargs["errors"], "strict")
+            error_calls = [
+                call
+                for call in app._set_runtime_progress.call_args_list
+                if call.kwargs.get("error") is True
+            ]
+            self.assertEqual(len(error_calls), 1)
+            self.assertIn("无法安全停止", error_calls[0].args[3])
 
     def test_runtime_download_failure_opens_copyable_github_dialog(self):
         """The manual GitHub fallback appears only after automatic pull failure."""
@@ -425,6 +867,44 @@ class DashboardShellTests(unittest.TestCase):
                 self.assertIn(
                     "network unavailable",
                     app._show_runtime_download_fallback.call_args.args[0],
+                )
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_runtime_download_reuses_a_verified_cached_package(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                base = Path(tmp)
+                target = base / "cache" / main_gateway.RUNTIME_PACKAGE_NAME
+                target.parent.mkdir(parents=True)
+                target.write_bytes(b"verified cached runtime")
+                app._extract_runtime = mock.Mock()
+                app.after = lambda _delay, callback, *args: callback(*args)
+
+                with (
+                    mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+                    mock.patch.object(main_gateway, "BASE_DIR", base),
+                    mock.patch.object(
+                        main_gateway,
+                        "verify_runtime_package",
+                        return_value=(True, "expected", "actual"),
+                    ) as verify,
+                    mock.patch("urllib.request.urlopen") as urlopen,
+                ):
+                    app._download_runtime("https://example.invalid/runtime.7z")
+
+                verify.assert_called_once_with(target, None)
+                urlopen.assert_not_called()
+                app._extract_runtime.assert_called_once_with(
+                    target,
+                    repair_confirmed=False,
                 )
             finally:
                 app._dashboard_pages.cancel_pending()
@@ -631,7 +1111,7 @@ class DashboardShellTests(unittest.TestCase):
                         text = str(widget.cget("text"))
                     except Exception:
                         text = ""
-                    if text in {"查看参数", "停用", "设为默认"} and callable(
+                    if text in {"详情", "停用", "设为默认"} and callable(
                         getattr(widget, "invoke", None)
                     ):
                         buttons.append(widget)
@@ -642,9 +1122,9 @@ class DashboardShellTests(unittest.TestCase):
                         except Exception:
                             pass
 
-                self.assertEqual(sum(str(item.cget("text")) == "查看参数" for item in buttons), 6)
-                self.assertEqual(sum(str(item.cget("text")) == "停用" for item in buttons), 6)
-                self.assertEqual(sum(str(item.cget("text")) == "设为默认" for item in buttons), 5)
+                self.assertGreaterEqual(sum(str(item.cget("text")) == "详情" for item in buttons), 6)
+                self.assertGreaterEqual(sum(str(item.cget("text")) == "停用" for item in buttons), 6)
+                self.assertGreaterEqual(sum(str(item.cget("text")) == "设为默认" for item in buttons), 5)
                 self.assertTrue(scroll_canvases)
                 page_left = page.winfo_rootx()
                 page_right = page_left + page.winfo_width()
@@ -702,6 +1182,22 @@ class DashboardShellTests(unittest.TestCase):
             pages._workflow_state(workflow),
             ("加载中", "neutral", "正在检查模型和 ComfyUI 节点", ""),
         )
+
+    def test_capability_labels_are_textual_and_not_color_only(self):
+        app = object.__new__(GatewayApp)
+        expected = {
+            "text_image_to_image": "文/图生图",
+            "text_to_image": "文生图",
+            "first_last_frame": "首尾帧",
+            "text_model": "文本模型",
+        }
+        for capability, label in expected.items():
+            with self.subTest(capability=capability):
+                _key, actual, color = app._workflow_capability_meta(
+                    {"capability": capability}
+                )
+                self.assertEqual(actual, label)
+                self.assertRegex(color, r"^#[0-9a-fA-F]{6}$")
 
     def test_repeated_completed_task_does_not_redraw_progress(self):
         app = object.__new__(GatewayApp)

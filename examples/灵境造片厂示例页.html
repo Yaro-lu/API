@@ -701,6 +701,7 @@
               <div class="field">
                 <label for="imageSize">图片尺寸</label>
                 <select id="imageSize">
+                  <option value="768x768">1:1 · 768 × 768（8GB 建议）</option>
                   <option value="1024x1024">1:1 · 1024 × 1024</option>
                   <option value="1344x768">16:9 · 1344 × 768</option>
                   <option value="768x1344">9:16 · 768 × 1344</option>
@@ -710,6 +711,10 @@
               <div class="field">
                 <label for="imageSeed">随机种子 <small>-1 表示随机</small></label>
                 <input id="imageSeed" type="number" value="-1" min="-1" step="1">
+              </div>
+              <div class="field file-field" id="imageReferenceField" hidden>
+                <label for="imageReference">参考图片 <small>可选，PNG / JPEG / WebP，最大 20 MB</small></label>
+                <input id="imageReference" type="file" accept="image/png,image/jpeg,image/webp">
               </div>
             </div>
 
@@ -736,9 +741,9 @@
               <div class="field">
                 <label for="videoDuration">期望时长</label>
                 <select id="videoDuration">
+                  <option value="3">3 秒（8GB 显卡建议）</option>
                   <option value="5">5 秒</option>
                   <option value="8">8 秒</option>
-                  <option value="10">10 秒</option>
                 </select>
               </div>
               <div class="field">
@@ -996,6 +1001,16 @@
       return categoryForModel(model || {}) === "video" && ["start_image", "end_image"].includes(inputName);
     }
 
+    function modelAcceptsInput(model, inputName) {
+      const schema = model?.input_schema || {};
+      if ([...(schema.required || []), ...(schema.optional || [])].includes(inputName)) return true;
+      return Array.isArray(schema.inputs) && schema.inputs.some(input => input?.name === inputName);
+    }
+
+    function updateImageInputs(model = selectedModel()) {
+      $("imageReferenceField").hidden = !modelAcceptsInput(model, "image");
+    }
+
     function updateVideoInputs(model = selectedModel()) {
       const requiresStart = modelRequiresInput(model, "start_image");
       const requiresEnd = modelRequiresInput(model, "end_image");
@@ -1045,6 +1060,7 @@
         elements.modelSelect.value = state.selected[state.category];
         elements.modelSelect.disabled = !ready;
       }
+      updateImageInputs();
       updateVideoInputs();
       renderModelDetail();
       updateGenerateAvailability();
@@ -1227,17 +1243,27 @@
     }
 
     async function generateImage(model, prompt) {
-      const { response, data } = await apiRequest("/api/v3/images/generations", {
+      const acceptsReference = modelAcceptsInput(model, "image");
+      const referenceFile = acceptsReference ? $("imageReference").files?.[0] : null;
+      const referenceImage = referenceFile
+        ? await fileToDataUrl(referenceFile, "参考图片")
+        : undefined;
+      const body = {
+        model: model.id,
+        prompt,
+        seed: Number($("imageSeed").value || -1),
+        response_format: "url",
+        async: true
+      };
+      if (referenceImage) body.image = referenceImage;
+      else body.size = $("imageSize").value;
+      const endpoint = referenceImage
+        ? `/v1/workflows/run/${encodeURIComponent(model.workflowId || model.id)}`
+        : "/api/v3/images/generations";
+      const { response, data } = await apiRequest(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Prefer": "respond-async" },
-        body: JSON.stringify({
-          model: model.id,
-          prompt,
-          size: $("imageSize").value,
-          seed: Number($("imageSeed").value || -1),
-          response_format: "url",
-          async: true
-        })
+        body: JSON.stringify(body)
       });
       const mediaUrl = findMediaUrl(data);
       if (mediaUrl) return renderMediaResult(mediaUrl, "image");
@@ -1329,12 +1355,14 @@
     });
     elements.modelSelect.addEventListener("change", () => {
       state.selected[state.category] = elements.modelSelect.value;
+      updateImageInputs();
       updateVideoInputs();
       renderModelDetail();
       updateGenerateAvailability();
     });
     $("videoStartFrame").addEventListener("change", updateGenerateAvailability);
     $("videoEndFrame").addEventListener("change", updateGenerateAvailability);
+    $("imageReference").addEventListener("change", updateGenerateAvailability);
     elements.prompt.addEventListener("input", () => {
       elements.charCount.textContent = `${elements.prompt.value.length} / 4000`;
     });

@@ -31,14 +31,25 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DefaultSourceRoot = Split-Path -Parent $ScriptDir
 $BootstrapPackageEntries = @(
+    '*__mypyc*.pyd',
+    'certifi',
+    'certifi-*.dist-info',
+    'charset_normalizer',
+    'charset_normalizer-*.dist-info',
+    'idna',
+    'idna-*.dist-info',
     'packaging',
     'packaging-*.dist-info',
     'psutil',
     'psutil-*.dist-info',
     'pystray',
     'pystray-*.dist-info',
+    'requests',
+    'requests-*.dist-info',
     'six.py',
-    'six-*.dist-info'
+    'six-*.dist-info',
+    'urllib3',
+    'urllib3-*.dist-info'
 )
 
 function Write-Step {
@@ -102,6 +113,9 @@ function Test-ExcludedRelativePath {
         return $true
     }
     if ($leaf -match '(?i)\.(pyc|pyo)$') {
+        return $true
+    }
+    if ($leaf -match '(?i)^git\.exe$') {
         return $true
     }
     if ($leaf -match '(?i)^(session|account_session|client_instance|workflow_config|config\.local)\.json$') {
@@ -207,6 +221,60 @@ function Copy-BootstrapPackages {
     }
 }
 
+function Assert-StagedClientImportable {
+    param([Parameter(Mandatory)][string]$StageRoot)
+
+    $python = Join-Path $StageRoot 'runtime\python\python.exe'
+    $entrypoint = Join-Path $StageRoot 'app\gui\main_gateway.py'
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $python
+    $startInfo.WorkingDirectory = $StageRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+        '-s',
+        '-B',
+        '-c',
+        "import charset_normalizer, pathlib, runpy, sys; root = pathlib.Path.cwd().resolve(); runpy.run_path(sys.argv[1], run_name='__release_startup_smoke__'); modules = (charset_normalizer, sys.modules['requests']); assert all(pathlib.Path(module.__file__).resolve().is_relative_to(root) for module in modules), tuple(module.__file__ for module in modules); print('LINGJING_STARTUP_IMPORT_OK')",
+        $entrypoint
+    )) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $null = $startInfo.Environment.Remove('PYTHONHOME')
+    $null = $startInfo.Environment.Remove('PYTHONPATH')
+    $startInfo.Environment['PYTHONNOUSERSITE'] = '1'
+    $startInfo.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    $startInfo.Environment['PYTHONUTF8'] = '1'
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Staged client startup smoke test could not start Python"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            $process.Kill($true)
+            $process.WaitForExit()
+            throw "Staged client startup import timed out after 30 seconds"
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "Staged client startup import failed with exit code $($process.ExitCode): $stderr"
+        }
+        if (-not $stdout.Contains('LINGJING_STARTUP_IMPORT_OK')) {
+            throw "Staged client startup import did not emit its success marker. Output: $stdout"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Resolve-SevenZipRoot {
     param(
         [string]$RequestedRoot,
@@ -240,6 +308,27 @@ function Resolve-SevenZipRoot {
         }
     }
     throw "7-Zip runtime files were not found. Pass -SevenZipRoot with 7z.exe, 7z.dll and License.txt."
+}
+
+function Resolve-PipLicensePath {
+    param([Parameter(Mandatory)][string]$SitePackagesRoot)
+
+    if (-not (Test-Path -LiteralPath $SitePackagesRoot -PathType Container)) {
+        throw "Bootstrap Python site-packages directory is missing: $SitePackagesRoot"
+    }
+    $distInfoDirectories = @(
+        Get-ChildItem -LiteralPath $SitePackagesRoot -Directory -Filter 'pip-*.dist-info' -Force |
+            Sort-Object Name -Descending
+    )
+    foreach ($distInfo in $distInfoDirectories) {
+        foreach ($relative in @('licenses\LICENSE.txt', 'LICENSE.txt')) {
+            $candidate = Join-Path $distInfo.FullName $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return $candidate
+            }
+        }
+    }
+    throw "pip LICENSE.txt was not found under: $SitePackagesRoot"
 }
 
 function Copy-RequiredFile {
@@ -276,6 +365,8 @@ function Assert-StagingPolicy {
         '^(models|inputs|outputs|logs|tasks|temp|cache)(/|$)',
         '^runtime/(requests|inputs|outputs|logs|tasks|temp|cache|env-backups|ui-review|workflow_import_tmp)(/|$)',
         '^runtime/comfyui(/|$)',
+        '(^|/)git\.exe$',
+        '^app/updater_runtime/(?!pip(?:/|$)|pip-license\.txt$)',
         '^runtime/python/lib/site-packages/(?:diffusers|pip|setuptools|_distutils_hack)(?:[-./]|$)',
         '^\.venv/share(/|$)',
         '^\.venv/lib/site-packages/(?:torch|torchaudio|torchvision|triton|nvidia)(?:[-./]|$)',
@@ -360,6 +451,12 @@ else {
     Get-FullPath (Join-Path $SourceRoot '.venv\Lib\site-packages')
 }
 $SevenZipRoot = Resolve-SevenZipRoot -RequestedRoot $SevenZipRoot -ProjectRoot $SourceRoot
+$UpdaterPipSitePackagesRoot = Get-FullPath (Join-Path $BootstrapPythonRoot 'Lib\site-packages')
+$UpdaterPipRoot = Get-FullPath (Join-Path $UpdaterPipSitePackagesRoot 'pip')
+if (-not (Test-Path -LiteralPath $UpdaterPipRoot -PathType Container)) {
+    throw "Bootstrap Python pip package is missing: $UpdaterPipRoot"
+}
+$UpdaterPipLicensePath = Resolve-PipLicensePath -SitePackagesRoot $UpdaterPipSitePackagesRoot
 
 $versionFile = Join-Path $SourceRoot 'VERSION'
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
@@ -405,6 +502,11 @@ try {
     $requiredInputs = @(
         'app\gui\main_gateway.py',
         'app\gui\assets\app.ico',
+        'app\core\runtime_update.py',
+        'app\core\runtime_update_helper.ps1',
+        'app\core\comfyui_update.py',
+        'app\core\comfyui_update_worker.py',
+        'app\comfyui_release.json',
         'workflows',
         'start.bat',
         'check-env.bat',
@@ -427,6 +529,13 @@ try {
 
     Write-Step "Copying application allowlist"
     Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'app') -Destination (Join-Path $StageRoot 'app') -Profile Application
+    Copy-AllowlistedTree `
+        -Source $UpdaterPipRoot `
+        -Destination (Join-Path $StageRoot 'app\updater_runtime\pip') `
+        -Profile Application
+    Copy-RequiredFile `
+        -Source $UpdaterPipLicensePath `
+        -Destination (Join-Path $StageRoot 'app\updater_runtime\pip-LICENSE.txt')
     Copy-AllowlistedTree -Source (Join-Path $SourceRoot 'workflows') -Destination (Join-Path $StageRoot 'workflows') -Profile Workflow
     Copy-AllowlistedTree -Source $BootstrapPythonRoot -Destination (Join-Path $StageRoot 'runtime\python') -Profile BootstrapPython
     Copy-BootstrapPackages -Source $BootstrapSitePackagesRoot -Destination (Join-Path $StageRoot '.venv\Lib\site-packages')
@@ -479,11 +588,23 @@ try {
     $requiredStagedFiles = @(
         'app\gui\main_gateway.py',
         'app\gui\assets\app.ico',
+        'app\core\runtime_update.py',
+        'app\core\runtime_update_helper.ps1',
+        'app\core\comfyui_update.py',
+        'app\core\comfyui_update_worker.py',
+        'app\comfyui_release.json',
+        'app\updater_runtime\pip\__main__.py',
+        'app\updater_runtime\pip-LICENSE.txt',
         'runtime\python\python.exe',
         'runtime\python\pythonw.exe',
+        '.venv\Lib\site-packages\certifi\__init__.py',
+        '.venv\Lib\site-packages\charset_normalizer\__init__.py',
+        '.venv\Lib\site-packages\idna\__init__.py',
         '.venv\Lib\site-packages\psutil\__init__.py',
         '.venv\Lib\site-packages\pystray\__init__.py',
+        '.venv\Lib\site-packages\requests\__init__.py',
         '.venv\Lib\site-packages\six.py',
+        '.venv\Lib\site-packages\urllib3\__init__.py',
         'bin\7z.exe',
         'bin\7z.dll',
         'bin\7-Zip-License.txt',
@@ -503,6 +624,9 @@ try {
     if ($missingStaged.Count) {
         throw "Staging validation failed. Missing: $($missingStaged -join ', ')"
     }
+
+    Write-Step "Smoke-testing staged client startup imports"
+    Assert-StagedClientImportable -StageRoot $StageRoot
 
     Write-Step "Generating member manifest with SHA256"
     $members = @(

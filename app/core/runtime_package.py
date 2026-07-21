@@ -231,8 +231,42 @@ def find_extractor(base_dir: Path) -> tuple[str, str] | None:
 def archive_list_command(extractor: tuple[str, str], package: Path) -> list[str]:
     kind, executable = extractor
     if kind == "7z":
-        return [executable, "l", "-ba", str(package)]
+        return [executable, "l", "-slt", "-sccUTF-8", str(package)]
     return [executable, "-tf", str(package)]
+
+
+class SevenZipProgressParser:
+    """Parse CR/LF-delimited 7-Zip percentage records across byte chunks."""
+
+    _progress_pattern = re.compile(rb"(?<!\d)(\d{1,3})%(?!\d)")
+
+    def __init__(self):
+        self._buffer = b""
+
+    def feed(self, chunk: bytes) -> list[int]:
+        if not chunk:
+            return []
+        self._buffer += bytes(chunk)
+        records = re.split(rb"[\r\n]+", self._buffer)
+        self._buffer = records.pop()[-256:]
+        values: list[int] = []
+        for record in records:
+            for match in self._progress_pattern.finditer(record):
+                value = int(match.group(1))
+                if 0 <= value <= 100:
+                    values.append(value)
+        return values
+
+    def finish(self) -> list[int]:
+        if not self._buffer:
+            return []
+        record, self._buffer = self._buffer, b""
+        values: list[int] = []
+        for match in self._progress_pattern.finditer(record):
+            value = int(match.group(1))
+            if 0 <= value <= 100:
+                values.append(value)
+        return values
 
 
 def archive_extract_command(
@@ -240,23 +274,37 @@ def archive_extract_command(
 ) -> list[str]:
     kind, executable = extractor
     if kind == "7z":
-        return [executable, "x", str(package), f"-o{destination}", "-y"]
+        return [
+            executable,
+            "x",
+            str(package),
+            f"-o{destination}",
+            "-y",
+            "-bsp1",
+            "-bso0",
+            "-bse2",
+            "-sccUTF-8",
+        ]
     return [executable, "-xf", str(package), "-C", str(destination)]
 
 
 def parse_archive_members(extractor: tuple[str, str], output: str) -> list[str]:
-    """Parse member names from 7-Zip's compact listing or bsdtar output."""
+    """Parse member names from 7-Zip's technical listing or bsdtar output."""
     if extractor[0] == "tar":
         return [line.strip() for line in output.splitlines() if line.strip()]
 
     members: list[str] = []
-    for line in output.splitlines():
-        # ``7z l -ba`` emits six columns: date, time, attributes, size,
-        # compressed size and path.  Split only the first five separators so
-        # member names containing spaces remain intact.
-        columns = line.strip().split(maxsplit=5)
-        if len(columns) == 6:
-            members.append(columns[5].strip())
+    member_section = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not member_section:
+            if len(line) >= 5 and set(line) == {"-"}:
+                member_section = True
+            continue
+        if line.startswith("Path = "):
+            member = line[len("Path = ") :].strip()
+            if member:
+                members.append(member.replace("\\", "/"))
     return members
 
 

@@ -1,9 +1,11 @@
 {
   "id": "llm_qwen3_text_gen",
-  "name": "qwen3.5",
+  "name": "Qwen3.5 4B",
   "type": "text.chat",
   "engine": "comfyui",
   "version": "1.0.0",
+  "capability": "text_model",
+  "model_group": "Qwen3.5",
   "description": "文字生成工作流，输入 prompt 后输出脚本、分镜或结构化文本",
   "input_schema": {
     "summary": "输入文字需求，生成脚本、角色或分镜结构化 JSON。",

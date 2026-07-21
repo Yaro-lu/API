@@ -1,0 +1,15 @@
+{
+  "1": {"inputs": {"unet_name": "flux-2-klein-4b-fp8.safetensors", "weight_dtype": "default"}, "class_type": "UNETLoader", "_meta": {"title": "Load FLUX.2 Klein 4B FP8"}},
+  "2": {"inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "flux2", "device": "default"}, "class_type": "CLIPLoader", "_meta": {"title": "Load Qwen 3 4B"}},
+  "3": {"inputs": {"vae_name": "flux2-vae.safetensors"}, "class_type": "VAELoader", "_meta": {"title": "Load FLUX.2 VAE"}},
+  "4": {"inputs": {"text": "", "clip": ["2", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Positive Prompt)"}},
+  "5": {"inputs": {"conditioning": ["4", 0]}, "class_type": "ConditioningZeroOut", "_meta": {"title": "Zero Negative Conditioning"}},
+  "6": {"inputs": {"model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "cfg": 1.0}, "class_type": "CFGGuider", "_meta": {"title": "CFG Guider"}},
+  "7": {"inputs": {"sampler_name": "euler"}, "class_type": "KSamplerSelect", "_meta": {"title": "Euler Sampler"}},
+  "8": {"inputs": {"steps": 4, "width": 768, "height": 768}, "class_type": "Flux2Scheduler", "_meta": {"title": "FLUX.2 Scheduler"}},
+  "9": {"inputs": {"noise_seed": 0, "control_after_generate": "randomize"}, "class_type": "RandomNoise", "_meta": {"title": "Random Noise"}},
+  "10": {"inputs": {"width": 768, "height": 768, "batch_size": 1}, "class_type": "EmptyFlux2LatentImage", "_meta": {"title": "Empty FLUX.2 Latent"}},
+  "11": {"inputs": {"noise": ["9", 0], "guider": ["6", 0], "sampler": ["7", 0], "sigmas": ["8", 0], "latent_image": ["10", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "Sample"}},
+  "12": {"inputs": {"samples": ["11", 0], "vae": ["3", 0]}, "class_type": "VAEDecode", "_meta": {"title": "Decode Image"}},
+  "13": {"inputs": {"filename_prefix": "Flux2-Klein-4B", "images": ["12", 0]}, "class_type": "SaveImage", "_meta": {"title": "Save Image"}}
+}

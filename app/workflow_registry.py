@@ -34,8 +34,30 @@ _TYPE_MAP = {
     "video.first_last_to_video": "video",
     "video.image_to_video": "video",
     "image.text_to_image": "image",
+    "image.text_image_to_image": "image",
+    "image.image_to_image": "image",
     "text.chat": "text",
 }
+
+
+def _safe_workflow_variants(value) -> dict[str, str]:
+    """Keep only same-folder JSON variants declared by a workflow manifest."""
+    if not isinstance(value, dict):
+        return {}
+    variants: dict[str, str] = {}
+    for raw_key, raw_name in value.items():
+        key = str(raw_key or "").strip()
+        name = str(raw_name or "").strip().replace("\\", "/")
+        path = Path(name)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", key)
+            or not name
+            or path.name != name
+            or path.suffix.lower() != ".json"
+        ):
+            continue
+        variants[key] = name
+    return variants
 
 
 def _as_bool(value, default: bool = True) -> bool:
@@ -73,6 +95,10 @@ class WorkflowDef:
         input_schema: Optional[dict] = None,
         inputs: Optional[list] = None,
         dependencies: Optional[dict] = None,
+        workflow_type: str = "",
+        capability: str = "",
+        model_group: str = "",
+        workflow_variants: Optional[dict] = None,
     ):
         self.id = str(id or "").strip()
         self.name = str(name or self.id).strip()
@@ -84,6 +110,10 @@ class WorkflowDef:
         self.input_schema = input_schema if isinstance(input_schema, dict) else {}
         self.inputs = inputs if isinstance(inputs, list) else []
         self.dependencies = normalize_workflow_dependencies(dependencies)
+        self.workflow_type = str(workflow_type or "").strip()
+        self.capability = str(capability or "").strip()
+        self.model_group = str(model_group or "").strip()
+        self.workflow_variants = _safe_workflow_variants(workflow_variants)
         self._workflows_dir: Optional[Path] = None  # 由 Registry 注入
 
     @property
@@ -110,6 +140,10 @@ class WorkflowDef:
             "input_schema": self.input_schema,
             "inputs": self.inputs,
             "dependencies": self.dependencies,
+            "type": self.workflow_type,
+            "capability": self.capability,
+            "model_group": self.model_group,
+            "workflow_variants": self.workflow_variants,
         }
 
     @classmethod
@@ -127,6 +161,10 @@ class WorkflowDef:
             input_schema=d.get("input_schema") or {},
             inputs=d.get("inputs") or [],
             dependencies=d.get("dependencies") or {},
+            workflow_type=d.get("type") or d.get("workflow_type") or "",
+            capability=d.get("capability") or "",
+            model_group=d.get("model_group") or d.get("modelGroup") or "",
+            workflow_variants=d.get("workflow_variants") or d.get("workflowVariants") or {},
         )
 
     @classmethod
@@ -180,7 +218,138 @@ class WorkflowDef:
                 manifest.get("dependencies") or {},
                 workflow_data,
             ),
+            workflow_type=wf_type,
+            capability=manifest.get("capability") or "",
+            model_group=manifest.get("model_group") or manifest.get("modelGroup") or "",
+            workflow_variants=manifest.get("workflow_variants") or manifest.get("workflowVariants") or {},
         )
+
+
+def read_local_workflow_catalog(
+    workflows_dir: Path,
+    config_path: Optional[Path] = None,
+) -> list[dict]:
+    """Read manifests for UI fallback without changing workflow_config.json."""
+    workflows_dir = Path(workflows_dir)
+    if not workflows_dir.is_dir():
+        return []
+    ensure_safe_workflows_root(workflows_dir)
+
+    configured: dict[str, dict] = {}
+    default_workflow_id = ""
+    config_path = Path(config_path) if config_path else None
+    try:
+        if config_path and config_path.is_file() and config_path.stat().st_size <= 2 * 1024 * 1024:
+            raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(raw_config, dict):
+                default_workflow_id = str(raw_config.get("default_workflow_id") or "").strip()
+                configured = {
+                    str(item.get("id") or "").strip(): item
+                    for item in raw_config.get("workflows", [])
+                    if isinstance(item, dict) and str(item.get("id") or "").strip()
+                }
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        configured = {}
+
+    records: list[dict] = []
+    seen_ids: set[str] = set()
+    for folder in sorted(workflows_dir.iterdir()):
+        if (
+            folder.name.lower().startswith(".importing_")
+            or not folder.is_dir()
+            or folder.is_symlink()
+            or _is_reparse_point(folder)
+        ):
+            continue
+        manifest_path = folder / "manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink() or _is_reparse_point(manifest_path):
+            continue
+        try:
+            if manifest_path.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("manifest.json 过大")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json 顶层必须是对象")
+            workflow = WorkflowDef.from_manifest(folder, manifest)
+            workflow.id = str(workflow.id or folder.name).strip()
+            normalized_id = workflow.id.casefold()
+            if (
+                not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", workflow.id)
+                or normalized_id in seen_ids
+            ):
+                continue
+            seen_ids.add(normalized_id)
+            saved = configured.get(workflow.id) or {}
+            workflow.enabled = _as_bool(saved.get("enabled", workflow.enabled))
+            workflow.description = str(saved.get("description") or workflow.description)
+            workflow._workflows_dir = workflows_dir
+            record = workflow.to_dict()
+            record["is_default"] = workflow.id == default_workflow_id
+            records.append(record)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            records.append(
+                {
+                    "id": folder.name,
+                    "name": folder.name,
+                    "enabled": False,
+                    "workflow_json": "",
+                    "manifest_error": True,
+                    "is_default": False,
+                }
+            )
+    return records
+
+
+def merge_workflow_catalog(
+    local_records: list[dict],
+    remote_records: list[dict],
+) -> list[dict]:
+    """Keep every local workflow visible while overlaying live backend state.
+
+    Local manifests are the catalogue of what the installed client ships.  A
+    backend can legitimately return a partial list while it is starting or
+    when its workflow config is stale, so treating the remote list as the
+    entire catalogue would make missing-model workflows disappear.
+    """
+    local = [dict(item) for item in local_records if isinstance(item, dict)]
+    remote = [dict(item) for item in remote_records if isinstance(item, dict)]
+    remote_by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in remote
+        if str(item.get("id") or "").strip()
+    }
+    merged: list[dict] = []
+    seen: set[str] = set()
+    manifest_fields = (
+        "name",
+        "description",
+        "type",
+        "workflow_type",
+        "output_type",
+        "capability",
+        "model_group",
+        "workflow_json",
+        "workflow_variants",
+        "input_schema",
+    )
+    for local_item in local:
+        workflow_id = str(local_item.get("id") or "").strip()
+        if not workflow_id:
+            continue
+        live_item = remote_by_id.get(workflow_id)
+        combined = {**local_item, **live_item} if live_item else local_item
+        if live_item:
+            for field in manifest_fields:
+                if combined.get(field) in (None, "", {}):
+                    combined[field] = local_item.get(field)
+        merged.append(combined)
+        seen.add(workflow_id)
+    for item in remote:
+        workflow_id = str(item.get("id") or "").strip()
+        if workflow_id and workflow_id not in seen:
+            merged.append(item)
+            seen.add(workflow_id)
+    return merged
 
 
 class WorkflowRegistry:

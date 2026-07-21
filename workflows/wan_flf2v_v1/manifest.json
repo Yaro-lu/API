@@ -1,8 +1,10 @@
 {
   "id": "wan_flf2v_v1",
-  "name": "wan2.1",
+  "name": "WAN2.1 14B（原首尾帧）",
   "type": "video.first_last_to_video",
   "engine": "comfyui",
   "version": "1.0.0",
-  "description": "首帧+尾帧转视频工作流"
+  "capability": "first_last_frame",
+  "model_group": "Wan2.1 FLF2V 14B",
+  "description": "原版 720P 首帧+尾帧转视频工作流"
 }

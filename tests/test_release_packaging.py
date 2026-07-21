@@ -58,6 +58,87 @@ class LightweightReleaseContractTests(unittest.TestCase):
         self.assertIn('MyAppExe "runtime\\python\\pythonw.exe"', self.installer_script)
         self.assertIn("轻量客户端", self.installer_script)
 
+    def test_release_bootstrap_includes_http_client_and_smoke_tests_real_entrypoint(self):
+        for package_entry in (
+            "certifi",
+            "charset_normalizer",
+            "idna",
+            "requests",
+            "urllib3",
+        ):
+            with self.subTest(package_entry=package_entry):
+                self.assertIn(f"'{package_entry}'", self.release_script)
+                self.assertIn(f"'{package_entry}-*.dist-info'", self.release_script)
+
+        self.assertIn("'*__mypyc*.pyd'", self.release_script)
+
+        for marker in (
+            "Assert-StagedClientImportable",
+            "import charset_normalizer",
+            "runpy.run_path",
+            "__release_startup_smoke__",
+            "LINGJING_STARTUP_IMPORT_OK",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.release_script)
+
+    def test_release_requires_and_stages_the_comfyui_updater(self):
+        updater_files = (
+            "app\\core\\comfyui_update.py",
+            "app\\core\\comfyui_update_worker.py",
+            "app\\comfyui_release.json",
+        )
+        for relative_path in updater_files:
+            with self.subTest(relative_path=relative_path):
+                self.assertGreaterEqual(
+                    self.release_script.count(f"'{relative_path}'"),
+                    2,
+                    "Updater files must be required inputs and required staged files",
+                )
+
+    def test_release_requires_and_stages_runtime_update_handoff(self):
+        for relative_path in (
+            "app\\core\\runtime_update.py",
+            "app\\core\\runtime_update_helper.ps1",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertGreaterEqual(
+                    self.release_script.count(f"'{relative_path}'"),
+                    2,
+                    "Runtime handoff files must be required inputs and staged files",
+                )
+
+    def test_release_policy_excludes_git_comfyui_core_and_torch(self):
+        for marker in (
+            "(^|/)git\\.exe$",
+            "^runtime/comfyui(/|$)",
+            "^\\.venv/lib/site-packages/(?:torch|torchaudio|torchvision|triton|nvidia)",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.release_script.lower())
+
+    def test_release_stages_pip_only_for_the_isolated_updater_runtime(self):
+        for marker in (
+            "Join-Path $BootstrapPythonRoot 'Lib\\site-packages'",
+            "Join-Path $UpdaterPipSitePackagesRoot 'pip'",
+            "app\\updater_runtime\\pip",
+            "app\\updater_runtime\\pip-LICENSE.txt",
+            "app\\updater_runtime\\pip\\__main__.py",
+            "^app/updater_runtime/(?!pip(?:/|$)|pip-license\\.txt$)",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker.lower(), self.release_script.lower())
+
+        self.assertNotIn(
+            "Destination (Join-Path $StageRoot 'runtime\\python\\Lib\\site-packages\\pip')",
+            self.release_script,
+        )
+        self.assertNotIn(
+            "Copy-AllowlistedTree -Source (Join-Path $BootstrapPythonRoot "
+            "'Lib\\site-packages\\setuptools')",
+            self.release_script,
+        )
+
     def test_release_secret_scan_includes_fine_grained_github_tokens(self):
         self.assertIn("github_pat_", self.release_script)
 
@@ -112,6 +193,14 @@ class LightweightReleaseContractTests(unittest.TestCase):
         self.assertIn("examples\\灵境造片厂示例页.html", self.release_script)
         self.assertIn("灵境造片厂示例页.html", self.release_script)
 
+    def test_installer_preserves_the_restored_14b_visual_workflow_on_upgrade(self):
+        old_visual_workflow_delete = (
+            'Type: files; Name: "{app}\\workflows\\wan_flf2v_v1\\'
+            'wan2.1_flf2v_720_f16.json"'
+        )
+
+        self.assertNotIn(old_visual_workflow_delete, self.installer_script)
+
     def test_installer_creates_same_logo_desktop_example_shortcut(self):
         self.assertIn('Name: "{autodesktop}\\灵境造片厂示例页"', self.installer_script)
         self.assertIn('Filename: "{app}\\灵境造片厂示例页.html"', self.installer_script)
@@ -125,6 +214,63 @@ class LightweightReleaseContractTests(unittest.TestCase):
             if line.startswith('Name: "desktopicon";')
         )
         self.assertNotIn("unchecked", desktop_task)
+
+    def test_uninstaller_removes_installed_and_downloaded_client_content(self):
+        removable_directories = (
+            ".venv",
+            "app",
+            "bin",
+            "cache",
+            "models",
+            "runtime",
+            "workflows",
+        )
+        for directory in removable_directories:
+            with self.subTest(directory=directory):
+                self.assertIn(
+                    f'Type: filesandordirs; Name: "{{app}}\\{directory}"',
+                    self.installer_script,
+                )
+
+        transient_directories = (
+            ".runtime-install-staging-*",
+            ".runtime-install-backup-*",
+            ".comfyui-update-staging-*",
+            ".comfyui-update-overlay-*",
+            ".comfyui-update-backup-*",
+        )
+        for directory in transient_directories:
+            with self.subTest(directory=directory):
+                self.assertIn(
+                    f'Type: filesandordirs; Name: "{{app}}\\{directory}"',
+                    self.installer_script,
+                )
+
+        transient_files = (
+            ".comfyui-update-requirements-*.txt",
+            ".comfyui-update-release-*.zip",
+            ".comfyui-update-release-*.zip.part",
+            ".comfyui-update-manifest-*.json",
+            ".comfyui-update-manifest-*.json.tmp",
+            ".comfyui-update-journal-*.json",
+            "runtime-nvidia-*.7z",
+            "runtime-nvidia-*.7z.sha256",
+        )
+        for filename in transient_files:
+            with self.subTest(filename=filename):
+                self.assertIn(
+                    f'Type: files; Name: "{{app}}\\{filename}"',
+                    self.installer_script,
+                )
+
+    def test_uninstaller_preserves_root_outputs_and_never_recursively_deletes_app_root(self):
+        uninstall_section = self.installer_script.split("[UninstallDelete]", 1)[1]
+        uninstall_section = uninstall_section.split("[Tasks]", 1)[0]
+
+        self.assertNotIn('Name: "{app}\\outputs"', uninstall_section)
+        self.assertNotIn('Name: "{app}\\outputs\\*"', uninstall_section)
+        self.assertNotIn('Name: "{app}"', uninstall_section)
+        self.assertNotIn('Name: "{app}\\*"', uninstall_section)
 
 
 if __name__ == "__main__":

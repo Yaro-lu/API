@@ -12,6 +12,81 @@ from app.core.process_supervisor import ProcessSupervisor, WindowsProcessJob
 
 
 class ProcessSupervisorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows hidden background process")
+    def test_run_observed_hides_console_window_by_default(self):
+        supervisor = ProcessSupervisor(Path.cwd())
+        real_popen = subprocess.Popen
+        launched = []
+
+        def capture_popen(*args, **kwargs):
+            launched.append(dict(kwargs))
+            return real_popen(*args, **kwargs)
+
+        with mock.patch(
+            "app.core.process_supervisor.subprocess.Popen",
+            side_effect=capture_popen,
+        ):
+            result = supervisor.run_observed(
+                "runtime-install",
+                [sys.executable, "-c", "pass"],
+                timeout=5,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(launched), 1)
+        self.assertTrue(launched[0]["creationflags"] & subprocess.CREATE_NO_WINDOW)
+
+    def test_run_observed_streams_output_and_releases_process(self):
+        supervisor = ProcessSupervisor(Path.cwd())
+        chunks = []
+        ticks = []
+
+        result = supervisor.run_observed(
+            "runtime-install",
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys,time;"
+                    "sys.stdout.buffer.write(b'\\r10%\\r');sys.stdout.flush();"
+                    "time.sleep(0.15);"
+                    "sys.stdout.buffer.write(b'60%\\r');sys.stdout.flush()"
+                ),
+            ],
+            timeout=5,
+            tick_interval=0.02,
+            on_stdout=chunks.append,
+            on_tick=ticks.append,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"10%", b"".join(chunks))
+        self.assertIn(b"60%", b"".join(chunks))
+        self.assertTrue(ticks)
+        self.assertFalse(supervisor.is_running("runtime-install"))
+
+    def test_run_observed_reports_when_timed_out_process_cannot_be_stopped(self):
+        supervisor = ProcessSupervisor(Path.cwd())
+        try:
+            with mock.patch.object(
+                supervisor,
+                "_terminate_one",
+                return_value="process is still busy",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "无法安全停止"):
+                    supervisor.run_observed(
+                        "runtime-install",
+                        [sys.executable, "-c", "import time;time.sleep(60)"],
+                        timeout=0.05,
+                        tick_interval=0.02,
+                    )
+
+            self.assertTrue(supervisor.is_running("runtime-install"))
+        finally:
+            supervisor.shutdown_all(timeout=4)
+
+        self.assertFalse(supervisor.is_running("runtime-install"))
+
     def test_prepare_port_never_terminates_external_listener(self):
         supervisor = ProcessSupervisor(Path.cwd())
         with (

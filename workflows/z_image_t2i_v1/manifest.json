@@ -1,0 +1,10 @@
+{
+  "id": "z_image_t2i_v1",
+  "name": "Z-Image Turbo",
+  "type": "image.text_to_image",
+  "engine": "comfyui",
+  "version": "1.0.0",
+  "capability": "text_to_image",
+  "model_group": "Z-Image",
+  "description": "8 步 Z-Image Turbo 文生图；8GB 显卡使用内存卸载，速度会较慢"
+}

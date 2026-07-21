@@ -95,7 +95,50 @@ def _next_task_progress_percent(high_water, progress: Optional[dict]) -> int:
     )
 
 
-def _workflow_type(workflow_id: str, output_type: str = "") -> str:
+def _workflow_step_count(workflow_data: dict, fallback: int = 20) -> int:
+    """Read sampler steps, including distilled graphs driven by ManualSigmas."""
+    if isinstance(workflow_data, dict):
+        for node in workflow_data.values():
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict) or inputs.get("steps") in (None, ""):
+                continue
+            try:
+                return max(1, int(inputs["steps"]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        for node in workflow_data.values():
+            if not isinstance(node, dict) or node.get("class_type") != "ManualSigmas":
+                continue
+            inputs = node.get("inputs")
+            sigmas = inputs.get("sigmas") if isinstance(inputs, dict) else None
+            if isinstance(sigmas, str):
+                values = [value.strip() for value in sigmas.split(",") if value.strip()]
+            elif isinstance(sigmas, (list, tuple)):
+                values = list(sigmas)
+            else:
+                values = []
+            if len(values) >= 2:
+                return len(values) - 1
+    try:
+        return max(1, int(fallback))
+    except (TypeError, ValueError, OverflowError):
+        return 20
+
+
+def _workflow_type(
+    workflow_id: str,
+    output_type: str = "",
+    manifest_type: str = "",
+) -> str:
+    declared = str(manifest_type or "").strip().lower()
+    if declared in {"image.text_image_to_image", "image.image_to_image"}:
+        return "image_edit"
+    if declared == "image.text_to_image":
+        return "image_t2i"
+    if declared == "video.first_last_to_video":
+        return "video_flf2v"
+    if declared == "text.chat":
+        return "text_chat"
     output = (output_type or "").lower()
     if output == "video":
         return "video_flf2v"
@@ -136,6 +179,21 @@ def _workflow_has_image_input(w) -> bool:
     return False
 
 
+def _workflow_json_path_for_body(w, body: dict) -> Path:
+    """Select a safe same-folder API graph for optional workflow variants."""
+    folder = Path(getattr(w, "folder", None) or BASE_DIR / "workflows" / getattr(w, "id", ""))
+    variants = getattr(w, "workflow_variants", {}) or {}
+    variant_key = "image_to_image" if body.get("image") else "text_to_image"
+    filename = str(variants.get(variant_key) or "workflow.json").strip()
+    relative = Path(filename)
+    if relative.name != filename or relative.suffix.lower() != ".json":
+        raise HTTPException(500, detail="Workflow 变体路径无效")
+    candidate = folder / relative
+    if not candidate.is_file() or candidate.is_symlink():
+        raise HTTPException(500, detail="Workflow JSON 文件不存在")
+    return candidate
+
+
 def _default_input_schema(workflow_type: str) -> dict:
     return {
         "image_t2i": {
@@ -150,16 +208,30 @@ def _default_input_schema(workflow_type: str) -> dict:
                 {"name": "seed", "type": "integer", "label": "随机种子", "required": False},
             ],
         },
+        "image_edit": {
+            "summary": "输入提示词，可选一张参考图片；有图时编辑图片，无图时直接文生图。",
+            "required": ["prompt"],
+            "optional": ["image", "size", "width", "height", "steps", "seed"],
+            "response": {"type": "image", "format": "url"},
+            "inputs": [
+                {"name": "prompt", "type": "text", "label": "提示词", "required": True},
+                {"name": "image", "type": "image", "label": "参考图片", "required": False},
+                {"name": "size", "type": "string", "label": "尺寸", "required": False},
+                {"name": "seed", "type": "integer", "label": "随机种子", "required": False},
+            ],
+        },
         "video_flf2v": {
             "summary": "输入文字动作提示词、首帧图片、尾帧图片，生成分镜视频。",
             "required": ["prompt", "start_image", "end_image"],
-            "optional": ["duration", "fps", "seed"],
+            "optional": ["duration", "frames", "fps", "seed"],
             "response": {"type": "video", "format": "url"},
             "inputs": [
                 {"name": "prompt", "type": "text", "label": "动作/镜头提示词", "required": True},
                 {"name": "start_image", "type": "image", "label": "首帧图片", "required": True},
                 {"name": "end_image", "type": "image", "label": "尾帧图片", "required": True},
                 {"name": "duration", "type": "number", "label": "时长秒", "required": False},
+                {"name": "frames", "type": "integer", "label": "输出帧数", "required": False},
+                {"name": "fps", "type": "integer", "label": "输出帧率", "required": False},
                 {"name": "seed", "type": "integer", "label": "随机种子", "required": False},
             ],
         },
@@ -241,7 +313,11 @@ def _installed_comfy_node_types(cache_seconds: float = 30.0) -> set[str] | None:
 
 
 def _workflow_payload(w) -> dict:
-    workflow_type = _workflow_type(w.id, getattr(w, "output_type", ""))
+    workflow_type = _workflow_type(
+        w.id,
+        getattr(w, "output_type", ""),
+        getattr(w, "workflow_type", ""),
+    )
     if workflow_type == "text_chat" and _workflow_has_image_input(w):
         workflow_type = "text_vision"
     input_schema = _normalize_input_schema(getattr(w, "input_schema", {}) or {}, workflow_type)
@@ -277,6 +353,10 @@ def _workflow_payload(w) -> dict:
         "enabled": w.enabled,
         "description": w.description,
         "type": workflow_type,
+        "workflow_type": getattr(w, "workflow_type", ""),
+        "capability": getattr(w, "capability", ""),
+        "model_group": getattr(w, "model_group", ""),
+        "workflow_variants": dict(getattr(w, "workflow_variants", {}) or {}),
         "output_type": getattr(w, "output_type", "") or ("video" if workflow_type == "video_flf2v" else "text" if workflow_type == "text_chat" else "image"),
         "input_schema": input_schema,
         "inputs": input_schema["inputs"],
@@ -362,6 +442,8 @@ def _models_from_workflows() -> list:
             "workflowId": model_id,
             "workflow_id": model_id,
             "description": payload.get("description", ""),
+            "capability": payload.get("capability", ""),
+            "model_group": payload.get("model_group", ""),
             "input_schema": payload.get("input_schema") or {},
             "inputs": payload.get("inputs") or [],
         })
@@ -694,12 +776,16 @@ def _load_image_body_key(node: dict) -> str:
         return "start_image"
     if "end" in hint or "尾帧" in hint:
         return "end_image"
-    return ""
+    return "image"
 
 
 def _upload_workflow_images(client, workflow_data: dict, body: dict, task_id: str) -> None:
     """Upload request images to ComfyUI and bind them to matching LoadImage nodes."""
-    mapped_nodes: dict[str, list[dict]] = {"start_image": [], "end_image": []}
+    mapped_nodes: dict[str, list[dict]] = {
+        "image": [],
+        "start_image": [],
+        "end_image": [],
+    }
     for node in workflow_data.values():
         if not isinstance(node, dict):
             continue
@@ -707,7 +793,11 @@ def _upload_workflow_images(client, workflow_data: dict, body: dict, task_id: st
         if key:
             mapped_nodes[key].append(node)
 
-    labels = {"start_image": "首帧图片", "end_image": "尾帧图片"}
+    labels = {
+        "image": "参考图片",
+        "start_image": "首帧图片",
+        "end_image": "尾帧图片",
+    }
     prepared: dict[str, tuple[bytes, str, str]] = {}
     for key, nodes in mapped_nodes.items():
         if not nodes:
@@ -717,7 +807,8 @@ def _upload_workflow_images(client, workflow_data: dict, body: dict, task_id: st
         prepared[key] = _decode_workflow_image(body[key], name=labels[key])
 
     for key, (image_data, mime_type, extension) in prepared.items():
-        filename = f"lingjing_{task_id}_{'start' if key == 'start_image' else 'end'}.{extension}"
+        suffix = {"image": "reference", "start_image": "start", "end_image": "end"}[key]
+        filename = f"lingjing_{task_id}_{suffix}.{extension}"
         uploaded_name = client.upload_input_image(image_data, filename, mime_type)
         for node in mapped_nodes[key]:
             node.setdefault("inputs", {})["image"] = uploaded_name
@@ -729,6 +820,7 @@ def _validated_generation_body(body: dict) -> dict:
     if not isinstance(body, dict):
         raise HTTPException(422, detail="请求正文必须是 JSON 对象")
     result = dict(body)
+    result["_steps_explicit"] = result.get("steps") not in (None, "")
     prompt = str(result.get("prompt") or "")
     if len(prompt) > MAX_PROMPT_CHARS:
         raise HTTPException(422, detail=f"prompt 最多允许 {MAX_PROMPT_CHARS} 个字符")
@@ -777,6 +869,12 @@ def _validated_generation_body(body: dict) -> dict:
         result["duration"] = _bounded_integer(
             result.get("duration"), name="duration", default=5, minimum=1, maximum=30
         )
+    if result.get("frames") not in (None, ""):
+        result["frames"] = _bounded_integer(
+            result.get("frames"), name="frames", default=1, minimum=1, maximum=1000
+        )
+    else:
+        result.pop("frames", None)
     if "fps" in result:
         result["fps"] = _bounded_integer(
             result.get("fps"), name="fps", default=16, minimum=1, maximum=60
@@ -790,6 +888,15 @@ def _image_workflow_from_model(model: str) -> str:
     text = str(model or "").strip().lower().replace("_", "-")
     if not text:
         return "flux_t2i_v1"
+    if text in {
+        "flux2-klein-4b",
+        "flux-2-klein-4b",
+        "flux2-klein-4b-edit",
+        "flux2-klein-4b-v1",
+    } or ("flux" in text and "4b" in text):
+        return "flux2_klein_4b_v1"
+    if text in {"z-image", "z-image-turbo", "z-image-t2i-v1"} or "z-image" in text:
+        return "z_image_t2i_v1"
     aliases = {
         "flux",
         "flux2",
@@ -1126,6 +1233,7 @@ def create_app() -> FastAPI:
                 "- Do not add explanations, comments, prefixes, suffixes, or extra text.\n"
                 "- The JSON fields must match the upstream system prompt."
             )
+        has_negative_prompt = "negative_prompt" in body or "negativePrompt" in body
         negative_prompt = body.get("negative_prompt", body.get("negativePrompt", ""))
         seed = _normalize_seed(body.get("seed", -1))
         steps = body.get("steps", 20)
@@ -1133,39 +1241,92 @@ def create_app() -> FastAPI:
         height = body.get("height", 1024)
         dimensions_explicit = body.get("_dimensions_explicit") is True
         requested_duration = body.get("duration")
+        requested_frames = body.get("frames")
         requested_fps = body.get("fps")
         effective_fps = requested_fps
         if effective_fps is None:
-            for candidate in workflow_data.values():
-                candidate_inputs = candidate.get("inputs", {}) if isinstance(candidate, dict) else {}
-                if "fps" in candidate_inputs:
+            # Prefer the final video's FPS as the canonical workflow default,
+            # then fall back to an LTX conditioning/audio frame rate.
+            for rate_key in ("fps", "frame_rate"):
+                for candidate in workflow_data.values():
+                    candidate_inputs = (
+                        candidate.get("inputs", {})
+                        if isinstance(candidate, dict)
+                        else {}
+                    )
+                    if rate_key not in candidate_inputs:
+                        continue
                     try:
-                        effective_fps = max(1, int(float(candidate_inputs["fps"])))
+                        effective_fps = max(1, int(float(candidate_inputs[rate_key])))
                     except (TypeError, ValueError, OverflowError):
                         effective_fps = None
                     if effective_fps is not None:
                         break
-        frame_length = None
+                if effective_fps is not None:
+                    break
+        wan_frame_length = None
         if requested_duration is not None and effective_fps is not None:
             target_frames = max(1, int(requested_duration) * int(effective_fps))
             # Wan video latent lengths use the 4n+1 sequence. Pick the nearest
             # valid length so the UI's seconds control has a real effect.
-            frame_length = max(1, ((target_frames + 1) // 4) * 4 + 1)
+            wan_frame_length = max(1, ((target_frames + 1) // 4) * 4 + 1)
+        has_ltx_video = any(
+            isinstance(candidate, dict)
+            and str(candidate.get("class_type") or "") in {
+                "EmptyLTXVLatentVideo",
+                "LTXVEmptyLatentAudio",
+                "LTXVConditioning",
+            }
+            for candidate in workflow_data.values()
+        )
+        ltx_frame_length = None
+        if has_ltx_video:
+            if requested_frames is not None:
+                ltx_frame_length = max(1, int(requested_frames))
+            elif requested_duration is not None and effective_fps is not None:
+                # LTX uses an inclusive final frame: duration * fps + 1.
+                ltx_frame_length = max(
+                    1, int(requested_duration) * int(effective_fps) + 1
+                )
+        sync_ltx_fps = has_ltx_video and effective_fps is not None and any(
+            value is not None
+            for value in (requested_duration, requested_frames, requested_fps)
+        )
+        has_wan_vace = any(
+            isinstance(candidate, dict)
+            and str(candidate.get("class_type") or "") == "WanVaceToVideo"
+            for candidate in workflow_data.values()
+        )
 
         for node_id, node in workflow_data.items():
             ctype = node.get("class_type", "")
             inputs = node.get("inputs", {})
             title = node.get("_meta", {}).get("title", "")
             title_lower = title.lower()
+            if ltx_frame_length is not None:
+                if ctype == "EmptyLTXVLatentVideo" and "length" in inputs:
+                    inputs["length"] = ltx_frame_length
+                elif ctype == "LTXVEmptyLatentAudio" and "frames_number" in inputs:
+                    inputs["frames_number"] = ltx_frame_length
+            if sync_ltx_fps:
+                if (
+                    ctype in {"LTXVEmptyLatentAudio", "LTXVConditioning"}
+                    and "frame_rate" in inputs
+                ):
+                    inputs["frame_rate"] = effective_fps
+                elif ctype == "CreateVideo" and "fps" in inputs:
+                    inputs["fps"] = effective_fps
             if ctype == "CLIPTextEncode" and "text" in inputs:
                 if "negative" in title_lower:
-                    inputs["text"] = negative_prompt
-                elif title == "CLIP Text Encode (Positive Prompt)" or not title:
+                    if has_negative_prompt:
+                        inputs["text"] = negative_prompt
+                else:
                     inputs["text"] = prompt
             elif ctype == "RandomNoise":
                 inputs["noise_seed"] = seed
             elif ctype == "Flux2Scheduler":
-                inputs["steps"] = steps
+                if body.get("_steps_explicit") is True:
+                    inputs["steps"] = steps
                 if dimensions_explicit:
                     inputs["width"] = width
                     inputs["height"] = height
@@ -1184,14 +1345,29 @@ def create_app() -> FastAPI:
                     inputs["width"] = width
                 if dimensions_explicit and "height" in inputs:
                     inputs["height"] = height
-                if "steps" in inputs:
+                if body.get("_steps_explicit") is True and "steps" in inputs:
                     inputs["steps"] = steps
                 if requested_fps is not None and "fps" in inputs:
                     inputs["fps"] = requested_fps
-                if frame_length is not None and "length" in inputs and (
-                    "wan" in ctype.lower() or "video" in ctype.lower()
+                if (
+                    wan_frame_length is not None
+                    and ctype != "EmptyLTXVLatentVideo"
+                    and "length" in inputs
+                    and (
+                        "wan" in ctype.lower() or "video" in ctype.lower()
+                    )
                 ):
-                    inputs["length"] = frame_length
+                    inputs["length"] = wan_frame_length
+                if (
+                    wan_frame_length is not None
+                    and has_wan_vace
+                    and ctype == "RepeatImageBatch"
+                    and "amount" in inputs
+                ):
+                    # VACE FLF2V needs first + (length - 2) masked transition
+                    # frames + last. Keep the image batch aligned whenever an
+                    # API caller changes duration or FPS.
+                    inputs["amount"] = max(1, wan_frame_length - 2)
                 if "seed" in inputs:
                     inputs["seed"] = seed
                 if "noise_seed" in inputs:
@@ -1224,10 +1400,8 @@ def create_app() -> FastAPI:
             task_records[task_id] = dict(reservation)
             _prune_task_records_locked()
 
-        wf_json_path = wf.folder / "workflow.json"
+        wf_json_path = _workflow_json_path_for_body(wf, body)
         try:
-            if not wf_json_path.exists():
-                raise HTTPException(500, detail="Workflow JSON 文件不存在")
             with open(wf_json_path, "r", encoding="utf-8") as f:
                 workflow_data = json.load(f)
             comfy_log_path = config.logs_dir / "comfyui.log"
@@ -1253,7 +1427,7 @@ def create_app() -> FastAPI:
                     current_task.clear()
             raise HTTPException(502, detail="ComfyUI 暂不可用，请稍后重试") from None
 
-        steps = int(body.get("steps") or 20)
+        steps = _workflow_step_count(workflow_data, body.get("steps") or 20)
         task_title = _task_title_from_body(body, wf.id)
         prompt_summary = _clean_task_text(body.get("prompt", ""), 220)
         task_info = {
@@ -1462,11 +1636,15 @@ def create_app() -> FastAPI:
         runtime_status = _local_runtime_status()
 
         # 模型完整性检查
-        model_status = _local_model_status()
-        flux2_ok = model_status["flux2"]
-        wan21_ok = model_status["wan21"]
-        qwen35_ok = model_status["qwen35"]
-        models_all_ok = qwen35_ok and flux2_ok and wan21_ok
+        checked_model_groups = check_model_groups(
+            BASE_DIR / "models",
+            MODEL_REQUIREMENTS,
+        )
+        models_all_ok = bool(checked_model_groups.get("all_ok"))
+        published_model_groups = {
+            key: "complete" if checked_model_groups.get(key) == "完整" else "missing"
+            for key in MODEL_REQUIREMENTS
+        }
 
         # 当前任务进度
         with _task_lock:
@@ -1502,9 +1680,7 @@ def create_app() -> FastAPI:
             "runtime": runtime_status,
             "models": {
                 "status": "complete" if models_all_ok else "incomplete",
-                "Flux2": "complete" if flux2_ok else "missing",
-                "Wan2.1": "complete" if wan21_ok else "missing",
-                "Qwen3.5": "complete" if qwen35_ok else "missing",
+                **published_model_groups,
                 "list": model_list,
                 "image": model_groups.get("image", []),
                 "video": model_groups.get("video", []),
@@ -1865,10 +2041,13 @@ def create_app() -> FastAPI:
             "negative_prompt": body.get("negative_prompt", ""),
             "width": width,
             "height": height,
-            "steps": body.get("steps", 20),
             "seed": body.get("seed", 0),
             "filename_prefix": f"{workflow_id}-{int(time.time())}",
         }
+        if body.get("steps") not in (None, ""):
+            workflow_body["steps"] = body.get("steps")
+        if body.get("image"):
+            workflow_body["image"] = body.get("image")
 
         try:
             submitted = await asyncio.to_thread(
