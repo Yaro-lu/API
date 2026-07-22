@@ -36,6 +36,13 @@ BASE_DIR = Path(__file__).parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+try:
+    APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+except OSError:
+    APP_VERSION = "dev"
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", APP_VERSION):
+    APP_VERSION = "dev"
+
 from app.config import Config  # noqa: E402
 from app.core.model_maintenance import MODEL_REQUIREMENTS, check_model_groups  # noqa: E402
 from app.core.runtime_package import REQUIRED_RUNTIME_PATHS, missing_runtime_paths  # noqa: E402
@@ -881,6 +888,19 @@ def _validated_generation_body(body: dict) -> dict:
         )
     if "seed" in result:
         result["seed"] = _normalize_seed(result.get("seed"))
+    if "filename_prefix" in result:
+        prefix = str(result.get("filename_prefix") or "").strip().replace("\\", "/")
+        parts = prefix.split("/")
+        if (
+            not prefix
+            or len(prefix) > 160
+            or prefix.startswith("/")
+            or re.match(r"^[A-Za-z]:", prefix)
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ord(char) < 32 or char in '<>:"|?*' for char in prefix)
+        ):
+            raise HTTPException(422, detail="filename_prefix 必须是安全的相对输出名称")
+        result["filename_prefix"] = prefix
     return result
 
 
@@ -1204,7 +1224,7 @@ def create_app() -> FastAPI:
             if state is not None:
                 state.set_offline()
 
-    app = FastAPI(title="Local AI API Gateway", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Local AI API Gateway", version=APP_VERSION, lifespan=lifespan)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
     app.add_middleware(SecurityHeadersMiddleware)
@@ -1335,8 +1355,9 @@ def create_app() -> FastAPI:
                     inputs["width"] = width
                     inputs["height"] = height
             elif ctype == "SaveImage":
-                prefix = body.get("filename_prefix", "Flux2-Klein")
-                inputs["filename_prefix"] = prefix
+                prefix = body.get("filename_prefix")
+                if prefix not in (None, ""):
+                    inputs["filename_prefix"] = prefix
             else:
                 for text_key in ("prompt", "text", "query", "content", "message", "messages", "user_prompt", "input", "instruction"):
                     if text_key in inputs and isinstance(inputs.get(text_key), str):
@@ -1602,7 +1623,7 @@ def create_app() -> FastAPI:
     @app.get("/health")
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "version": "1.0.0"}
+        return {"status": "ok", "version": APP_VERSION}
 
     @app.get("/v1/status")
     def status():
@@ -1662,7 +1683,7 @@ def create_app() -> FastAPI:
 
         return {
             "status": "ok",
-            "version": "1.0.0",
+            "version": APP_VERSION,
             "session_id": state.session_id,
             "base_url": public_base_url,
             "local_api": state.local_api,

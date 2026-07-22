@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 
+from app.config import Config
 from app.core.runtime_package import (
     REQUIRED_RUNTIME_PATHS,
     missing_runtime_paths,
@@ -21,6 +23,49 @@ from app.workflow_registry import merge_workflow_catalog, read_local_workflow_ca
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+
+
+class RoundedTag(tk.Canvas):
+    """Small auto-sized rounded label used for user-facing categories and states."""
+
+    def __init__(self, parent, *, text: str, font, foreground: str, fill: str):
+        try:
+            parent_bg = parent.cget("bg")
+        except Exception:
+            parent_bg = "#ffffff"
+        measured = tkfont.Font(font=font).measure(str(text))
+        width = max(44, measured + 22)
+        height = 24
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=parent_bg,
+            bd=0,
+            highlightthickness=0,
+        )
+        radius = 8
+        points = [
+            radius, 1, width - radius, 1, width - 1, 1,
+            width - 1, radius, width - 1, height - radius,
+            width - 1, height - 1, width - radius, height - 1,
+            radius, height - 1, 1, height - 1,
+            1, height - radius, 1, radius, 1, 1,
+        ]
+        self.create_polygon(
+            points,
+            smooth=True,
+            splinesteps=16,
+            fill=fill,
+            outline="",
+        )
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=text,
+            font=font,
+            fill=foreground,
+        )
 
 
 def runtime_package_status(base_dir: Path) -> tuple[str, list[str]]:
@@ -120,17 +165,16 @@ class StaticDashboardPages:
 
     def _scrollable_body(self, page) -> tk.Frame:
         """Return a full-width body that remains usable at the minimum window height."""
-        scrollbar = tk.Scrollbar(page, orient="vertical")
-        scrollbar.pack(side="right", fill="y", pady=(4, 14))
         canvas = tk.Canvas(
             page,
             bg=self.c["bg"],
             highlightthickness=0,
             bd=0,
-            yscrollcommand=scrollbar.set,
         )
+        scrollbar = self.app._vertical_scrollbar(page, canvas.yview)
+        scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=(4, 14))
+        canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.configure(command=canvas.yview)
 
         content = tk.Frame(canvas, bg=self.c["bg"])
         body = tk.Frame(content, bg=self.c["bg"])
@@ -144,12 +188,40 @@ class StaticDashboardPages:
             "<Configure>",
             lambda event: canvas.itemconfigure(content_window, width=event.width),
         )
-        canvas.bind(
-            "<MouseWheel>",
-            lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"),
-        )
         body._scroll_canvas = canvas
+        body._scrollbar = scrollbar
+        self._bind_mousewheel_tree(content, canvas)
         return body
+
+    @staticmethod
+    def _mousewheel_units(event) -> int:
+        """Translate Windows/macOS and X11 wheel events into canvas units."""
+        button_number = getattr(event, "num", None)
+        if button_number == 4:
+            return -1
+        if button_number == 5:
+            return 1
+        delta = int(getattr(event, "delta", 0) or 0)
+        if not delta:
+            return 0
+        magnitude = max(1, abs(delta) // 120)
+        return -magnitude if delta > 0 else magnitude
+
+    def _bind_mousewheel_tree(self, root, canvas) -> None:
+        """Make wheel scrolling work when the pointer is over any child control."""
+        def on_mousewheel(event):
+            units = self._mousewheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        stack = [root]
+        while stack:
+            widget = stack.pop()
+            widget.bind("<MouseWheel>", on_mousewheel, add="+")
+            widget.bind("<Button-4>", on_mousewheel, add="+")
+            widget.bind("<Button-5>", on_mousewheel, add="+")
+            stack.extend(widget.winfo_children())
 
     def _card(self, parent, height: int | None = None):
         card = self.app._card(parent)
@@ -197,14 +269,12 @@ class StaticDashboardPages:
             "neutral": (self.c["hover"], self.c["text2"]),
         }
         bg, fg = palette.get(tone, palette["neutral"])
-        return tk.Label(
+        return RoundedTag(
             parent,
-            text=f"  {text}  ",
+            text=text,
             font=self.f["small"],
-            fg=fg,
-            bg=bg,
-            padx=4,
-            pady=3,
+            foreground=fg,
+            fill=bg,
         )
 
     def _metric(
@@ -421,17 +491,16 @@ class StaticDashboardPages:
         rows_parent = listing
         scroll_canvas = None
         if len(workflows) > 3:
-            scrollbar = tk.Scrollbar(listing, orient="vertical")
-            scrollbar.pack(side="right", fill="y", padx=(0, 3), pady=5)
             scroll_canvas = tk.Canvas(
                 listing,
                 bg=self.c["card"],
                 highlightthickness=0,
                 bd=0,
-                yscrollcommand=scrollbar.set,
             )
+            scrollbar = self.app._vertical_scrollbar(listing, scroll_canvas.yview)
+            scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=5)
+            scroll_canvas.configure(yscrollcommand=scrollbar.set)
             scroll_canvas.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=3)
-            scrollbar.configure(command=scroll_canvas.yview)
             rows_parent = tk.Frame(scroll_canvas, bg=self.c["card"])
             rows_window = scroll_canvas.create_window((0, 0), window=rows_parent, anchor="nw")
             rows_parent.bind(
@@ -452,7 +521,7 @@ class StaticDashboardPages:
             tk.Label(listing, text="点击右上角“添加工作流”即可开始。", font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack()
         else:
             for index, workflow in enumerate(workflows):
-                glyph, kind, type_tone = self._workflow_type_label(workflow)
+                _glyph, kind, type_tone = self._workflow_type_label(workflow)
                 state, state_tone, detail, model_key = self._workflow_state(workflow)
                 tone_fg = {
                     "primary": self.c["primary"],
@@ -470,13 +539,7 @@ class StaticDashboardPages:
                     workflow.get("name") or workflow.get("id") or "未命名工作流",
                     18,
                 )
-                tk.Label(
-                    name_line,
-                    text=f"{glyph} {kind}",
-                    font=self.f["tiny"],
-                    fg=tone_fg,
-                    bg=self.c["card"],
-                ).pack(side="left", padx=(0, 7))
+                self._badge(name_line, kind, type_tone).pack(side="left", padx=(0, 7))
                 tk.Label(name_line, text=display_name, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
                 if workflow.get("is_default"):
                     self._badge(name_line, "默认", "primary").pack(side="left", padx=(7, 0))
@@ -491,10 +554,10 @@ class StaticDashboardPages:
                 if state_tone == "warn" and model_key:
                     self._action(
                         row,
-                        "修复",
+                        "安装模型",
                         lambda key=model_key: self.app._show_model_install_help(key),
                         "primary",
-                        58,
+                        78,
                     ).pack(side="right", padx=(6, 0))
                 self._action(
                     row,
@@ -531,15 +594,7 @@ class StaticDashboardPages:
                     tk.Frame(rows_parent, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
 
             if scroll_canvas is not None:
-                def scroll(event, canvas=scroll_canvas):
-                    canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-                def bind_wheel(widget):
-                    widget.bind("<MouseWheel>", scroll, add="+")
-                    for child in widget.winfo_children():
-                        bind_wheel(child)
-
-                bind_wheel(rows_parent)
+                self._bind_mousewheel_tree(listing, scroll_canvas)
 
         guide = self._card(body, 96)
         guide.pack(fill="x")
@@ -634,25 +689,24 @@ class StaticDashboardPages:
                 ("重新检查", lambda: self.app._start_background_model_recheck(), "primary"),
             ],
         )
-        models_card = self._card(body, max(198, 22 + len(model_keys) * 28))
+        models_card = self._card(body, max(220, 22 + len(model_keys) * 36))
         models_card.pack(fill="x", pady=(0, 14))
         labels = {
-            "Qwen3.5": ("Qwen 3.5 文字生成", "文本模型", "文", "primary"),
-            "Flux2": ("FLUX.2 Klein 9B", "文生图", "图", "success"),
-            "Flux2 Klein 4B": ("FLUX.2 Klein 4B", "文/图生图", "图", "primary"),
-            "Z-Image": ("Z-Image Turbo", "文生图", "图", "success"),
-            "Wan2.1": ("WAN2.1 VACE 1.3B", "首尾帧", "影", "warn"),
-            "Wan2.1 FLF2V 14B": ("WAN2.1 14B（原工作流）", "首尾帧", "影", "warn"),
-            "LTX-2.3": ("LTX-2.3 22B", "首尾帧", "影", "warn"),
-            "Wan2.1 Fun 1.3B": ("WAN2.1-Fun 1.3B", "首尾帧", "影", "warn"),
+            "Qwen3.5": ("Qwen 3.5 文字生成", "文本模型", "primary"),
+            "Flux2": ("FLUX.2 Klein 9B", "文生图", "success"),
+            "Flux2 Klein 4B": ("FLUX.2 Klein 4B", "文/图生图", "primary"),
+            "Z-Image": ("Z-Image Turbo", "文生图", "success"),
+            "Wan2.1": ("WAN2.1 VACE 1.3B", "首尾帧", "warn"),
+            "Wan2.1 FLF2V 14B": ("WAN2.1 14B（原工作流）", "首尾帧", "warn"),
+            "LTX-2.3": ("LTX-2.3 22B", "首尾帧", "warn"),
+            "Wan2.1 Fun 1.3B": ("WAN2.1-Fun 1.3B", "首尾帧", "warn"),
         }
         for index, key in enumerate(model_keys):
-            title, kind, glyph, tone = labels.get(
+            title, kind, tone = labels.get(
                 key,
                 (
                     str(MODEL_REQUIREMENTS.get(key, {}).get("title") or key),
                     "模型",
-                    "模",
                     "primary",
                 ),
             )
@@ -660,22 +714,11 @@ class StaticDashboardPages:
             ready = model_status.get(key) == "完整"
             row = tk.Frame(models_card, bg=self.c["card"])
             row.pack(fill="x", padx=14, pady=(5 if index == 0 else 3, 3))
-            icon_bg = {
-                "primary": self.c["soft_primary"],
-                "success": self.c["soft_success"],
-                "warn": self.c["soft_warn"],
-            }[tone]
-            icon_fg = {
-                "primary": self.c["primary"],
-                "success": self.c["success"],
-                "warn": self.c["warn"],
-            }[tone]
-            tk.Label(row, text=glyph, font=self.f["bold"], fg=icon_fg, bg=icon_bg, width=3, pady=2).pack(side="left")
+            self._badge(row, kind, tone).pack(side="left")
             tk.Label(row, text=title, font=self.f["bold"], fg=self.c["text"], bg=self.c["card"]).pack(side="left", fill="x", expand=True, padx=(11, 0))
-            tk.Label(row, text=kind, width=7, font=self.f["small"], fg=self.c["text2"], bg=self.c["card"]).pack(side="left")
             self._badge(row, "完整" if ready else f"缺少 {len(missing)} 个", "success" if ready else "warn").pack(side="left", padx=(6, 10))
             if not ready:
-                self._action(row, "下载缺失", lambda item=key: self.app._show_model_install_help(item), "primary", 88).pack(side="right")
+                self._action(row, "下载模型", lambda item=key: self.app._show_model_install_help(item), "primary", 88).pack(side="right")
             if index < len(model_keys) - 1:
                 tk.Frame(models_card, bg=self.c["border2"], height=1).pack(fill="x", padx=14)
 
@@ -695,10 +738,12 @@ class StaticDashboardPages:
             self._action(cell_head, "打开", command, "plain", 66).pack(side="right")
             tk.Label(cell, text=self._short_path(path, 30), font=self.f["tiny"], fg=self.c["muted"], bg=self.c["card"]).pack(anchor="w", pady=(3, 0))
 
+        self._bind_mousewheel_tree(body, body._scroll_canvas)
+
     # ── settings ───────────────────────────────────────────
     def _build_settings(self, page):
         body = self._scrollable_body(page)
-        self._section_heading(body, "访问与安全", "用于其他软件调用本客户端")
+        self._section_heading(body, "连接与安全", "管理其他软件连接本客户端时使用的密钥")
         access = self._card(body, 94)
         access.pack(fill="x", pady=(0, 14))
         access_left = tk.Frame(access, bg=self.c["card"])
@@ -714,7 +759,7 @@ class StaticDashboardPages:
         self._action(access_actions, "修改密钥", self.app._edit_api_key, "plain", 84).pack(side="left", padx=(0, 8))
         self._action(access_actions, "复制密钥", self.app._copy_api_key, "primary", 84).pack(side="left")
 
-        self._section_heading(body, "环境维护", "核心组件可以单独更新")
+        self._section_heading(body, "组件更新", "修复运行环境或更新内置 ComfyUI")
         maintenance = self._card(body, 94)
         maintenance.pack(fill="x", pady=(0, 14))
         maintenance_left = tk.Frame(maintenance, bg=self.c["card"])
@@ -750,7 +795,7 @@ class StaticDashboardPages:
             132,
         ).pack(side="left")
 
-        self._section_heading(body, "文件存放位置", "当前随项目保存，点击即可打开查看")
+        self._section_heading(body, "文件位置", "快速打开模型、工作流、生成结果和日志")
         paths_card = self._card(body, 188)
         paths_card.pack(fill="x", pady=(0, 14))
         path_rows = [
@@ -775,7 +820,7 @@ class StaticDashboardPages:
 
         behavior = self._card(lower, 168)
         behavior.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        tk.Label(behavior, text="运行方式", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w", padx=16, pady=(13, 7))
+        tk.Label(behavior, text="使用方式", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(anchor="w", padx=16, pady=(13, 7))
         behavior_rows = [
             ("关闭主窗口", "停止全部后台服务"),
             ("最小化窗口", "继续后台运行"),
@@ -792,27 +837,19 @@ class StaticDashboardPages:
         advanced.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         head = tk.Frame(advanced, bg=self.c["card"])
         head.pack(fill="x", padx=16, pady=(13, 7))
-        tk.Label(head, text="专业配置", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
+        tk.Label(head, text="高级设置", font=self.f["h2"], fg=self.c["text"], bg=self.c["card"]).pack(side="left")
         self._badge(head, "高级", "primary").pack(side="right")
+        local_config = Config(BASE_DIR)
         advanced_rows = [
-            ("API", "端口 18188"),
-            ("ComfyUI", "端口 8188"),
-            ("Tunnel", "自动建立公网连接"),
+            ("本地接口", f"端口 {local_config.server_port}"),
+            ("ComfyUI", f"端口 {str(local_config.comfyui_url).rsplit(':', 1)[-1]}"),
+            ("公网连接", "启动后自动建立"),
         ]
         for label, value in advanced_rows:
             row = tk.Frame(advanced, bg=self.c["card"])
             row.pack(fill="x", padx=16, pady=3)
             tk.Label(row, text=label, font=self.f["small"], fg=self.c["muted"], bg=self.c["card"]).pack(side="left")
             tk.Label(row, text=value, font=self.f["small"], fg=self.c["text"], bg=self.c["card"]).pack(side="right")
-        self._action(advanced, "打开配置文件", self.app._open_runtime_config, "plain", 106).pack(anchor="e", padx=16, pady=(7, 0))
+        self._action(advanced, "编辑 TXT 设置", self.app._open_runtime_config, "plain", 112).pack(anchor="e", padx=16, pady=(7, 0))
 
-        settings_canvas = body._scroll_canvas
-
-        def scroll_settings(event):
-            settings_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-        stack = [body]
-        while stack:
-            widget = stack.pop()
-            widget.bind("<MouseWheel>", scroll_settings, add="+")
-            stack.extend(widget.winfo_children())
+        self._bind_mousewheel_tree(body, body._scroll_canvas)

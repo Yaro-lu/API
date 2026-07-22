@@ -4,6 +4,7 @@ import time
 import unittest
 import io
 import json
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +23,31 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         app._shutting_down = False
         app._last_health = {}
         return app
+
+    def test_user_not_found_is_presented_as_wrong_credentials(self):
+        app = self._app()
+        response = io.BytesIO(
+            b'{"error":{"code":"USER_NOT_FOUND","message":"account not registered"}}'
+        )
+        error = urllib.error.HTTPError(
+            "https://example.test/api/auth/login",
+            401,
+            "Unauthorized",
+            {},
+            response,
+        )
+
+        self.assertEqual(app._format_http_error(error), "用户名或密码错误")
+
+    def test_model_download_sources_include_domestic_and_official_links(self):
+        app = self._app()
+        official = "https://huggingface.co/org/repo/resolve/main/model.safetensors"
+
+        sources = app._model_download_sources(official)
+
+        self.assertEqual(sources[0][0], "国内镜像")
+        self.assertTrue(sources[0][1].startswith("https://hf-mirror.com/"))
+        self.assertEqual(sources[1], ("官方源", official))
 
     def test_system_environment_rejects_pre_cuda_13_driver(self):
         result = main_gateway._check_system_env(
@@ -81,6 +107,25 @@ class RuntimeMaintenanceTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["gpu_name"], "NVIDIA GeForce RTX 3060")
+
+    def test_torch_probe_allows_slow_first_cuda_initialisation(self):
+        run_command = mock.Mock(
+            return_value=mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "torch_version": "2.9.1+cu130",
+                        "cuda_available": True,
+                        "gpu_name": "NVIDIA GeForce RTX 3060 Ti",
+                    }
+                ),
+            )
+        )
+
+        result = main_gateway._check_torch(Path("runtime/python/python.exe"), run_command)
+
+        self.assertTrue(result["success"])
+        self.assertGreaterEqual(run_command.call_args.kwargs["timeout"], 90)
 
     def test_maintenance_guard_records_and_releases_owned_services(self):
         app = self._app()
@@ -239,6 +284,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
     def test_resuming_model_download_is_still_an_active_background_task(self):
         self.assertTrue(main_gateway._model_download_active({"state": "downloading"}))
         self.assertTrue(main_gateway._model_download_active({"state": "resuming"}))
+        self.assertTrue(main_gateway._model_download_active({"state": "cancelling"}))
         self.assertTrue(main_gateway._model_download_active({"state": "abandoning"}))
         self.assertFalse(main_gateway._model_download_active({"state": "paused"}))
 
@@ -583,6 +629,84 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         self.assertEqual(second["state"], "idle")
         self.assertIs(app._active_model_transfers[app._model_transfer_key(target)], first)
 
+    def test_cancel_waits_for_writer_then_deletes_partial_and_metadata(self):
+        app = self._app()
+        app.after = lambda _delay, callback: callback()
+        app._footer_label = mock.Mock()
+        writer_started = threading.Event()
+        allow_exit = threading.Event()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "model.safetensors"
+            partial = target.with_suffix(target.suffix + ".part")
+            metadata = partial.with_suffix(partial.suffix + ".json")
+            partial.write_bytes(b"partial")
+            metadata.write_text("{}", encoding="utf-8")
+            stop_event = threading.Event()
+
+            def writer():
+                writer_started.set()
+                stop_event.wait(2)
+                allow_exit.wait(2)
+
+            worker = threading.Thread(target=writer, daemon=True)
+            worker.start()
+            self.assertTrue(writer_started.wait(1))
+            control = {
+                "state": "downloading",
+                "target": target,
+                "pause_event": threading.Event(),
+                "stop_event": stop_event,
+                "status_var": mock.Mock(),
+                "progress_var": mock.Mock(),
+                "button": mock.Mock(),
+                "pause_button": mock.Mock(),
+                "cancel_button": mock.Mock(),
+                "worker": worker,
+                "views": [],
+            }
+            self.assertTrue(app._claim_model_transfer(control))
+
+            app._cancel_model_download(control)
+
+            self.assertEqual(control["state"], "cancelling")
+            self.assertTrue(partial.exists())
+            allow_exit.set()
+            deadline = time.time() + 2
+            while time.time() < deadline and control["state"] != "cancelled":
+                time.sleep(0.01)
+
+            self.assertEqual(control["state"], "cancelled")
+            self.assertFalse(partial.exists())
+            self.assertFalse(metadata.exists())
+            self.assertFalse(app._model_transfer_active(target))
+
+    def test_reopened_download_view_receives_shared_progress(self):
+        app = self._app()
+        owner_status = mock.Mock()
+        owner_progress = mock.Mock()
+        attached_status = mock.Mock()
+        attached_progress = mock.Mock()
+        owner = {
+            "state": "downloading",
+            "target": Path(tempfile.gettempdir()) / "lingjing-attached-progress.safetensors",
+            "url": "https://example.invalid/model.safetensors",
+            "status_var": owner_status,
+            "progress_var": owner_progress,
+        }
+        attached = {
+            "owner": owner,
+            "status_var": attached_status,
+            "progress_var": attached_progress,
+        }
+        owner["views"] = [owner, attached]
+
+        app._update_model_download_progress(owner, 42.6, 426, 1000)
+
+        owner_progress.set.assert_called_with(42.6)
+        attached_progress.set.assert_called_with(42.6)
+        self.assertIn("43%", attached_status.set.call_args.args[0])
+
     def test_runtime_update_result_reports_rollback_in_chinese(self):
         app = self._app()
         result = {
@@ -791,7 +915,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         showerror.assert_called_once()
         self.assertIn("先修复运行环境", showerror.call_args.args[1])
 
-    def test_completed_interrupted_recovery_allows_startup_and_prompts_once(self):
+    def test_completed_interrupted_recovery_allows_startup_without_repeat_popup(self):
         app = self._app()
         recovery = {
             "status": "recovered",
@@ -815,18 +939,14 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             app._show_comfyui_recovery_result()
 
         self.assertFalse(app._runtime_start_blocked)
-        showinfo.assert_called_once()
-        self.assertIn("旧核心已安全恢复", showinfo.call_args.args[1])
+        showinfo.assert_not_called()
 
     def test_active_detached_recovery_blocks_backend_prompts_and_closes_once(self):
         app = self._app()
-        app._anim_running = True
-        app._heartbeat_run = True
-        app._poll_run = True
+        app._process_supervisor = mock.Mock()
+        app._show_active_comfyui_update_notice = mock.Mock()
         app._footer_label = mock.Mock()
         app.after = lambda _delay, callback: callback()
-        app._complete_destroy = mock.Mock()
-        app._process_supervisor = mock.Mock()
         recovery = {
             "status": "recovery_in_progress",
             "success": False,
@@ -843,8 +963,6 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             mock.patch.object(
                 main_gateway, "consume_comfyui_update_result", return_value=None
             ),
-            mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo,
-            mock.patch.object(main_gateway, "_release_instance_lock") as release_lock,
         ):
             app._capture_startup_update_results()
             self.assertFalse(app._request_backend_start("启动后台"))
@@ -852,12 +970,8 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             app._show_comfyui_recovery_result()
 
         self.assertTrue(app._runtime_start_blocked)
-        self.assertTrue(app._shutting_down)
-        showinfo.assert_called_once()
-        self.assertIn("后台更新仍在进行", showinfo.call_args.args[1])
-        self.assertIn("若未重启再手动打开", showinfo.call_args.args[1])
-        release_lock.assert_called_once_with()
-        app._complete_destroy.assert_called_once_with()
+        self.assertFalse(app._shutting_down)
+        app._show_active_comfyui_update_notice.assert_called_once_with()
         app._process_supervisor.shutdown_all.assert_not_called()
 
     def test_overlay_timeout_keeps_staging_when_process_cannot_be_stopped(self):
@@ -905,8 +1019,9 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         self.assertIn("回滚检查提示", message)
         self.assertIn("清单待下次启动清理", message)
 
-    def test_comfyui_update_success_surfaces_bounded_cleanup_warnings(self):
+    def test_comfyui_update_success_is_silent_after_manual_restart(self):
         app = self._app()
+        app._footer_label = mock.Mock()
         result = {
             "status": "installed",
             "success": True,
@@ -926,12 +1041,11 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             app._show_comfyui_update_result()
 
         showinfo.assert_not_called()
-        title, message = showwarning.call_args.args
-        self.assertIn("有提示", title)
-        self.assertIn("旧备份仍被占用", message)
-        self.assertIn("回滚日志提示", message)
-        self.assertIn("清单文件稍后删除", message)
-        self.assertLess(len(message), 2400)
+        showwarning.assert_not_called()
+        self.assertIn(
+            "ComfyUI 已更新",
+            app._footer_label.config.call_args.kwargs["text"],
+        )
 
     def test_comfyui_update_handoff_uses_parent_wait_and_ready_manifest(self):
         app = self._app()
@@ -942,6 +1056,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         app._exit_for_runtime_update = mock.Mock()
         app._post_to_ui = lambda callback, delay=0: (callback(), True)[1]
         app.after = mock.Mock()
+        app._show_manual_restart_notice = mock.Mock(return_value=True)
 
         popup = mock.MagicMock()
         popup.winfo_exists.return_value = True
@@ -958,7 +1073,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         }
         app._create_runtime_progress_dialog = mock.Mock(return_value=dialog)
 
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             live = base / "runtime" / "ComfyUI"
             live.mkdir(parents=True)
@@ -1013,8 +1128,12 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             self.assertEqual(payload["status"], "ready")
             launch_worker.assert_called_once_with(
                 manifest,
-                restart_client=base / "runtime" / "python" / "pythonw.exe",
+                restart_client=None,
                 parent_pid=4321,
+            )
+            app._show_manual_restart_notice.assert_called_once_with(
+                dialog,
+                component="ComfyUI",
             )
             app._exit_for_runtime_update.assert_called_once_with(popup)
             self.assertTrue(app._runtime_maintenance_in_progress)
@@ -1052,7 +1171,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
         }
         app._create_runtime_progress_dialog = mock.Mock(return_value=dialog)
 
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             live = base / "runtime" / "ComfyUI"
             live.mkdir(parents=True)

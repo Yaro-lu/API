@@ -25,7 +25,7 @@
 ### 发布包结构
 
 ```text
-LingJingAI-Setup-1.0.0-win-x64.exe                 轻量客户端
+LingJingAI-Setup-1.0.1-win-x64.exe                 轻量客户端
 runtime-nvidia-rtx20plus-cu130-v1.0.0.7z           独立运行环境包
 ```
 
@@ -130,4 +130,4 @@ Trae / VS Code 应使用 `runtime\python\python.exe`。仓库中的 `.vscode/set
 
 本仓库已公开，但尚未添加开源许可证，仅作学习使用
 
-当前版本：`1.0.0`
+当前版本：`1.0.1`

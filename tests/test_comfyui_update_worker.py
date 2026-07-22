@@ -14,7 +14,7 @@ from app.core import comfyui_update_worker as worker
 
 
 OPERATION_ID = "a" * 32
-TEMP_ROOT = Path("E:/CodexTemp")
+TEMP_ROOT = Path(__file__).resolve().parents[1]
 RELEASE_METADATA = {
     "repository_url": "https://github.com/Comfy-Org/ComfyUI",
     "tag_name": "v0.4.0",

@@ -16,6 +16,7 @@ class LightweightReleaseContractTests(unittest.TestCase):
             encoding="utf-8-sig"
         )
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8-sig")
+        cls.version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         cls.runtime_script = (ROOT / "scripts" / "build_runtime_release.ps1").read_text(
             encoding="utf-8-sig"
         )
@@ -142,10 +143,27 @@ class LightweightReleaseContractTests(unittest.TestCase):
     def test_release_secret_scan_includes_fine_grained_github_tokens(self):
         self.assertIn("github_pat_", self.release_script)
 
+    def test_release_rechecks_policy_after_startup_smoke_test(self):
+        smoke_index = self.release_script.index(
+            "Assert-StagedClientImportable -StageRoot $StageRoot"
+        )
+        rescan_index = self.release_script.index(
+            "Assert-StagingPolicy -StageRoot $StageRoot",
+            smoke_index,
+        )
+        self.assertGreater(rescan_index, smoke_index)
+
     def test_readme_documents_separate_program_environment_and_models(self):
         for marker in ("轻量客户端", "独立运行环境包", "不包含模型"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.readme)
+
+    def test_readme_client_filename_and_current_version_follow_version_file(self):
+        self.assertIn(
+            f"LingJingAI-Setup-{self.version}-win-x64.exe",
+            self.readme,
+        )
+        self.assertIn(f"当前版本：`{self.version}`", self.readme)
 
     def test_runtime_builder_supports_external_source_and_emits_release_manifest(self):
         for marker in (

@@ -17,6 +17,7 @@ import queue
 import re
 import shutil
 import tempfile
+import unicodedata
 import webbrowser
 import msvcrt
 import uuid
@@ -34,6 +35,13 @@ MIN_NVIDIA_DRIVER_MAJOR = 580
 MIN_SUPPORTED_VRAM_MB = 8 * 1024
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+try:
+    APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+except OSError:
+    APP_VERSION = "dev"
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", APP_VERSION):
+    APP_VERSION = "dev"
 
 from app.core.runtime_package import (  # noqa: E402
     REQUIRED_RUNTIME_PATHS,
@@ -77,6 +85,7 @@ from app.core.model_maintenance import (  # noqa: E402
 )
 from app.core.runtime_state import RuntimeState  # noqa: E402
 from app.core.secret_store import protect_text, unprotect_text  # noqa: E402
+from app.config import Config  # noqa: E402
 from app.core.workflow_dependencies import (  # noqa: E402
     clear_model_index_cache,
     normalize_workflow_dependencies,
@@ -139,13 +148,13 @@ F = {
     "title":  ("Microsoft YaHei UI", 14, "bold"),
     "h2":     ("Microsoft YaHei UI", 11, "bold"),
     "bold":   ("Microsoft YaHei UI", 10, "bold"),
-    "normal": ("Microsoft YaHei UI", 9),
+    "normal": ("Microsoft YaHei UI", 10),
     "button": ("Microsoft YaHei UI", 10),
     "body":   ("Microsoft YaHei UI", 10),
-    "small":  ("Microsoft YaHei UI", 8),
-    "tiny":   ("Microsoft YaHei UI", 8),
-    "mono":   ("Consolas", 9),
-    "url":    ("Consolas", 9),
+    "small":  ("Microsoft YaHei UI", 9),
+    "tiny":   ("Microsoft YaHei UI", 9),
+    "mono":   ("Consolas", 10),
+    "url":    ("Consolas", 10),
 }
 
 RUNTIME_INSTALL_STAGES = {
@@ -181,14 +190,19 @@ LAYOUT = {
     "info_h": 72,
     "left_w": 240,
     "actions_h": 42,
-    "footer_h": 28,
+    "footer_h": 32,
 }
 
-API_PORT = 18188
-COMFY_PORT = 8188
+_LOCAL_CONFIG = Config(BASE_DIR)
+API_PORT = _LOCAL_CONFIG.server_port
+try:
+    COMFY_PORT = int(urlsplit(_LOCAL_CONFIG.comfyui_url).port or 8188)
+except (TypeError, ValueError):
+    COMFY_PORT = 8188
 API_BASE = f"http://127.0.0.1:{API_PORT}"
-COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
+COMFY_BASE = _LOCAL_CONFIG.comfyui_url.rstrip("/") or f"http://127.0.0.1:{COMFY_PORT}"
 SERVER_SYNC_MAX_RETRIES = 3
+TORCH_PROBE_TIMEOUT_SECONDS = 90
 _LOOPBACK_SERVER_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _RUNTIME_UPDATE_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -198,15 +212,10 @@ _RUNTIME_UPDATE_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # ══════════════════════════════════════════════════════
 
 def _load_local_config():
-    path = BASE_DIR / "runtime" / "config.local.json"
     try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        return Config(BASE_DIR).as_dict()
     except Exception:
-        pass
-    return {}
+        return Config(BASE_DIR)._default_config()
 
 
 def _detect_gpu_memory_mb():
@@ -373,7 +382,41 @@ def _check_models_status() -> dict:
 
 
 def _model_download_active(control: dict) -> bool:
-    return str(control.get("state") or "") in {"downloading", "resuming", "abandoning"}
+    return str(control.get("state") or "") in {
+        "downloading",
+        "resuming",
+        "cancelling",
+        "abandoning",
+    }
+
+
+_ACCOUNT_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def _normalize_account_email(value: str) -> str:
+    """Normalize paste-friendly punctuation without changing a valid address."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    normalized = normalized.replace("\u200b", "").replace("\ufeff", "")
+    if "@" not in normalized:
+        return normalized
+    local, domain = normalized.rsplit("@", 1)
+    return f"{local}@{domain.lower()}"
+
+
+def _account_email_error(value: str) -> str:
+    email = _normalize_account_email(value)
+    if not email:
+        return "请填写账号邮箱。"
+    if len(email) > 254 or not _ACCOUNT_EMAIL_RE.fullmatch(email):
+        return "邮箱格式不正确，请检查 @ 和英文句点。"
+    local = email.rsplit("@", 1)[0]
+    if len(local) > 64 or local.startswith(".") or local.endswith(".") or ".." in local:
+        return "邮箱格式不正确，请检查英文句点的位置。"
+    return ""
 
 
 def _check_torch(python_path: Path, run_command=subprocess.run) -> dict:
@@ -394,7 +437,9 @@ except Exception as e:
     try:
         proc = run_command(
             [str(python_path), "-c", check_script],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=TORCH_PROBE_TIMEOUT_SECONDS,
             cwd=str(BASE_DIR),
         )
         if proc.returncode != 0:
@@ -562,6 +607,106 @@ class RoundedFrame(tk.Frame):
             x1, y1,
         ]
         return canvas.create_polygon(points, smooth=True, splinesteps=16, **kwargs)
+
+
+class SlimRoundedScrollbar(tk.Canvas):
+    """A narrow, brand-coloured vertical scrollbar without arrow buttons."""
+
+    def __init__(
+        self,
+        parent,
+        command,
+        *,
+        width=6,
+        bar_width=4,
+        color=None,
+        active_color=None,
+        trough_color=None,
+        **kwargs,
+    ):
+        self.bar_width = max(3, int(bar_width))
+        self._command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_offset = None
+        self._thumb_bounds = (0.0, 0.0)
+        self._color = color or C["primary"]
+        self._active_color = active_color or C["primary2"]
+        self._trough_color = trough_color or C["card"]
+        super().__init__(
+            parent,
+            width=max(self.bar_width, int(width)),
+            bg=self._trough_color,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            cursor="hand2",
+            **kwargs,
+        )
+        self.bind("<Configure>", self._redraw)
+        self.bind("<Button-1>", self._begin_drag)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<Enter>", lambda _event: self._redraw(color=self._active_color))
+        self.bind("<Leave>", lambda _event: self._redraw())
+
+    def set(self, first, last):
+        try:
+            self._first = max(0.0, min(1.0, float(first)))
+            self._last = max(self._first, min(1.0, float(last)))
+        except (TypeError, ValueError):
+            self._first, self._last = 0.0, 1.0
+        self._redraw()
+
+    def _redraw(self, _event=None, color=None):
+        if not self.winfo_exists():
+            return
+        height = max(2, self.winfo_height())
+        width = max(self.bar_width, self.winfo_width())
+        span = max(0.0, self._last - self._first)
+        thumb_h = min(height, max(18, int(round(height * span))))
+        movable = max(0, height - thumb_h)
+        denominator = max(0.000001, 1.0 - span)
+        top = int(round(movable * min(1.0, self._first / denominator)))
+        bottom = min(height, top + thumb_h)
+        left = max(0, (width - self.bar_width) // 2)
+        right = left + self.bar_width
+        self._thumb_bounds = (float(top), float(bottom))
+        self.delete("thumb")
+        radius = min(self.bar_width / 2, max(1.0, (bottom - top) / 2))
+        RoundedFrame._round_rect(
+            self,
+            left,
+            top,
+            right,
+            bottom,
+            radius,
+            fill=color or self._color,
+            outline="",
+            tags=("thumb",),
+        )
+
+    def _begin_drag(self, event):
+        top, bottom = self._thumb_bounds
+        if top <= event.y <= bottom:
+            self._drag_offset = event.y - top
+        else:
+            self._drag_offset = max(0.0, (bottom - top) / 2)
+            self._move_to_pointer(event.y)
+        self._redraw(color=self._active_color)
+
+    def _drag(self, event):
+        self._move_to_pointer(event.y)
+
+    def _move_to_pointer(self, pointer_y):
+        if not callable(self._command):
+            return
+        height = max(1.0, float(self.winfo_height()))
+        top, bottom = self._thumb_bounds
+        thumb_h = max(1.0, bottom - top)
+        movable = max(1.0, height - thumb_h)
+        offset = self._drag_offset if self._drag_offset is not None else thumb_h / 2
+        fraction = max(0.0, min(1.0, (float(pointer_y) - offset) / movable))
+        self._command("moveto", fraction)
 
 WindowBase = ctk.CTk if CTK_AVAILABLE else tk.Tk
 
@@ -785,7 +930,7 @@ class GatewayApp(WindowBase):
 
     def _get_server_email(self) -> str:
         fallback = self._server_email_var.get() if hasattr(self, "_server_email_var") else self._server_user_email
-        return self._entry_text("_server_email_entry", fallback).strip()
+        return _normalize_account_email(self._entry_text("_server_email_entry", fallback))
 
     def _get_server_password(self) -> str:
         fallback = self._server_password_var.get() if hasattr(self, "_server_password_var") else ""
@@ -794,8 +939,10 @@ class GatewayApp(WindowBase):
     def _set_account_form_values(self, server_url=None, email=None, password=None):
         if server_url is not None:
             self._server_url_value = str(server_url).strip().rstrip("/") or self._server_url_value
+        if email is not None:
+            email = _normalize_account_email(email)
         if email is not None and self._server_mode != "logged_in":
-            self._server_user_email = str(email).strip()
+            self._server_user_email = email
         values = {
             "_server_url_entry": (server_url, "_server_url_var"),
             "_server_email_entry": (email, "_server_email_var"),
@@ -917,6 +1064,18 @@ class GatewayApp(WindowBase):
             frame.pack(**pack_kwargs)
         return frame
 
+    def _vertical_scrollbar(self, parent, command):
+        """Create the single brand scrollbar used by every dashboard page."""
+        return SlimRoundedScrollbar(
+            parent,
+            command,
+            width=6,
+            bar_width=4,
+            color=C["primary"],
+            active_color=C["primary2"],
+            trough_color=C["card"],
+        )
+
     def _set_window_icon(self):
         icon_png = BASE_DIR / "icon.png"
         icon_ico = GUI_ASSET_DIR / "app.ico"
@@ -979,13 +1138,14 @@ class GatewayApp(WindowBase):
             pady=2,
         )
 
-    def _entry_widget(self, parent, show=None, width=None):
+    def _entry_widget(self, parent, show=None, width=None, font=None, height=None):
+        entry_font = font or F["small"]
         if CTK_AVAILABLE:
             entry = ctk.CTkEntry(
                 parent,
-                font=F["small"],
+                font=entry_font,
                 width=width or 180,
-                height=34,
+                height=height or 34,
                 corner_radius=8,
                 fg_color=C["entry"],
                 text_color=C["text"],
@@ -996,7 +1156,7 @@ class GatewayApp(WindowBase):
             return entry
         return tk.Entry(
             parent,
-            font=F["small"],
+            font=entry_font,
             bg=C["entry"],
             fg=C["text"],
             insertbackground=C["text"],
@@ -1235,7 +1395,7 @@ class GatewayApp(WindowBase):
         brand_text = tk.Frame(brand, bg=C["sidebar"])
         brand_text.pack(side="left", fill="x", expand=True)
         tk.Label(brand_text, text="灵境造片厂", font=("Microsoft YaHei UI", 13, "bold"), fg=C["text"], bg=C["sidebar"]).pack(anchor="w")
-        tk.Label(brand_text, text="LOCAL AI GATEWAY", font=("Consolas", 7), fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", pady=(2, 0))
+        tk.Label(brand_text, text="LOCAL AI GATEWAY", font=F["tiny"], fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", pady=(2, 0))
 
         tk.Frame(self._sidebar, bg=C["sidebar_border"], height=1).pack(fill="x", padx=14, pady=(0, 12))
         tk.Label(self._sidebar, text="工作台", font=F["tiny"], fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=22, pady=(0, 7))
@@ -1291,11 +1451,7 @@ class GatewayApp(WindowBase):
         tk.Label(row, text="本机节点", font=F["bold"], fg=C["text"], bg=C["hover"]).pack(side="left")
         tk.Label(node, text="客户端正在运行", font=F["tiny"], fg=C["text2"], bg=C["hover"]).pack(anchor="w", padx=27, pady=(0, 9))
 
-        try:
-            version = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        except Exception:
-            version = "dev"
-        tk.Label(self._sidebar, text=f"Desktop  {version}", font=("Consolas", 7), fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=18, pady=(0, 14))
+        tk.Label(self._sidebar, text=f"Desktop  {APP_VERSION}", font=F["tiny"], fg=C["muted"], bg=C["sidebar"]).pack(anchor="w", padx=18, pady=(0, 14))
 
     def _build_page_host(self):
         self._page_host = tk.Frame(self._content_root, bg=C["bg"])
@@ -1365,7 +1521,7 @@ class GatewayApp(WindowBase):
 
         left = tk.Frame(bar, bg=C["surface"])
         left.pack(side="left", padx=18, pady=12)
-        tk.Label(left, text="LOCAL AI GATEWAY  /  DESKTOP", font=("Consolas", 7), fg=C["primary"], bg=C["surface"]).pack(anchor="w")
+        tk.Label(left, text="LOCAL AI GATEWAY  /  DESKTOP", font=F["tiny"], fg=C["primary"], bg=C["surface"]).pack(anchor="w")
         title_row = tk.Frame(left, bg=C["surface"])
         title_row.pack(anchor="w", pady=(1, 0))
         self._page_title_label = tk.Label(
@@ -1427,7 +1583,7 @@ class GatewayApp(WindowBase):
             ("server",  "服务器"),
             ("env",     "运行环境"),
             ("comfyui", "ComfyUI"),
-            ("tunnel",  "Tunnel"),
+            ("tunnel",  "公网连接"),
             ("api",     "API"),
         ]
         self._light_groups = {}
@@ -1446,7 +1602,7 @@ class GatewayApp(WindowBase):
             retry_btn = tk.Button(
                 group,
                 text="重试",
-                font=("Microsoft YaHei UI", 8),
+                font=F["tiny"],
                 bg=C["hover"],
                 fg=C["primary"],
                 activebackground=C["border"],
@@ -1506,7 +1662,7 @@ class GatewayApp(WindowBase):
         text_box = tk.Frame(url_row, bg=C["card"])
         text_box.pack(side="left", fill="x", expand=True)
         tk.Label(text_box, text="公网 URL", font=F["bold"], fg=C["text"], bg=C["card"]).pack(anchor="w")
-        self._url_label = tk.Label(text_box, text="等待隧道...", font=F["url"],
+        self._url_label = tk.Label(text_box, text="正在建立公网连接...", font=F["url"],
                                    fg=C["primary"], bg=C["card"], anchor="w")
         self._url_label.pack(anchor="w", pady=(5, 0))
         url_copy_box = tk.Frame(url_row, bg=C["card"], width=68, height=30)
@@ -1669,7 +1825,7 @@ class GatewayApp(WindowBase):
         rows = [
             ("平台同步", "已开启"),
             ("本地服务", "退出登录后仍可正常使用"),
-            ("公网连接", "由本机 Tunnel 独立提供"),
+            ("公网连接", "由客户端自动建立"),
         ]
         for label, value in rows:
             row = tk.Frame(info, bg=C["hover"])
@@ -2208,11 +2364,11 @@ class GatewayApp(WindowBase):
             highlightthickness=0,
             bd=0,
         )
-        self._workflow_scrollbar = ttk.Scrollbar(
+        self._workflow_scrollbar = SlimRoundedScrollbar(
             scroll_host,
-            orient="vertical",
             command=self._workflow_canvas.yview,
-            style="LingJing.Vertical.TScrollbar",
+            width=6,
+            bar_width=4,
         )
         self._workflow_scroll_content = tk.Frame(
             self._workflow_canvas,
@@ -2226,7 +2382,7 @@ class GatewayApp(WindowBase):
         self._workflow_canvas.configure(
             yscrollcommand=self._workflow_scrollbar.set,
         )
-        self._workflow_scrollbar.pack(side="right", fill="y", padx=(5, 1))
+        self._workflow_scrollbar.pack(side="right", fill="y", padx=(4, 1))
         self._workflow_canvas.pack(side="left", fill="both", expand=True)
         self._workflow_scroll_content.bind(
             "<Configure>",
@@ -2494,10 +2650,29 @@ class GatewayApp(WindowBase):
             self._wf_rows[wf_id] = row
 
     def _mirror_model_url(self, url: str) -> str:
-        url = str(url or "").strip()
-        if url.startswith("https://huggingface.co/"):
-            return url.replace("https://huggingface.co/", "https://hf-mirror.com/", 1)
-        return url
+        sources = self._model_download_sources(url)
+        return sources[0][1] if sources else ""
+
+    @staticmethod
+    def _model_download_sources(url: str) -> list[tuple[str, str]]:
+        """Return the preferred domestic source plus the official fallback."""
+        official = str(url or "").strip()
+        if not official:
+            return []
+        sources: list[tuple[str, str]] = []
+        if official.startswith("https://huggingface.co/"):
+            sources.append((
+                "国内镜像",
+                official.replace("https://huggingface.co/", "https://hf-mirror.com/", 1),
+            ))
+        sources.append(("官方源", official))
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for label, source_url in sources:
+            if source_url and source_url not in seen:
+                seen.add(source_url)
+                unique.append((label, source_url))
+        return unique
 
     def _missing_model_items(self, model_key: str) -> list:
         spec = MODEL_REQUIREMENTS.get(model_key, {})
@@ -2561,7 +2736,7 @@ class GatewayApp(WindowBase):
             f"模型：{info['title']}",
             self._format_model_performance_text(info["model_key"]),
             "",
-            "接口参数：",
+            "调用说明（高级）：",
             self._format_workflow_schema_text(workflow),
         ]
         return "\n".join(lines)
@@ -2571,7 +2746,7 @@ class GatewayApp(WindowBase):
         popup_w = 840
         popup_h = 600 if len(missing) >= 4 else 520
         popup = tk.Toplevel(self)
-        popup.title("缺失模型")
+        popup.title("下载模型")
         popup.geometry(f"{popup_w}x{popup_h}")
         popup.configure(bg=C["bg"])
         popup.transient(self)
@@ -2580,8 +2755,8 @@ class GatewayApp(WindowBase):
 
         panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
         title = MODEL_REQUIREMENTS.get(model_key, {}).get("title", model_key)
-        tk.Label(panel, text=f"{title}：缺失模型", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=18, pady=(16, 4))
-        tk.Label(panel, text="选择需要补齐的模型，客户端会在后台下载并放入对应目录。下载完成后会自动重新检测模型状态。",
+        tk.Label(panel, text=f"{title}：下载模型", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=18, pady=(16, 4))
+        tk.Label(panel, text="选择需要的模型文件。客户端优先使用国内镜像，连接失败时会自动切换到官方源。",
                  font=F["normal"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=18, pady=(0, 10))
         tk.Label(
             panel,
@@ -2594,25 +2769,28 @@ class GatewayApp(WindowBase):
             wraplength=770,
         ).pack(fill="x", padx=18, pady=(0, 12))
 
+        actions = tk.Frame(panel, bg=C["card"])
+        actions.pack(side="bottom", fill="x", padx=18, pady=(4, 14))
+
         list_outer = tk.Frame(panel, bg=C["card"])
         list_outer.pack(fill="both", expand=True, padx=18, pady=(0, 10))
 
-        if len(missing) <= 4:
-            rows = tk.Frame(list_outer, bg=C["card"])
-            rows.pack(fill="both", expand=True)
-        else:
-            canvas = tk.Canvas(list_outer, bg=C["card"], highlightthickness=0, bd=0)
-            scrollbar = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
-            rows = tk.Frame(canvas, bg=C["card"])
-            rows.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-            canvas_window = canvas.create_window((0, 0), window=rows, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            canvas.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
-            canvas.bind("<Configure>", lambda event: canvas.itemconfig(canvas_window, width=event.width))
+        canvas = tk.Canvas(list_outer, bg=C["card"], highlightthickness=0, bd=0)
+        scrollbar = SlimRoundedScrollbar(
+            list_outer,
+            command=canvas.yview,
+            width=6,
+            bar_width=4,
+        )
+        rows = tk.Frame(canvas, bg=C["card"])
+        rows.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=rows, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y", padx=(4, 0))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfig(canvas_window, width=event.width))
 
         download_controls = []
-        abandon_started = False
         if not missing:
             empty = self._card(rows)
             empty.pack(fill="x", pady=(0, 10))
@@ -2621,76 +2799,23 @@ class GatewayApp(WindowBase):
             control = self._build_model_download_row(rows, model_key, item, index)
             download_controls.append(control)
 
-        def abandon_paused_and_close():
-            nonlocal abandon_started
-            paused = [control for control in download_controls if control.get("state") == "paused"]
-            if not paused:
-                if not any(control.get("state") == "abandoning" for control in download_controls):
-                    popup.destroy()
-                return
-            if abandon_started:
-                return
-            abandon_started = True
+        def close_popup():
+            owners = [self._model_download_owner(control) for control in download_controls]
+            if any(
+                owner.get("state") in {"downloading", "resuming", "paused", "cancelling"}
+                for owner in owners
+            ):
+                self._footer_label.config(
+                    text="  模型正在后台下载；再次打开下载页面可查看进度或取消"
+                )
+            self._detach_model_download_views(download_controls)
             try:
                 popup.grab_release()
             except Exception:
                 pass
-            popup.withdraw()
-            remaining = {id(control) for control in paused}
-
-            def one_finished(control):
-                remaining.discard(id(control))
-                if not remaining:
-                    try:
-                        popup.destroy()
-                    except Exception:
-                        pass
-
-            for control in paused:
-                self._abandon_paused_model_download(
-                    control,
-                    lambda item=control: one_finished(item),
-                )
-
-        def cleanup_hidden_popup():
-            try:
-                if not popup.winfo_exists():
-                    return
-                if any(
-                    control.get("state") in {"downloading", "resuming"}
-                    for control in download_controls
-                ):
-                    popup.after(600, cleanup_hidden_popup)
-                    return
-                if any(control.get("state") in {"paused", "abandoning"} for control in download_controls):
-                    abandon_paused_and_close()
-                    return
-                popup.destroy()
-            except Exception:
-                pass
-
-        def close_popup():
-            if any(
-                control.get("state") in {"downloading", "resuming"}
-                for control in download_controls
-            ):
-                try:
-                    popup.grab_release()
-                except Exception:
-                    pass
-                popup.withdraw()
-                self._footer_label.config(text="  模型继续在后台下载，完成后会自动重新检查")
-                popup.after(600, cleanup_hidden_popup)
-                return
-            if any(control.get("state") in {"paused", "abandoning"} for control in download_controls):
-                abandon_paused_and_close()
-                return
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
-
-        actions = tk.Frame(panel, bg=C["card"])
-        actions.pack(fill="x", padx=18, pady=(0, 14))
 
         def download_all():
             for control in download_controls:
@@ -2698,13 +2823,15 @@ class GatewayApp(WindowBase):
                     self._start_model_download(control)
 
         if download_controls:
-            self._button(actions, "下载全部缺失", download_all, "primary", width=110).pack(side="left", ipadx=12, ipady=6)
-        self._button(actions, "打开模型目录", self._open_models, "plain").pack(side="left", ipadx=12, ipady=6, padx=(10, 0))
+            self._button(actions, "下载全部模型", download_all, "primary", width=118).pack(side="left", ipadx=12, ipady=6)
+        self._button(actions, "打开模型文件夹", self._open_models, "plain").pack(side="left", ipadx=12, ipady=6, padx=(10, 0))
         self._button(actions, "关闭", close_popup, "plain").pack(side="right", ipadx=12, ipady=6)
+        self._bind_model_download_mousewheel_tree(popup, canvas)
 
     def _build_model_download_row(self, parent, model_key: str, item: dict, index: int) -> dict:
         rel_path = str(item.get("path") or "").strip()
-        url = self._mirror_model_url(item.get("url", ""))
+        sources = self._model_download_sources(item.get("url", ""))
+        url = sources[0][1] if sources else ""
         target = BASE_DIR / "models" / rel_path
         filename = Path(rel_path).name or f"model_{index}"
         rel_parent = Path(rel_path).parent if rel_path else Path("")
@@ -2716,15 +2843,26 @@ class GatewayApp(WindowBase):
         card.grid_columnconfigure(2, weight=2)
 
         tk.Label(card, text=f"{index}", font=F["bold"], fg=C["primary"], bg=C["card"], width=3).grid(row=0, column=0, rowspan=3, padx=(12, 6), pady=10, sticky="n")
-        tk.Label(card, text="镜像名称", font=F["small"], fg=C["text2"], bg=C["card"]).grid(row=0, column=1, sticky="w", pady=(9, 0))
+        tk.Label(card, text="模型文件", font=F["small"], fg=C["text2"], bg=C["card"]).grid(row=0, column=1, sticky="w", pady=(9, 0))
         tk.Label(card, text=filename, font=F["bold"], fg=C["text"], bg=C["card"], anchor="w").grid(row=1, column=1, sticky="ew", pady=(1, 0))
 
         url_row = tk.Frame(card, bg=C["card"])
         url_row.grid(row=2, column=1, sticky="ew", pady=(7, 9))
-        tk.Label(url_row, text="下载地址", font=F["small"], fg=C["text2"], bg=C["card"]).pack(side="left")
-        url_label = tk.Label(url_row, text=self._short_middle(url, 34, 16), font=F["url"], fg=C["primary"], bg=C["card"], anchor="w", cursor="hand2")
-        url_label.pack(side="left", padx=(10, 0), fill="x", expand=True)
-        url_label.bind("<Button-1>", lambda _event, u=url: webbrowser.open(u))
+        for source_index, (source_name, source_url) in enumerate(sources):
+            source_row = tk.Frame(url_row, bg=C["card"])
+            source_row.pack(fill="x", pady=(0 if source_index == 0 else 3, 0))
+            tk.Label(source_row, text=source_name, width=7, anchor="w", font=F["small"], fg=C["text2"], bg=C["card"]).pack(side="left")
+            url_label = tk.Label(
+                source_row,
+                text=self._short_middle(source_url, 34, 16),
+                font=F["url"],
+                fg=C["primary"],
+                bg=C["card"],
+                anchor="w",
+                cursor="hand2",
+            )
+            url_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
+            url_label.bind("<Button-1>", lambda _event, u=source_url: webbrowser.open(u))
 
         right = tk.Frame(card, bg=C["card"])
         right.grid(row=0, column=2, rowspan=3, sticky="nsew", padx=(12, 12), pady=9)
@@ -2745,31 +2883,141 @@ class GatewayApp(WindowBase):
             "model_key": model_key,
             "item": item,
             "url": url,
+            "urls": [source_url for _source_name, source_url in sources],
             "target": target,
+            "card": card,
             "progress_var": progress_var,
             "status_var": status_var,
+            "progress_percent": 0.0,
+            "status_text": "等待下载",
             "state": "idle",
             "pause_event": threading.Event(),
             "stop_event": threading.Event(),
             "worker": None,
         }
+        control["views"] = [control]
         button_row = tk.Frame(right, bg=C["card"])
         button_row.pack(side="right", padx=(10, 0))
         pause_button = self._button(button_row, "暂停", lambda c=control: self._pause_model_download(c), "plain", width=56)
         pause_button.pack(side="left", padx=(0, 6))
         pause_button.configure(state="disabled")
+        cancel_button = self._button(button_row, "取消", lambda c=control: self._cancel_model_download(c), "plain", width=56)
+        cancel_button.pack(side="left", padx=(0, 6))
+        cancel_button.configure(state="disabled")
         button = self._button(button_row, "下载", lambda c=control: self._start_model_download(c), "primary", width=72)
         if not url:
             button.configure(state="disabled", text="无地址")
         button.pack(side="left")
         control["button"] = button
         control["pause_button"] = pause_button
-        if self._model_transfer_active(target):
-            control["state"] = "attached"
-            control["status_var"].set("此模型已在另一个窗口后台下载")
-            button.configure(state="disabled", text="后台下载中")
-            pause_button.configure(state="disabled")
+        control["cancel_button"] = cancel_button
+        owner = self._model_transfer_for(target)
+        if owner is not None and owner is not control:
+            control["owner"] = owner
+            owner.setdefault("views", []).append(control)
+            self._refresh_model_download_views(owner)
+        else:
+            self._refresh_model_download_views(control)
         return control
+
+    def _bind_model_download_mousewheel_tree(self, widget, canvas):
+        def on_mousewheel(event):
+            delta = int(getattr(event, "delta", 0) or 0)
+            button = int(getattr(event, "num", 0) or 0)
+            if delta:
+                units = max(1, abs(delta) // 120)
+                direction = -1 if delta > 0 else 1
+            elif button in (4, 5):
+                units = 1
+                direction = -1 if button == 4 else 1
+            else:
+                return None
+            canvas.yview_scroll(direction * units, "units")
+            return "break"
+
+        def bind_tree(item):
+            try:
+                item.bind("<MouseWheel>", on_mousewheel, add="+")
+                item.bind("<Button-4>", on_mousewheel, add="+")
+                item.bind("<Button-5>", on_mousewheel, add="+")
+                children = item.winfo_children()
+            except Exception:
+                children = []
+            for child in children:
+                bind_tree(child)
+
+        bind_tree(canvas)
+        bind_tree(widget)
+
+    def _model_download_owner(self, control: dict) -> dict:
+        owner = control.get("owner") if isinstance(control, dict) else None
+        return owner if isinstance(owner, dict) else control
+
+    def _model_transfer_for(self, target: Path):
+        lock, transfers = self._model_transfer_state()
+        with lock:
+            return transfers.get(self._model_transfer_key(target))
+
+    def _model_download_view_exists(self, view: dict) -> bool:
+        card = view.get("card")
+        if card is None:
+            return True
+        try:
+            return bool(card.winfo_exists())
+        except Exception:
+            return False
+
+    def _refresh_model_download_views(self, control: dict):
+        task = self._model_download_owner(control)
+        state = str(task.get("state") or "idle")
+        status_text = str(task.get("status_text") or "等待下载")
+        progress_percent = float(task.get("progress_percent") or 0.0)
+        url_available = bool(str(task.get("url") or "").strip())
+        action_state = {
+            "idle": ("normal" if url_available else "disabled", "下载" if url_available else "无地址", "disabled", "暂停", "disabled"),
+            "downloading": ("disabled", "下载中", "normal", "暂停", "normal"),
+            "paused": ("normal", "继续", "disabled", "暂停", "normal"),
+            "resuming": ("disabled", "恢复中", "disabled", "暂停", "normal"),
+            "cancelling": ("disabled", "取消中", "disabled", "暂停", "disabled"),
+            "abandoning": ("disabled", "结束中", "disabled", "暂停", "disabled"),
+            "done": ("disabled", "已完成", "disabled", "暂停", "disabled"),
+            "failed": ("normal" if url_available else "disabled", "重试", "disabled", "暂停", "disabled"),
+            "cancelled": ("normal" if url_available else "disabled", "重新下载", "disabled", "暂停", "disabled"),
+        }.get(state, ("disabled", "处理中", "disabled", "暂停", "disabled"))
+        main_state, main_text, pause_state, pause_text, cancel_state = action_state
+        active_views = []
+        for view in list(task.setdefault("views", [task])):
+            if not self._model_download_view_exists(view):
+                continue
+            active_views.append(view)
+            try:
+                view["status_var"].set(status_text)
+                view["progress_var"].set(progress_percent)
+            except Exception:
+                pass
+            try:
+                view["button"].configure(state=main_state, text=main_text)
+            except Exception:
+                pass
+            try:
+                view["pause_button"].configure(state=pause_state, text=pause_text)
+            except Exception:
+                pass
+            try:
+                view["cancel_button"].configure(state=cancel_state, text="取消")
+            except Exception:
+                pass
+        task["views"] = active_views
+
+    def _set_model_download_status(self, control: dict, text: str):
+        task = self._model_download_owner(control)
+        task["status_text"] = str(text)
+        self._refresh_model_download_views(task)
+
+    def _detach_model_download_views(self, controls):
+        for view in controls:
+            task = self._model_download_owner(view)
+            task["views"] = [item for item in task.get("views", []) if item is not view]
 
     def _model_transfer_key(self, target: Path) -> str:
         try:
@@ -2791,6 +3039,7 @@ class GatewayApp(WindowBase):
             return self._model_transfer_key(target) in transfers
 
     def _claim_model_transfer(self, control: dict) -> bool:
+        control = self._model_download_owner(control)
         if self._runtime_maintenance_active():
             return False
         lock, transfers = self._model_transfer_state()
@@ -2808,6 +3057,7 @@ class GatewayApp(WindowBase):
             return True
 
     def _release_model_transfer(self, control: dict):
+        control = self._model_download_owner(control)
         target = control.get("target")
         if target is None:
             return
@@ -2819,18 +3069,13 @@ class GatewayApp(WindowBase):
 
     def _abandon_paused_model_download(self, control: dict, on_done=None):
         """Release a paused target only after its writer thread has exited."""
+        control = self._model_download_owner(control)
         if control.get("state") != "paused":
             if control.get("state") != "abandoning" and on_done:
                 on_done()
             return
         control["state"] = "abandoning"
-        control["status_var"].set("正在安全结束暂停任务...")
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="disabled", text="结束中")
-        if pause_button:
-            pause_button.configure(state="disabled")
+        self._set_model_download_status(control, "正在安全结束暂停任务...")
         worker = control.get("worker")
 
         def wait_for_writer():
@@ -2858,26 +3103,15 @@ class GatewayApp(WindowBase):
             return bool(transfers)
 
     def _start_model_download(self, control: dict):
-        if control.get("state") in {"downloading", "resuming", "abandoning", "attached"}:
+        control = self._model_download_owner(control)
+        if control.get("state") in {"downloading", "resuming", "cancelling", "abandoning"}:
             return
         if not self._claim_model_transfer(control):
-            control["status_var"].set("另一个模型维护任务正在运行，请稍候")
-            button = control.get("button")
-            pause_button = control.get("pause_button")
-            if button:
-                button.configure(state="normal", text="稍后重试")
-            if pause_button:
-                pause_button.configure(state="disabled")
+            self._set_model_download_status(control, "另一个模型维护任务正在运行，请稍候")
             return
         if control.get("state") == "paused":
             control["state"] = "resuming"
-            button = control.get("button")
-            pause_button = control.get("pause_button")
-            if button:
-                button.configure(state="disabled", text="恢复中")
-            if pause_button:
-                pause_button.configure(state="disabled", text="暂停")
-            control["status_var"].set("正在安全恢复下载...")
+            self._set_model_download_status(control, "正在安全恢复下载...")
             previous_worker = control.get("worker")
 
             def wait_then_resume():
@@ -2888,67 +3122,109 @@ class GatewayApp(WindowBase):
 
             threading.Thread(target=wait_then_resume, daemon=True).start()
             return
+        previous_state = control.get("state")
         control["state"] = "downloading"
+        if control.get("progress_percent") is None or previous_state == "cancelled":
+            control["progress_percent"] = 0.0
         pause_event = control.get("pause_event")
         stop_event = control.get("stop_event")
         if pause_event:
             pause_event.clear()
         if stop_event:
             stop_event.clear()
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="disabled", text="下载中")
-        if pause_button:
-            pause_button.configure(state="normal", text="暂停")
-        control["status_var"].set("准备下载...")
+        self._set_model_download_status(control, "准备下载...")
         worker = threading.Thread(target=lambda: self._download_model_file(control), daemon=True)
         control["worker"] = worker
         worker.start()
 
     def _resume_model_download(self, control: dict):
         """Start a fresh worker only after the paused worker has fully exited."""
+        control = self._model_download_owner(control)
         if self._shutting_down or control.get("state") != "resuming":
             return
         pause_event = control.get("pause_event")
         if pause_event:
             pause_event.clear()
         control["state"] = "downloading"
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="disabled", text="下载中")
-        if pause_button:
-            pause_button.configure(state="normal", text="暂停")
-        control["status_var"].set("继续下载...")
+        self._set_model_download_status(control, "继续下载...")
         worker = threading.Thread(target=lambda: self._download_model_file(control), daemon=True)
         control["worker"] = worker
         worker.start()
 
     def _pause_model_download(self, control: dict):
+        control = self._model_download_owner(control)
         if control.get("state") != "downloading":
             return
         pause_event = control.get("pause_event")
         if pause_event:
             pause_event.set()
         control["state"] = "paused"
-        control["status_var"].set("已暂停，点击继续可断点续传")
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="normal", text="继续")
-        if pause_button:
-            pause_button.configure(state="disabled", text="暂停")
+        self._set_model_download_status(control, "已暂停，点击继续可断点续传")
+
+    def _cancel_model_download(self, control: dict):
+        control = self._model_download_owner(control)
+        if control.get("state") not in {"downloading", "paused", "resuming"}:
+            return
+        control["state"] = "cancelling"
+        stop_event = control.setdefault("stop_event", threading.Event())
+        stop_event.set()
+        pause_event = control.get("pause_event")
+        if pause_event:
+            pause_event.set()
+        self._set_model_download_status(control, "正在取消并清理未完成文件...")
+        worker = control.get("worker")
+
+        def wait_for_writer():
+            if worker and worker.is_alive():
+                worker.join()
+            if getattr(self, "_shutting_down", False):
+                self._complete_model_download_cancel(control)
+            else:
+                self.after(0, lambda: self._complete_model_download_cancel(control))
+
+        threading.Thread(target=wait_for_writer, daemon=True).start()
+
+    def _complete_model_download_cancel(self, control: dict):
+        control = self._model_download_owner(control)
+        if control.get("state") == "done":
+            return
+        target = Path(control["target"])
+        part_path = target.with_suffix(target.suffix + ".part")
+        meta_path = part_path.with_suffix(part_path.suffix + ".json")
+        part_path.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+        self._release_model_transfer(control)
+        control["state"] = "cancelled"
+        control["worker"] = None
+        control["progress_percent"] = 0.0
+        self._set_model_download_status(control, "已取消，未完成文件已删除")
+        try:
+            self._footer_label.config(text="  模型下载已取消，未完成文件已清理")
+        except Exception:
+            pass
 
     def _download_model_file(self, control: dict):
+        control = self._model_download_owner(control)
         import urllib.request as ur
-        url = control["url"]
+        urls = [str(item).strip() for item in control.get("urls", []) if str(item).strip()]
+        if not urls and control.get("url"):
+            urls = [str(control["url"])]
+        if not urls:
+            self.after(0, lambda: self._fail_model_download(control, "没有可用的下载地址"))
+            return
+        source_index = 0
+        url = urls[source_index]
+        control["url"] = url
         target: Path = control["target"]
         part_path = target.with_suffix(target.suffix + ".part")
         meta_path = part_path.with_suffix(part_path.suffix + ".json")
         expected_size = int((control.get("item") or {}).get("size_bytes") or 0)
         expected_sha256 = str((control.get("item") or {}).get("sha256") or "").strip()
         max_retries = 3
+
+        def cancelled() -> bool:
+            stop_event = control.get("stop_event")
+            return bool(stop_event and stop_event.is_set())
 
         def discard_partial():
             part_path.unlink(missing_ok=True)
@@ -3000,13 +3276,17 @@ class GatewayApp(WindowBase):
             )
 
         try:
+            if cancelled():
+                return
             target.parent.mkdir(parents=True, exist_ok=True)
             resume_metadata = load_resume_metadata()
             if part_path.exists() and not resume_metadata:
                 discard_partial()
             if expected_size and resume_metadata and model_file_ready(part_path, expected_size):
-                self.after(0, lambda: control["status_var"].set("下载完成，正在校验 SHA256..."))
+                self.after(0, lambda: self._set_model_download_status(control, "下载完成，正在校验 SHA256..."))
                 if not expected_sha256 or model_file_sha256_matches(part_path, expected_sha256):
+                    if cancelled():
+                        return
                     os.replace(part_path, target)
                     meta_path.unlink(missing_ok=True)
                     self.after(0, lambda: self._finish_model_download(control))
@@ -3016,9 +3296,11 @@ class GatewayApp(WindowBase):
                 discard_partial()
             attempt = 0
             while True:
+                if cancelled():
+                    return
                 pause_event = control.get("pause_event")
                 if pause_event and pause_event.is_set():
-                    self.after(0, lambda: control["status_var"].set("已暂停，点击继续可断点续传"))
+                    self.after(0, lambda: self._set_model_download_status(control, "已暂停，点击继续可断点续传"))
                     return
 
                 resume_metadata = load_resume_metadata()
@@ -3032,6 +3314,8 @@ class GatewayApp(WindowBase):
                 req = ur.Request(url, headers=headers)
                 try:
                     with ur.urlopen(req, timeout=30) as resp:
+                        if cancelled():
+                            return
                         status_code = int(getattr(resp, "status", 200) or 200)
                         validator = response_validator(resp.headers)
                         if resume_from and status_code == 200:
@@ -3073,11 +3357,15 @@ class GatewayApp(WindowBase):
                         mode = "ab" if resume_from else "wb"
                         with open(part_path, mode) as f:
                             while True:
+                                if cancelled():
+                                    return
                                 pause_event = control.get("pause_event")
                                 if pause_event and pause_event.is_set():
-                                    self.after(0, lambda: control["status_var"].set("已暂停，点击继续可断点续传"))
+                                    self.after(0, lambda: self._set_model_download_status(control, "已暂停，点击继续可断点续传"))
                                     return
                                 chunk = resp.read(1024 * 1024)
+                                if cancelled():
+                                    return
                                 if not chunk:
                                     break
                                 f.write(chunk)
@@ -3086,7 +3374,7 @@ class GatewayApp(WindowBase):
                                     percent = min(100, done * 100 / total)
                                     self.after(0, lambda p=percent, d=done, t=total: self._update_model_download_progress(control, p, d, t))
                                 else:
-                                    self.after(0, lambda d=done: control["status_var"].set(f"已下载 {d / 1024 / 1024:.1f} MB"))
+                                    self.after(0, lambda d=done: self._set_model_download_status(control, f"已下载 {d / 1024 / 1024:.1f} MB"))
                         if total and done != total:
                             raise IOError(f"下载不完整（应接收 {total} 字节，实际 {done} 字节）")
                         if expected_size and done != expected_size:
@@ -3097,53 +3385,82 @@ class GatewayApp(WindowBase):
                             )
                     break
                 except Exception:
+                    if cancelled():
+                        return
                     attempt += 1
                     if attempt > max_retries:
-                        raise
-                    self.after(0, lambda n=attempt: control["status_var"].set(f"网络中断，正在重连 {n}/{max_retries}..."))
-                    time.sleep(min(2 * attempt, 6))
+                        source_index += 1
+                        if source_index >= len(urls):
+                            raise
+                        url = urls[source_index]
+                        control["url"] = url
+                        discard_partial()
+                        attempt = 0
+                        self.after(
+                            0,
+                            lambda: self._set_model_download_status(
+                                control,
+                                "国内镜像连接失败，正在切换官方源...",
+                            ),
+                        )
+                        continue
+                    self.after(0, lambda n=attempt: self._set_model_download_status(control, f"网络中断，正在重连 {n}/{max_retries}..."))
+                    stop_event = control.get("stop_event")
+                    if stop_event and stop_event.wait(min(2 * attempt, 6)):
+                        return
+                    if not stop_event:
+                        time.sleep(min(2 * attempt, 6))
+            if cancelled():
+                return
             if not model_file_ready(part_path, expected_size or None):
                 raise IOError("模型文件校验未通过，已保留断点文件")
             if expected_sha256:
-                self.after(0, lambda: control["status_var"].set("下载完成，正在校验 SHA256..."))
+                self.after(0, lambda: self._set_model_download_status(control, "下载完成，正在校验 SHA256..."))
                 if not model_file_sha256_matches(part_path, expected_sha256):
                     discard_partial()
                     raise IOError("模型 SHA256 与可信清单不一致，已删除无效下载")
+            if cancelled():
+                return
             os.replace(part_path, target)
             meta_path.unlink(missing_ok=True)
             self.after(0, lambda: self._finish_model_download(control))
         except Exception as exc:
-            self.after(0, lambda e=str(exc): self._fail_model_download(control, e))
+            if not cancelled():
+                self.after(0, lambda e=str(exc): self._fail_model_download(control, e))
 
     def _update_model_download_progress(self, control: dict, percent: float, done: int, total: int):
-        control["progress_var"].set(percent)
-        control["status_var"].set(f"{percent:.0f}%  {done / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB")
+        control = self._model_download_owner(control)
+        control["progress_percent"] = float(percent)
+        self._set_model_download_status(
+            control,
+            f"{percent:.0f}%  {done / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB",
+        )
 
     def _finish_model_download(self, control: dict):
+        control = self._model_download_owner(control)
         self._release_model_transfer(control)
         control["state"] = "done"
-        control["progress_var"].set(100)
-        control["status_var"].set("下载完成，已放入模型目录")
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="disabled", text="已完成")
-        if pause_button:
-            pause_button.configure(state="disabled", text="暂停")
-        self._footer_label.config(text="  模型下载完成，正在重新检测...")
+        control["worker"] = None
+        control["progress_percent"] = 100.0
+        self._set_model_download_status(control, "下载完成，已放入模型目录")
+        try:
+            self._footer_label.config(text="  模型下载完成，正在重新检测...")
+        except Exception:
+            pass
         threading.Thread(target=self._recheck_models, daemon=True).start()
 
     def _fail_model_download(self, control: dict, error: str):
+        control = self._model_download_owner(control)
+        if control.get("state") == "cancelling":
+            return
         self._release_model_transfer(control)
         control["state"] = "failed"
-        control["status_var"].set(f"下载失败，已保留断点：{error}")
-        button = control.get("button")
-        pause_button = control.get("pause_button")
-        if button:
-            button.configure(state="normal", text="重试")
-        if pause_button:
-            pause_button.configure(state="disabled", text="暂停")
-        self._footer_label.config(text="  模型下载失败，请检查网络或稍后重试")
+        control["worker"] = None
+        self._set_model_download_status(control, f"下载失败，已保留断点：{error}")
+        try:
+            self._footer_label.config(text="  模型下载失败，请检查网络或稍后重试")
+        except Exception:
+            pass
 
     def _open_workflows_dir(self):
         workflows_dir = BASE_DIR / "workflows"
@@ -3375,8 +3692,17 @@ class GatewayApp(WindowBase):
         self._center_popup(popup, 760, 560)
 
         panel = self._card(popup, fill="both", expand=True, padx=18, pady=18)
-        tk.Label(panel, text=f"{title}：用途与性能要求", font=F["title"], fg=C["text"], bg=C["card"]).pack(anchor="w", padx=20, pady=(18, 6))
-        tk.Label(panel, text="包含模型用途、机器配置和客户端对服务端暴露的入参 / 出参。",
+        heading = tk.Frame(panel, bg=C["card"])
+        heading.pack(fill="x", padx=20, pady=(18, 6))
+        tk.Label(heading, text=f"{title}：用途与性能要求", font=F["title"], fg=C["text"], bg=C["card"]).pack(side="left")
+
+        def show_downloads():
+            popup.destroy()
+            self._show_model_install_help(model_key)
+
+        if missing_models:
+            self._button(heading, "安装模型", show_downloads, "primary", width=88).pack(side="right")
+        tk.Label(panel, text="这里可以查看用途、电脑配置要求，以及需要对接时使用的参数说明。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=20, pady=(0, 12))
 
         box = tk.Text(
@@ -3407,17 +3733,6 @@ class GatewayApp(WindowBase):
             self._footer_label.config(text="  已复制工作流详情")
 
         self._button(actions, "复制详情", copy_text, "primary").pack(side="left", ipadx=12, ipady=5)
-        if missing_models:
-            def show_downloads():
-                popup.destroy()
-                self._show_model_install_help(model_key)
-
-            self._button(actions, "下载缺失模型", show_downloads, "plain").pack(
-                side="left",
-                padx=(8, 0),
-                ipadx=12,
-                ipady=5,
-            )
         self._button(actions, "关闭", popup.destroy, "plain").pack(side="right", ipadx=12, ipady=5)
 
     def _load_json_file(self, path: Path, max_bytes: int = 64 * 1024 * 1024) -> dict:
@@ -4019,7 +4334,7 @@ class GatewayApp(WindowBase):
                 raise ValueError("工作流不是可调用的 ComfyUI API 格式")
             dependency = workflow_dependency_report(workflow.dependencies, BASE_DIR / "models")
             if dependency["missing_models"]:
-                raise ValueError("请先补齐缺失模型，再设为默认工作流")
+                raise ValueError("请先安装这个工作流需要的模型，再设为默认工作流")
             health_workflows = (self._last_health or {}).get("workflows") or []
             health_item = next(
                 (
@@ -4388,26 +4703,34 @@ class GatewayApp(WindowBase):
         heading: str,
         stage: str,
         detail: str,
+        background_action_text: str = "后台修复",
     ) -> dict:
-        """Build the quiet, user-facing progress dialog used by runtime setup."""
+        """Build a branded maintenance dialog that can collapse into the app."""
         popup = tk.Toplevel(self)
         popup.title(title)
-        popup.geometry("480x205")
-        popup.configure(bg=C["surface"])
+        popup.geometry("540x270")
+        popup.configure(bg=C["bg"])
         popup.transient(self)
         popup.grab_set()
         popup.resizable(False, False)
-        self._center_popup(popup, 480, 205)
+        self._center_popup(popup, 540, 270)
 
-        content = tk.Frame(popup, bg=C["surface"])
-        content.pack(fill="both", expand=True, padx=28, pady=24)
+        panel = RoundedFrame(
+            popup,
+            radius=14,
+            fill=C["card"],
+            outline=C["border2"],
+        )
+        panel.pack(fill="both", expand=True, padx=18, pady=18)
+        content = tk.Frame(panel, bg=C["card"])
+        content.pack(fill="both", expand=True, padx=24, pady=20)
 
         tk.Label(
             content,
             text=heading,
             font=F["title"],
             fg=C["text"],
-            bg=C["surface"],
+            bg=C["card"],
         ).pack(anchor="w")
 
         stage_var = tk.StringVar(value=stage)
@@ -4416,7 +4739,7 @@ class GatewayApp(WindowBase):
             textvariable=stage_var,
             font=F["bold"],
             fg=C["text2"],
-            bg=C["surface"],
+            bg=C["card"],
             anchor="w",
             justify="left",
             wraplength=420,
@@ -4440,22 +4763,131 @@ class GatewayApp(WindowBase):
             textvariable=detail_var,
             font=F["small"],
             fg=C["muted"],
-            bg=C["surface"],
+            bg=C["card"],
             anchor="w",
             justify="left",
             wraplength=420,
         )
         detail_label.pack(fill="x", pady=(9, 0))
 
-        return {
+        dialog = {
             "popup": popup,
+            "panel": panel,
+            "content": content,
+            "heading": heading,
             "progress": progress,
             "progress_var": progress_var,
             "stage_var": stage_var,
             "stage_label": stage_label,
             "detail_var": detail_var,
             "detail_label": detail_label,
+            "background_action_text": background_action_text,
+            "background_card": None,
         }
+        self._button(
+            content,
+            background_action_text,
+            lambda: self._minimize_maintenance_dialog(dialog),
+            "plain",
+            width=96,
+        ).pack(anchor="e", pady=(12, 0))
+        popup.protocol(
+            "WM_DELETE_WINDOW",
+            lambda: self._minimize_maintenance_dialog(dialog),
+        )
+        return dialog
+
+    def _minimize_maintenance_dialog(self, dialog: dict):
+        """Collapse a long-running maintenance dialog into the app's lower-right corner."""
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                return
+            popup.grab_release()
+            popup.withdraw()
+        except Exception:
+            return
+        existing = dialog.get("background_card")
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                return
+        except Exception:
+            pass
+        host = getattr(self, "_content_root", self)
+        card = RoundedFrame(
+            host,
+            radius=12,
+            fill=C["card"],
+            outline=C["primary"],
+        )
+        card.place(relx=1.0, rely=1.0, x=-18, y=-(LAYOUT["footer_h"] + 14), anchor="se", width=390, height=82)
+        card.lift()
+        inner = tk.Frame(card, bg=C["card"])
+        inner.pack(fill="both", expand=True, padx=14, pady=10)
+        top = tk.Frame(inner, bg=C["card"])
+        top.pack(fill="x")
+        tk.Label(
+            top,
+            textvariable=dialog["stage_var"],
+            font=F["bold"],
+            fg=C["text"],
+            bg=C["card"],
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        self._button(
+            top,
+            "查看",
+            lambda: self._restore_maintenance_dialog(dialog),
+            "plain",
+            width=58,
+        ).pack(side="right")
+        ttk.Progressbar(
+            inner,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            variable=dialog["progress_var"],
+            style="Progress.Horizontal.TProgressbar",
+        ).pack(fill="x", pady=(9, 0))
+        dialog["background_card"] = card
+        try:
+            self._footer_label.config(text="  维护任务正在后台继续，点击右下角可查看进度")
+        except Exception:
+            pass
+
+    def _restore_maintenance_dialog(self, dialog: dict):
+        card = dialog.get("background_card")
+        try:
+            if card is not None and card.winfo_exists():
+                card.destroy()
+        except Exception:
+            pass
+        dialog["background_card"] = None
+        popup = dialog.get("popup")
+        try:
+            if popup is None or not popup.winfo_exists():
+                return
+            popup.deiconify()
+            popup.lift()
+            popup.focus_force()
+            popup.grab_set()
+        except Exception:
+            pass
+
+    def _close_maintenance_dialog(self, dialog: dict):
+        self._stop_runtime_progress_activity(dialog)
+        card = dialog.get("background_card")
+        popup = dialog.get("popup")
+        for widget in (card, popup):
+            try:
+                if widget is not None and widget.winfo_exists():
+                    if widget is popup:
+                        widget.grab_release()
+                    widget.destroy()
+            except Exception:
+                pass
+        dialog["background_card"] = None
 
     def _set_runtime_progress(
         self,
@@ -4739,23 +5171,9 @@ class GatewayApp(WindowBase):
         )
         popup = dialog["popup"]
 
-        def keep_download_open():
-            self._set_runtime_progress(
-                dialog,
-                dialog["progress_var"].get(),
-                dialog["stage_var"].get(),
-                "下载正在进行，请保持窗口开启",
-            )
-
         def show_download_error(message: str):
-            try:
-                popup.grab_release()
-                popup.destroy()
-            except Exception:
-                pass
+            self._close_maintenance_dialog(dialog)
             self._show_runtime_download_fallback(message)
-
-        popup.protocol("WM_DELETE_WINDOW", keep_download_open)
 
         def _do_download():
             try:
@@ -4790,7 +5208,7 @@ class GatewayApp(WindowBase):
                                 "环境包完整，跳过重复下载",
                             ),
                         )
-                        self.after(0, popup.destroy)
+                        self.after(0, lambda: self._close_maintenance_dialog(dialog))
                         self.after(
                             100,
                             lambda: self._extract_runtime(
@@ -4801,7 +5219,7 @@ class GatewayApp(WindowBase):
                         return
 
                 resume_at = partial.stat().st_size if partial.exists() else 0
-                headers = {"User-Agent": "LingJing-Desktop/1.0.0"}
+                headers = {"User-Agent": f"LingJing-Desktop/{APP_VERSION}"}
                 if resume_at:
                     headers["Range"] = f"bytes={resume_at}-"
                 request = ur.Request(url, headers=headers)
@@ -4855,7 +5273,7 @@ class GatewayApp(WindowBase):
                     ),
                 )
 
-                self.after(0, popup.destroy)
+                self.after(0, lambda: self._close_maintenance_dialog(dialog))
                 self.after(100, lambda: self._extract_runtime(target, repair_confirmed=repair_confirmed))
             except Exception as ex:
                 if not self._shutting_down:
@@ -4891,16 +5309,9 @@ class GatewayApp(WindowBase):
         popup = dialog["popup"]
         self._set_runtime_install_stage(dialog, "prepare")
 
-        def keep_install_open():
-            self._set_runtime_progress(
-                dialog,
-                dialog["progress_var"].get(),
-                dialog["stage_var"].get(),
-                "安装正在进行，请保持窗口开启",
-            )
-
         def show_install_error(message: str):
             try:
+                self._restore_maintenance_dialog(dialog)
                 self._set_runtime_progress(
                     dialog,
                     dialog["progress_var"].get(),
@@ -4908,8 +5319,10 @@ class GatewayApp(WindowBase):
                     str(message),
                     error=True,
                 )
-                popup.grab_release()
-                popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+                popup.protocol(
+                    "WM_DELETE_WINDOW",
+                    lambda: self._close_maintenance_dialog(dialog),
+                )
             except Exception:
                 pass
             self._environment_status = {
@@ -4919,8 +5332,6 @@ class GatewayApp(WindowBase):
             }
             if hasattr(self, "_dashboard_pages"):
                 self._dashboard_pages.refresh(self._last_health)
-
-        popup.protocol("WM_DELETE_WINDOW", keep_install_open)
 
         def set_install_stage(
             stage_name: str,
@@ -5063,7 +5474,7 @@ class GatewayApp(WindowBase):
                 set_install_stage("validate")
                 validate_staged_runtime(staging_dir)
 
-                if not self._show_runtime_manual_restart_notice(popup):
+                if not self._show_runtime_manual_restart_notice(dialog):
                     if self._shutting_down:
                         return
                     raise RuntimeError("未能显示手动重启提示，运行环境尚未切换")
@@ -5107,8 +5518,8 @@ class GatewayApp(WindowBase):
 
         threading.Thread(target=_do_extract, daemon=True).start()
 
-    def _show_runtime_manual_restart_notice(self, popup) -> bool:
-        """Tell the user why the GUI will exit before starting the handoff."""
+    def _show_manual_restart_notice(self, dialog: dict, *, component: str) -> bool:
+        """Show a branded, blocking handoff notice without using a system message box."""
         completed = threading.Event()
         state = {"shown": False}
 
@@ -5116,20 +5527,71 @@ class GatewayApp(WindowBase):
             try:
                 if self._shutting_down:
                     return
+                self._restore_maintenance_dialog(dialog)
+                popup = dialog.get("popup")
+                content = dialog.get("content")
+                if popup is None or content is None:
+                    return
+                content.pack_forget()
+                old_notice = dialog.get("restart_notice")
                 try:
-                    popup.grab_release()
+                    if old_notice is not None and old_notice.winfo_exists():
+                        old_notice.destroy()
                 except Exception:
                     pass
-                messagebox.showinfo(
-                    "运行环境已准备完成",
-                    "客户端将退出以完成运行环境切换。\n\n"
-                    "程序不会自动重启，请等待片刻后手动重新打开“灵境造片厂”。\n"
-                    "重新打开后环境生效。",
-                    parent=popup,
-                )
-                state["shown"] = not self._shutting_down
-            finally:
+                notice = tk.Frame(dialog["panel"], bg=C["card"])
+                notice.pack(fill="both", expand=True, padx=28, pady=24)
+                dialog["restart_notice"] = notice
+                action = "安装" if component == "运行环境" else "更新"
+                popup.title(f"{component}{action}已准备完成")
+                tk.Label(
+                    notice,
+                    text=f"{component}{action}已准备完成",
+                    font=F["title"],
+                    fg=C["text"],
+                    bg=C["card"],
+                ).pack(anchor="w")
+                tk.Label(
+                    notice,
+                    text=(
+                        f"请退出灵境造片厂，让{component}完成最后的文件切换。\n"
+                        "程序不会自动重新打开；稍等片刻后，请由你手动打开客户端。\n"
+                        "重新打开后会直接检查环境，不会重复显示完成提示。"
+                    ),
+                    font=F["body"],
+                    fg=C["text2"],
+                    bg=C["card"],
+                    justify="left",
+                    anchor="w",
+                    wraplength=450,
+                ).pack(fill="x", pady=(18, 20))
+
+                def accept():
+                    if completed.is_set():
+                        return
+                    state["shown"] = True
+                    try:
+                        popup.protocol("WM_DELETE_WINDOW", lambda: None)
+                    except Exception:
+                        pass
+                    completed.set()
+
+                self._button(
+                    notice,
+                    f"退出并完成{action}",
+                    accept,
+                    "primary",
+                    width=142,
+                ).pack(anchor="e")
+                popup.protocol("WM_DELETE_WINDOW", accept)
+                popup.lift()
+                popup.focus_force()
+            except Exception:
+                state["shown"] = False
                 completed.set()
+            finally:
+                if self._shutting_down:
+                    completed.set()
 
         try:
             self.after(0, show_notice)
@@ -5139,6 +5601,9 @@ class GatewayApp(WindowBase):
             if self._shutting_down:
                 return False
         return bool(state["shown"])
+
+    def _show_runtime_manual_restart_notice(self, dialog: dict) -> bool:
+        return self._show_manual_restart_notice(dialog, component="运行环境")
 
     def _write_runtime_restart_ack(self) -> bool:
         """Confirm that the replacement GUI reached its first Tk event-loop turn."""
@@ -5224,6 +5689,46 @@ class GatewayApp(WindowBase):
         _release_instance_lock()
         self._complete_destroy()
 
+    def _show_active_comfyui_update_notice(self):
+        """Explain the active detached update and let the user close explicitly."""
+        popup = tk.Toplevel(self)
+        popup.title("ComfyUI 正在更新")
+        popup.configure(bg=C["bg"])
+        popup.transient(self)
+        popup.resizable(False, False)
+        self._center_popup(popup, 520, 260)
+        panel = RoundedFrame(popup, radius=14, fill=C["card"], outline=C["border2"])
+        panel.pack(fill="both", expand=True, padx=18, pady=18)
+        body = tk.Frame(panel, bg=C["card"])
+        body.pack(fill="both", expand=True, padx=26, pady=22)
+        tk.Label(
+            body,
+            text="ComfyUI 正在后台完成更新",
+            font=F["title"],
+            fg=C["text"],
+            bg=C["card"],
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text=(
+                "上一次更新仍在完成文件切换。请先退出当前客户端，"
+                "稍等片刻后再手动打开；程序不会自动重新启动。"
+            ),
+            font=F["body"],
+            fg=C["text2"],
+            bg=C["card"],
+            wraplength=430,
+            justify="left",
+        ).pack(fill="x", pady=(18, 22))
+        self._button(
+            body,
+            "退出程序",
+            self._close_for_active_comfyui_update,
+            "primary",
+            width=110,
+        ).pack(anchor="e")
+        popup.protocol("WM_DELETE_WINDOW", self._close_for_active_comfyui_update)
+
     def _show_comfyui_recovery_result(self):
         if not self.__dict__.get("_startup_update_results_preconsumed", False):
             return
@@ -5234,21 +5739,14 @@ class GatewayApp(WindowBase):
         if status == "no_recovery_needed":
             return
         if status == "recovery_in_progress":
-            messagebox.showinfo(
-                "ComfyUI 后台更新仍在进行",
-                "后台更新仍在进行，请关闭当前临时窗口，完成后会自动重启；"
-                "若未重启再手动打开。",
-                parent=self,
-            )
-            self._close_for_active_comfyui_update()
+            self._show_active_comfyui_update_notice()
             return
         message = str(result.get("message") or "").strip().replace("\x00", "")[:1200]
         if status in {"recovered", "completed"}:
-            messagebox.showinfo(
-                "ComfyUI 更新恢复完成",
-                message or "已安全完成上次中断的 ComfyUI 更新恢复。",
-                parent=self,
-            )
+            try:
+                self._footer_label.config(text="  ComfyUI 已更新，环境检查正常")
+            except Exception:
+                pass
             return
         errors = result.get("errors") or []
         if not isinstance(errors, (list, tuple)):
@@ -5294,7 +5792,10 @@ class GatewayApp(WindowBase):
         if detail and code != "installed":
             message = f"{message}\n\n详细信息：{detail}"
         if result.get("success") is True:
-            messagebox.showinfo("运行环境更新", message, parent=self)
+            try:
+                self._footer_label.config(text="  运行环境已安装并通过检查")
+            except Exception:
+                pass
         else:
             messagebox.showerror("运行环境更新失败", message, parent=self)
 
@@ -5341,17 +5842,15 @@ class GatewayApp(WindowBase):
         )
         warning_summary = self._comfyui_update_result_warnings(result)
         if status == "installed":
-            message = "ComfyUI 核心更新完成"
+            status_text = "  ComfyUI 已更新"
             if version:
-                message += f"，当前版本为 v{version}"
-            message += "。\n\n模型、自定义节点、工作流和用户数据均已保留。"
-            if restart_error:
-                message += f"\n\n自动重启未完成：{restart_error}"
+                status_text += f"至 v{version}"
             if warning_summary:
-                message += f"\n\n更新已完成，但有以下清理提示：\n{warning_summary}"
-                messagebox.showwarning("ComfyUI 更新完成（有提示）", message, parent=self)
-            else:
-                messagebox.showinfo("ComfyUI 更新完成", message, parent=self)
+                status_text += "；部分临时文件将在稍后清理"
+            try:
+                self._footer_label.config(text=status_text)
+            except Exception:
+                pass
             return
         if status == "failed_rolled_back":
             message = "ComfyUI 更新未完成，旧版本已自动恢复。"
@@ -5467,13 +5966,13 @@ class GatewayApp(WindowBase):
         self._loading_bar = tk.Frame(bar, bg=C["surface"])
         self._loading_bar.pack(side="left", padx=(12, 8))
         self._loading_text = tk.Label(
-            self._loading_bar, text="", font=F["small"], fg=C["warn"], bg=C["surface"])
+            self._loading_bar, text="", font=F["normal"], fg=C["warn"], bg=C["surface"])
         self._loading_text.pack(side="left")
         self._loading_dots = tk.Label(
-            self._loading_bar, text="", font=F["small"], fg=C["warn"], bg=C["surface"], width=3, anchor="w")
+            self._loading_bar, text="", font=F["normal"], fg=C["warn"], bg=C["surface"], width=3, anchor="w")
         self._loading_dots.pack(side="left")
         self._footer_label = tk.Label(
-            bar, text="", font=("Consolas", 8), fg=C["text2"], bg=C["surface"], anchor="w")
+            bar, text="", font=F["normal"], fg=C["text2"], bg=C["surface"], anchor="w")
         self._footer_label.pack(side="left")
         tk.Button(bar, text="退出", font=F["small"], bg=C["surface"], fg=C["error"],
                   activebackground=C["hover"], relief="flat", bd=0, cursor="hand2",
@@ -5490,7 +5989,7 @@ class GatewayApp(WindowBase):
         return f"{text[:left]}...{text[-right:]}"
 
     def _set_public_url(self, url: str):
-        self._url_label.config(text=self._short_middle(url, 16, 10) if url else "等待隧道...")
+        self._url_label.config(text=self._short_middle(url, 16, 10) if url else "正在建立公网连接...")
 
     def _clear_public_url(self):
         self._tunnel_url = ""
@@ -5722,8 +6221,25 @@ class GatewayApp(WindowBase):
                     data = json.loads(raw)
                     err = data.get("error") if isinstance(data, dict) else None
                     if isinstance(err, dict):
-                        code = err.get("code", "")
-                        msg = err.get("message", "")
+                        code = str(err.get("code") or "").strip()
+                        msg = str(err.get("message") or "").strip()
+                        auth_errors = {
+                            "USER_NOT_FOUND",
+                            "INVALID_CREDENTIALS",
+                            "INVALID_PASSWORD",
+                            "WRONG_PASSWORD",
+                            "AUTH_FAILED",
+                            "LOGIN_FAILED",
+                        }
+                        auth_text = f"{code} {msg}".casefold()
+                        if (
+                            code.upper() in auth_errors
+                            or "not registered" in auth_text
+                            or "not found" in auth_text
+                            or "未注册" in auth_text
+                            or "密码错误" in auth_text
+                        ):
+                            return "用户名或密码错误"
                         return f"{code}: {msg}" if code and msg else msg or code or f"HTTP {error.code}"
                     if isinstance(data, dict) and data.get("message"):
                         return str(data.get("message"))
@@ -5792,7 +6308,7 @@ class GatewayApp(WindowBase):
                  fg="#ffffff", bg=C["primary"], width=3).pack(side="left", padx=(0, 10), ipady=4)
         tk.Label(title_row, text="登录灵境造片厂账号", font=F["title"],
                  fg=C["text"], bg=C["card"]).pack(side="left")
-        tk.Label(panel, text="登录后可同步会员与平台信息；不登录也能完整使用本地工作流、API 和 Tunnel。",
+        tk.Label(panel, text="登录后可同步会员与平台信息；不登录也能使用本地工作流和接口功能。",
                  font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=28, pady=(0, 18))
 
         form = tk.Frame(panel, bg=C["card"])
@@ -5801,9 +6317,15 @@ class GatewayApp(WindowBase):
         def popup_field(label, text="", show=None):
             row = tk.Frame(form, bg=C["card"])
             row.pack(fill="x", pady=(0, 10))
-            tk.Label(row, text=label, font=F["small"], fg=C["text"], bg=C["card"], width=10, anchor="w").pack(side="left")
-            entry = self._entry_widget(row, show=show, width=320)
-            entry.pack(side="left", fill="x", expand=True, ipady=6 if not CTK_AVAILABLE else 0)
+            tk.Label(row, text=label, font=F["normal"], fg=C["text"], bg=C["card"], width=10, anchor="w").pack(side="left")
+            entry = self._entry_widget(
+                row,
+                show=show,
+                width=320,
+                font=("Microsoft YaHei UI", 11),
+                height=40,
+            )
+            entry.pack(side="left", fill="x", expand=True, ipady=7 if not CTK_AVAILABLE else 0)
             if text:
                 entry.insert(0, text)
             return entry
@@ -5811,7 +6333,7 @@ class GatewayApp(WindowBase):
         server_entry = popup_field("服务端地址", self._get_server_url() or "https://ai.lol-lu.site")
         email_entry = popup_field("账号邮箱", self._get_server_email())
         password_entry = popup_field("密码", self._get_server_password(), show="*")
-        status_lbl = tk.Label(panel, text="", font=F["small"], fg=C["error"], bg=C["card"], anchor="w")
+        status_lbl = tk.Label(panel, text="", font=F["normal"], fg=C["error"], bg=C["card"], anchor="w")
         status_lbl.pack(fill="x", padx=28)
 
         actions = tk.Frame(panel, bg=C["card"])
@@ -5827,9 +6349,10 @@ class GatewayApp(WindowBase):
             close_popup()
 
         def login():
+            normalized_email = _normalize_account_email(email_entry.get())
             self._set_account_form_values(
                 server_url=server_entry.get().strip(),
-                email=email_entry.get().strip(),
+                email=normalized_email,
                 password=password_entry.get(),
             )
             def on_result(success: bool, message: str):
@@ -5851,7 +6374,7 @@ class GatewayApp(WindowBase):
 
         login_button = self._button(actions, "登录并同步", login, "primary")
         login_button.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
-        self._button(actions, "继续使用本地模式", guest, "plain").pack(side="left", fill="x", expand=True, ipady=7, padx=(8, 0))
+        self._button(actions, "暂不登录，使用本地功能", guest, "plain").pack(side="left", fill="x", expand=True, ipady=7, padx=(8, 0))
 
         links = tk.Frame(panel, bg=C["card"])
         links.pack(fill="x", padx=28, pady=(16, 0))
@@ -5865,7 +6388,7 @@ class GatewayApp(WindowBase):
                 on_result(False, "已有登录请求正在处理中，请稍候。")
             return
         server_url = self._get_server_url()
-        email = self._get_server_email()
+        email = _normalize_account_email(self._get_server_email())
         password = self._get_server_password()
         if not server_url:
             self._set_account_status("请填写服务端地址", "error")
@@ -5883,6 +6406,13 @@ class GatewayApp(WindowBase):
             if callable(on_result):
                 on_result(False, "请填写账号邮箱和密码。")
             return
+        email_error = _account_email_error(email)
+        if email_error:
+            self._set_account_status(email_error.rstrip("。"), "error")
+            if callable(on_result):
+                on_result(False, email_error)
+            return
+        self._set_account_form_values(email=email)
         threading.Thread(
             target=self._login_and_sync_worker,
             args=(server_url, email, password, on_result),
@@ -5890,6 +6420,7 @@ class GatewayApp(WindowBase):
         ).start()
 
     def _login_and_sync_worker(self, server_url: str, email: str, password: str, on_result=None):
+        email = _normalize_account_email(email)
         self._server_sync_running = True
         self.after(0, lambda: self._set_account_status("正在登录服务端...", "warn"))
         try:
@@ -5996,7 +6527,7 @@ class GatewayApp(WindowBase):
             "client_id": self._last_health.get("session_id", "") or f"local-{os.environ.get('COMPUTERNAME', 'windows')}",
             "instance_id": self._client_instance_id,
             "client_name": os.environ.get("COMPUTERNAME", "Windows 客户端"),
-            "version": self._last_health.get("version", "1.0.0"),
+            "version": self._last_health.get("version", APP_VERSION),
             "local_api": API_BASE,
             "status": status or ("online" if self._tunnel_url else "starting"),
             "heartbeatAt": now_iso,
@@ -6251,6 +6782,7 @@ class GatewayApp(WindowBase):
     def _open_outputs_for_items(self, outputs: list, task_id: str = ""):
         outputs_dir = BASE_DIR / "outputs"
         outputs_dir.mkdir(parents=True, exist_ok=True)
+        outputs_root = outputs_dir.resolve()
         task_id = str(task_id or "").strip()
         for item in outputs:
             if not isinstance(item, dict):
@@ -6260,12 +6792,22 @@ class GatewayApp(WindowBase):
                 continue
             subfolder = str(item.get("subfolder") or "").strip().replace("\\", "/")
             candidates = []
-            if subfolder and ".." not in subfolder.split("/"):
-                candidates.append(outputs_dir / subfolder / filename)
+            subfolder_path = Path(subfolder)
+            if (
+                subfolder
+                and not subfolder_path.is_absolute()
+                and not subfolder_path.drive
+                and all(part not in {"", ".", ".."} for part in subfolder_path.parts)
+            ):
+                candidate = (outputs_dir / subfolder_path / filename).resolve()
+                if candidate.is_relative_to(outputs_root):
+                    candidates.append(candidate)
             item_task_id = str(item.get("task_id") or item.get("taskId") or task_id)
-            if item_task_id:
-                candidates.append(outputs_dir / item_task_id / filename)
-            candidates.append(outputs_dir / filename)
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", item_task_id):
+                candidate = (outputs_dir / item_task_id / filename).resolve()
+                if candidate.is_relative_to(outputs_root):
+                    candidates.append(candidate)
+            candidates.append((outputs_dir / filename).resolve())
             for candidate in candidates:
                 try:
                     if candidate.exists() and candidate.is_file():
@@ -6290,11 +6832,16 @@ class GatewayApp(WindowBase):
         os.startfile(str(log_dir))
 
     def _open_runtime_config(self):
-        config_path = BASE_DIR / "runtime" / "config.local.json"
-        if config_path.exists():
+        try:
+            config_path = Config(BASE_DIR).ensure_file()
             os.startfile(str(config_path))
-        else:
-            self._open_runtime_dir()
+            self._footer_label.config(text="  高级设置已打开，修改后请退出并重新打开客户端")
+        except Exception as exc:
+            messagebox.showerror(
+                "无法打开高级设置",
+                f"配置文件未能打开：{exc}",
+                parent=self,
+            )
 
     def _start_background_model_recheck(self):
         threading.Thread(target=self._recheck_models, daemon=True).start()
@@ -6621,6 +7168,7 @@ class GatewayApp(WindowBase):
                 heading="正在更新 ComfyUI 核心",
                 stage="准备更新",
                 detail="正在安全停止本地服务",
+                background_action_text="后台更新",
             )
         except Exception:
             self._end_runtime_maintenance(restart=False)
@@ -6633,17 +7181,6 @@ class GatewayApp(WindowBase):
             "正在安全停止本地服务",
             indeterminate=True,
         )
-
-        def keep_update_open():
-            self._set_comfyui_update_progress(
-                dialog,
-                dialog["progress_var"].get(),
-                dialog["stage_var"].get(),
-                "更新正在进行，请保持窗口开启",
-                indeterminate=True,
-            )
-
-        popup.protocol("WM_DELETE_WINDOW", keep_update_open)
 
         def post_progress(
             percent: float,
@@ -6671,12 +7208,7 @@ class GatewayApp(WindowBase):
         ):
             def finish_on_ui():
                 self._end_runtime_maintenance(restart=bool(running_before))
-                self._stop_runtime_progress_activity(dialog)
-                try:
-                    popup.grab_release()
-                    popup.destroy()
-                except Exception:
-                    pass
+                self._close_maintenance_dialog(dialog)
                 if error:
                     messagebox.showerror(title, message, parent=self)
                 else:
@@ -6775,12 +7307,16 @@ class GatewayApp(WindowBase):
                 post_progress(
                     82,
                     "准备安全切换",
-                    "核心与官方组件已就绪，客户端即将重启验证",
+                    "核心与官方组件已就绪，退出后将完成文件切换",
                 )
                 manifest = self._write_comfyui_update_manifest(prepared)
+                if not self._show_manual_restart_notice(dialog, component="ComfyUI"):
+                    if self._shutting_down:
+                        return
+                    raise RuntimeError("未能显示重启提示，ComfyUI 尚未切换")
                 self._comfyui_update_worker_proc = launch_comfyui_update_worker(
                     manifest,
-                    restart_client=BASE_DIR / "runtime" / "python" / "pythonw.exe",
+                    restart_client=None,
                     parent_pid=os.getpid(),
                 )
                 handoff_started = True
@@ -7479,7 +8015,7 @@ class GatewayApp(WindowBase):
             parts = ["正在准备公网连接"]
         elif ts == "unavailable":
             error = str(tunnel_data.get("error") or "").strip()
-            parts = [f"Tunnel：{error or '连接失败'}"]
+            parts = [f"公网连接：{error or '连接失败'}"]
         else:
             parts = ["公网连接未建立"]
         self._footer_label.config(text="  " + "  ".join(parts))
@@ -7640,7 +8176,7 @@ class GatewayApp(WindowBase):
             self._end_backend_action()
 
     def _retry_tunnel_service(self):
-        if not self._begin_backend_action("Tunnel 重试"):
+        if not self._begin_backend_action("公网连接重试"):
             return
         try:
             import urllib.request as ur
@@ -7658,13 +8194,13 @@ class GatewayApp(WindowBase):
             result = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(result, dict) or not result.get("ok"):
                 detail = result.get("error") if isinstance(result, dict) else ""
-                raise RuntimeError(str(detail or "Tunnel 未能开始重连"))
+                raise RuntimeError(str(detail or "公网连接未能开始重连"))
             if not self._shutting_down:
                 self._ensure_health_polling()
         except Exception as exc:
             if not self._shutting_down:
                 self.after(0, lambda e=str(exc): self._set_light("tunnel", "offline", "重试失败"))
-                self.after(0, lambda e=str(exc): self._footer_label.config(text=f"  Tunnel 重试失败：{e}"))
+                self.after(0, lambda e=str(exc): self._footer_label.config(text=f"  公网连接重试失败：{e}"))
         finally:
             self._end_backend_action()
 
@@ -7828,7 +8364,7 @@ class GatewayApp(WindowBase):
     # 工具
     # ══════════════════════════════════════════════════════
     def _copy(self, text: str):
-        if not text or text in ("等待隧道...", "生成中...", "—", "API 服务启动失败"):
+        if not text or text in ("正在建立公网连接...", "生成中...", "—", "API 服务启动失败"):
             return
         self.clipboard_clear()
         self.clipboard_append(text)
@@ -7854,7 +8390,7 @@ class GatewayApp(WindowBase):
             "退出后将关闭：\n"
             "  - ComfyUI\n"
             "  - 本地 API 服务\n"
-            "  - Cloudflare Tunnel\n"
+            "  - 公网连接\n"
             "  - 当前生成任务",
             parent=self,
         )
@@ -7890,7 +8426,7 @@ class GatewayApp(WindowBase):
         list_frame.pack(fill="x", padx=30)
 
         items = {}
-        for name in ["ComfyUI", "API 服务", "Tunnel", "后台操作"]:
+        for name in ["ComfyUI", "API 服务", "公网连接", "下载与更新"]:
             row = tk.Frame(list_frame, bg=C["surface"])
             row.pack(fill="x", pady=3)
             status_lbl = tk.Label(
@@ -7959,14 +8495,14 @@ class GatewayApp(WindowBase):
                 self._comfy_proc = None
 
             self.after(0, lambda: update_item("API 服务", "关闭中...", C["warn"]))
-            self.after(0, lambda: update_item("Tunnel", "关闭中...", C["warn"]))
+            self.after(0, lambda: update_item("公网连接", "关闭中...", C["warn"]))
             api_error = self._process_supervisor.terminate("api", timeout=8)
             self.after(0, lambda e=api_error: update_item("API 服务", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
-            self.after(0, lambda e=api_error: update_item("Tunnel", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
+            self.after(0, lambda e=api_error: update_item("公网连接", "已停止 ✓" if not e else "需要清理", C["success"] if not e else C["error"]))
             if not self._process_supervisor.is_running("api"):
                 self._api_proc = None
 
-            self.after(0, lambda: update_item("后台操作", "关闭中...", C["warn"]))
+            self.after(0, lambda: update_item("下载与更新", "关闭中...", C["warn"]))
             retry_results = self._process_supervisor.shutdown_all(timeout=8)
             workflow_idle = self._wait_for_workflow_idle(timeout=20)
             remaining = self._process_supervisor.remaining()
@@ -7974,11 +8510,11 @@ class GatewayApp(WindowBase):
             api_left = bool(remaining.get("api"))
             self.after(0, lambda left=comfy_left: update_item("ComfyUI", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
             self.after(0, lambda left=api_left: update_item("API 服务", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
-            self.after(0, lambda left=api_left: update_item("Tunnel", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
+            self.after(0, lambda left=api_left: update_item("公网连接", "需要清理" if left else "已停止 ✓", C["error"] if left else C["success"]))
             self.after(
                 0,
                 lambda left=remaining: update_item(
-                    "后台操作",
+                    "下载与更新",
                     "已停止 ✓" if not left and workflow_idle else "需要清理",
                     C["success"] if not left and workflow_idle else C["error"],
                 ),

@@ -139,7 +139,7 @@ class ComfyUIDownloadAndVersionTests(unittest.TestCase):
         )
 
     def test_reads_version_assignment_without_executing_source(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             root = Path(tmp)
             (root / "comfyui_version.py").write_text(
                 '__version__ = "0.3.49"\nraise RuntimeError("must not execute")\n',
@@ -160,7 +160,7 @@ class ComfyUIDownloadAndVersionTests(unittest.TestCase):
                 headers={"Content-Length": str(len(payload))},
             )
 
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             target = Path(tmp) / "release.zip"
             result = download_release_archive(
                 self._release(),
@@ -176,7 +176,7 @@ class ComfyUIDownloadAndVersionTests(unittest.TestCase):
             self.assertEqual(progress[-1], (len(payload), len(payload)))
 
     def test_download_rejects_redirect_to_an_untrusted_host_and_removes_partial(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             target = Path(tmp) / "release.zip"
             with self.assertRaisesRegex(ComfyUIUpdateError, "重定向"):
                 download_release_archive(
@@ -199,7 +199,7 @@ class ComfyUIDownloadAndVersionTests(unittest.TestCase):
                 headers={"Content-Length": str(len(payload) + 10)},
             )
 
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             target = Path(tmp) / "release.zip"
             partial = Path(f"{target}.part")
             original_unlink = Path.unlink
@@ -234,7 +234,7 @@ class ComfyUIArchiveSafetyTests(unittest.TestCase):
                 bundle.writestr(name, payload)
 
     def test_extracts_one_root_strips_it_and_excludes_protected_user_paths(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             archive = base / "release.zip"
             entries = {f"ComfyUI-v0.3.50/{name}": data for name, data in self.required.items()}
@@ -260,7 +260,7 @@ class ComfyUIArchiveSafetyTests(unittest.TestCase):
             )
 
     def test_rejects_traversal_multiple_roots_and_symlinks(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             traversal = base / "traversal.zip"
             self._write_zip(
@@ -285,7 +285,7 @@ class ComfyUIArchiveSafetyTests(unittest.TestCase):
                 safe_extract_release_archive(symlink, base / "symlink-out")
 
     def test_rejects_entry_and_uncompressed_size_limits(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             archive = base / "limit.zip"
             self._write_zip(
@@ -316,7 +316,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
         return current_path, target_path
 
     def test_allows_only_changed_pinned_official_overlay_packages(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             current, target = self._requirements(
                 Path(tmp),
                 "torch==2.7.0\nnumpy==2.1.0\ncomfyui-frontend-package==1.20.0\n",
@@ -332,7 +332,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
             )
 
     def test_gpu_or_unapproved_dependency_changes_require_full_environment(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             current, target = self._requirements(
                 Path(tmp),
                 "torch==2.7.0\nnumpy==2.1.0\n",
@@ -348,7 +348,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
             self.assertIn("numpy", plan.unsupported_changes)
 
     def test_rejects_requirement_options_urls_and_unpinned_overlay_packages(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             current, target = self._requirements(Path(tmp), "", "--extra-index-url https://evil\n")
             with self.assertRaisesRegex(DependencyPolicyError, "不安全"):
                 plan_dependency_overlay(current, target)
@@ -359,7 +359,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
             self.assertIn("comfy-kitchen", plan.unsupported_changes)
 
     def test_builds_shell_free_exact_pin_binary_only_pypi_command(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             operation = "a" * 32
             requirements = base / f".comfyui-update-requirements-{operation}.txt"
@@ -409,7 +409,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
             self.assertNotIn("shell", command)
 
     def test_fixed_bootstrap_imports_bundled_pip_without_pythonpath(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             updater_root = Path(tmp) / "updater_runtime"
             pip_package = updater_root / "pip"
             pip_package.mkdir(parents=True)
@@ -438,7 +438,7 @@ class ComfyUIDependencyPolicyTests(unittest.TestCase):
 
 class ComfyUIPreparationTests(unittest.TestCase):
     def test_rejects_git_managed_live_core_before_any_network_request(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             live = base / "runtime" / "ComfyUI"
             live.mkdir(parents=True)
@@ -456,7 +456,7 @@ class ComfyUIPreparationTests(unittest.TestCase):
             self.assertEqual(calls, [])
 
     def test_prepare_returns_worker_manifest_without_mutating_live_core(self):
-        with tempfile.TemporaryDirectory(dir="E:\\CodexTemp") as tmp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
             base = Path(tmp)
             live = base / "runtime" / "ComfyUI"
             live.mkdir(parents=True)

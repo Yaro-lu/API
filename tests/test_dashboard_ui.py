@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import unittest
 from pathlib import Path
 from tkinter import ttk
@@ -76,6 +77,49 @@ class FakeWidget:
 
 
 class DashboardShellTests(unittest.TestCase):
+    def test_open_output_rejects_absolute_and_traversal_locations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "client"
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "result.png").write_bytes(b"outside")
+            app = object.__new__(GatewayApp)
+
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(main_gateway.os, "startfile") as startfile,
+            ):
+                app._open_outputs_for_items(
+                    [
+                        {
+                            "filename": "result.png",
+                            "subfolder": str(outside),
+                            "task_id": "..\\outside",
+                        }
+                    ]
+                )
+
+            startfile.assert_called_once_with(str(base / "outputs"))
+
+    def test_open_output_accepts_a_real_file_below_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "client"
+            expected = base / "outputs" / "任务结果" / "result.png"
+            expected.parent.mkdir(parents=True)
+            expected.write_bytes(b"image")
+            app = object.__new__(GatewayApp)
+
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(main_gateway.os, "startfile") as startfile,
+            ):
+                app._open_outputs_for_items(
+                    [{"filename": "result.png", "subfolder": "任务结果"}]
+                )
+
+            startfile.assert_called_once_with(str(expected.resolve()))
+
     @staticmethod
     def _find_by_text(root, text):
         stack = [root]
@@ -284,7 +328,7 @@ class DashboardShellTests(unittest.TestCase):
                 settings = app._pages["settings"]
                 texts = set(self._all_text(settings))
 
-                self.assertIn("环境维护", texts)
+                self.assertIn("组件更新", texts)
                 self.assertIn("一键更新 ComfyUI", texts)
                 self.assertIn("修复运行环境", texts)
                 self.assertIn(
@@ -330,20 +374,10 @@ class DashboardShellTests(unittest.TestCase):
                 scrollbar = app._workflow_scrollbar
                 bbox = canvas.bbox("all")
                 self.assertTrue(scrollbar.winfo_ismapped())
-                self.assertEqual(
-                    str(scrollbar.cget("style")),
-                    "LingJing.Vertical.TScrollbar",
-                )
-                scrollbar_style = ttk.Style(app)
-                scrollbar_layout = repr(
-                    scrollbar_style.layout("LingJing.Vertical.TScrollbar")
-                ).lower()
-                self.assertNotIn("uparrow", scrollbar_layout)
-                self.assertNotIn("downarrow", scrollbar_layout)
-                self.assertLessEqual(
-                    int(scrollbar_style.lookup("LingJing.Vertical.TScrollbar", "width")),
-                    8,
-                )
+                self.assertIsInstance(scrollbar, main_gateway.SlimRoundedScrollbar)
+                self.assertLessEqual(int(scrollbar.cget("width")), 6)
+                self.assertEqual(scrollbar.bar_width, 4)
+                self.assertTrue(scrollbar.find_withtag("thumb"))
                 self.assertTrue(str(canvas.cget("yscrollcommand")))
                 self.assertIsNotNone(bbox)
                 self.assertGreater(bbox[3] - bbox[1], canvas.winfo_height())
@@ -359,6 +393,86 @@ class DashboardShellTests(unittest.TestCase):
                 canvas.yview_moveto(0)
                 row_child = app._workflow_scroll_content.winfo_children()[0]
                 self.assertTrue(str(row_child.bind("<MouseWheel>")))
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_user_facing_font_tokens_and_footer_remain_legible(self):
+        for key in ("normal", "small", "tiny", "mono", "url"):
+            self.assertGreaterEqual(
+                abs(int(main_gateway.F[key][1])),
+                9,
+                f"{key} must not render below 9 pt",
+            )
+        self.assertGreaterEqual(main_gateway.LAYOUT["footer_h"], 30)
+
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app.update_idletasks()
+                footer_font = tkfont.Font(font=app._footer_label.cget("font"))
+                loading_font = tkfont.Font(font=app._loading_text.cget("font"))
+                self.assertIn("YaHei", str(footer_font.actual("family")))
+                self.assertGreaterEqual(abs(int(footer_font.actual("size"))), 9)
+                self.assertGreaterEqual(abs(int(loading_font.actual("size"))), 9)
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_scrollable_resource_and_settings_pages_use_brand_scrollbars_and_wheel(self):
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app.geometry("1090x700")
+                for page_id, nested_text in (
+                    ("resources", "模型维护"),
+                    ("settings", "组件更新"),
+                ):
+                    app._show_page(page_id)
+                    app.update()
+                    page = app._pages[page_id]
+                    widgets = list(self._walk_widgets(page))
+                    self.assertFalse(
+                        any(isinstance(widget, tk.Scrollbar) for widget in widgets),
+                        f"{page_id} must not use the system-grey scrollbar",
+                    )
+                    scrollbars = [
+                        widget
+                        for widget in widgets
+                        if isinstance(widget, main_gateway.SlimRoundedScrollbar)
+                    ]
+                    self.assertEqual(len(scrollbars), 1)
+                    self.assertEqual(scrollbars[0].bar_width, 4)
+                    canvas = next(
+                        widget
+                        for widget in widgets
+                        if isinstance(widget, tk.Canvas)
+                        and not isinstance(widget, main_gateway.SlimRoundedScrollbar)
+                        and str(widget.cget("yscrollcommand"))
+                    )
+                    canvas.yview_moveto(0)
+                    app.update_idletasks()
+                    nested = self._find_by_text(page, nested_text)
+                    self.assertIsNotNone(nested)
+                    self.assertTrue(str(nested.bind("<MouseWheel>")))
+                    self.assertTrue(str(nested.bind("<Button-4>")))
+                    self.assertTrue(str(nested.bind("<Button-5>")))
+                    before = canvas.yview()
+                    nested.event_generate("<MouseWheel>", delta=-120)
+                    app.update_idletasks()
+                    self.assertGreater(
+                        canvas.yview()[0],
+                        before[0],
+                        f"{page_id}: bbox={canvas.bbox('all')} viewport={canvas.winfo_height()} binding={nested.bind('<MouseWheel>')}",
+                    )
             finally:
                 app._dashboard_pages.cancel_pending()
                 app.destroy()
@@ -724,22 +838,17 @@ class DashboardShellTests(unittest.TestCase):
         )
         self.assertGreaterEqual(source.count("请手动重新打开，重启后生效"), 2)
 
-    def test_runtime_install_notice_explains_manual_restart_before_exit(self):
-        app = object.__new__(GatewayApp)
-        app._shutting_down = False
-        app.after = lambda _delay, callback: callback()
-        popup = mock.Mock()
+    def test_runtime_install_uses_branded_manual_restart_notice(self):
+        source = Path(main_gateway.__file__).read_text(encoding="utf-8")
+        start = source.index("    def _show_manual_restart_notice")
+        end = source.index("    def _show_runtime_manual_restart_notice", start)
+        notice_source = source[start:end]
 
-        with mock.patch.object(main_gateway.messagebox, "showinfo") as showinfo:
-            shown = app._show_runtime_manual_restart_notice(popup)
-
-        self.assertTrue(shown)
-        popup.grab_release.assert_called_once_with()
-        title, message = showinfo.call_args.args
-        self.assertIn("运行环境已准备完成", title)
-        self.assertIn("不会自动重启", message)
-        self.assertIn("手动重新打开", message)
-        self.assertIs(showinfo.call_args.kwargs["parent"], popup)
+        self.assertNotIn("messagebox", notice_source)
+        self.assertIn("程序不会自动重新打开", notice_source)
+        self.assertIn("手动打开客户端", notice_source)
+        self.assertIn("退出并完成", notice_source)
+        self.assertIn("WM_DELETE_WINDOW", notice_source)
 
     def test_runtime_install_preserves_staging_when_extractor_cannot_stop(self):
         app = object.__new__(GatewayApp)
@@ -1004,6 +1113,34 @@ class DashboardShellTests(unittest.TestCase):
         self.assertIn("HTTPS", results[0][1])
         app._set_account_status.assert_called_once()
 
+    def test_dotted_qq_email_is_preserved_and_valid(self):
+        email = "lol.lu@qq.com"
+
+        self.assertEqual(main_gateway._normalize_account_email(email), email)
+        self.assertEqual(main_gateway._account_email_error(email), "")
+
+    def test_full_width_email_punctuation_is_normalized_before_login(self):
+        self.assertEqual(
+            main_gateway._normalize_account_email("  lol.lu＠QQ．COM  "),
+            "lol.lu@qq.com",
+        )
+
+    def test_login_submits_valid_dotted_email_without_removing_periods(self):
+        app = object.__new__(GatewayApp)
+        app._server_sync_running = False
+        app._get_server_url = lambda: "https://api.example.com"
+        app._get_server_email = lambda: "lol.lu@qq.com"
+        app._get_server_password = lambda: "password"
+        app._set_account_status = mock.Mock()
+        app._set_account_form_values = mock.Mock()
+
+        with mock.patch.object(threading, "Thread") as thread_cls:
+            app._login_and_sync()
+
+        submitted = thread_cls.call_args.kwargs["args"]
+        self.assertEqual(submitted[1], "lol.lu@qq.com")
+        app._set_account_form_values.assert_called_once_with(email="lol.lu@qq.com")
+
     def test_account_session_token_is_protected_at_rest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with mock.patch.object(main_gateway, "BASE_DIR", Path(temp_dir)):
@@ -1126,6 +1263,22 @@ class DashboardShellTests(unittest.TestCase):
                 self.assertGreaterEqual(sum(str(item.cget("text")) == "停用" for item in buttons), 6)
                 self.assertGreaterEqual(sum(str(item.cget("text")) == "设为默认" for item in buttons), 5)
                 self.assertTrue(scroll_canvases)
+                self.assertFalse(
+                    any(isinstance(widget, tk.Scrollbar) for widget in self._walk_widgets(page))
+                )
+                brand_scrollbars = [
+                    widget
+                    for widget in self._walk_widgets(page)
+                    if isinstance(widget, main_gateway.SlimRoundedScrollbar)
+                ]
+                self.assertEqual(len(brand_scrollbars), 1)
+                self.assertEqual(brand_scrollbars[0].bar_width, 4)
+                detail_button = next(
+                    button for button in buttons if str(button.cget("text")) == "详情"
+                )
+                self.assertTrue(str(detail_button.bind("<MouseWheel>")))
+                self.assertTrue(str(detail_button.bind("<Button-4>")))
+                self.assertTrue(str(detail_button.bind("<Button-5>")))
                 page_left = page.winfo_rootx()
                 page_right = page_left + page.winfo_width()
                 self.assertTrue(
@@ -1229,6 +1382,127 @@ class DashboardShellTests(unittest.TestCase):
 
         app._set_progress_bar.assert_called_once_with(100, "已完成 · 100%")
         app.after.assert_called_once_with(15000, app._hide_progress)
+
+    def test_maintenance_progress_can_collapse_to_bottom_right_and_restore(self):
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+        ):
+            app = GatewayApp()
+            dialog = None
+            try:
+                app.attributes("-alpha", 0.0)
+                app.update()
+                dialog = app._create_runtime_progress_dialog(
+                    title="安装运行环境",
+                    heading="正在安装运行环境",
+                    stage="解压核心模块",
+                    detail="Python · ComfyUI · Torch/CUDA",
+                )
+                app.update()
+
+                self._find_by_text(dialog["popup"], "后台修复").invoke()
+                app.update()
+
+                self.assertEqual(dialog["popup"].state(), "withdrawn")
+                card = dialog["background_card"]
+                self.assertIsNotNone(card)
+                self.assertEqual(card.place_info().get("anchor"), "se")
+                self.assertGreaterEqual(card.winfo_width(), 360)
+
+                app._restore_maintenance_dialog(dialog)
+                app.update()
+                self.assertEqual(dialog["popup"].state(), "normal")
+                self.assertIsNone(dialog["background_card"])
+            finally:
+                if dialog is not None:
+                    app._close_maintenance_dialog(dialog)
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_model_download_dialog_keeps_bottom_actions_visible_and_scrollable(self):
+        missing = [
+            {
+                "path": f"diffusion_models/model-{index}.safetensors",
+                "url": f"https://huggingface.co/example/model/resolve/main/model-{index}.safetensors",
+                "size_bytes": 1024,
+            }
+            for index in range(6)
+        ]
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+            mock.patch.object(GatewayApp, "_missing_model_items", return_value=missing),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app.update()
+                app._show_model_install_help("Flux2 Klein 4B")
+                app.update()
+                popup = next(
+                    child
+                    for child in app.winfo_children()
+                    if isinstance(child, tk.Toplevel) and child.title() == "下载模型"
+                )
+                popup.update()
+                popup_height = popup.winfo_height()
+                for text in ("下载全部模型", "打开模型文件夹", "关闭"):
+                    button = self._find_by_text(popup, text)
+                    self.assertGreaterEqual(button.winfo_height(), 28)
+                    self.assertLessEqual(
+                        button.winfo_rooty() + button.winfo_height(),
+                        popup.winfo_rooty() + popup_height,
+                    )
+                scrollbars = [
+                    widget
+                    for widget in self._walk_widgets(popup)
+                    if isinstance(widget, main_gateway.SlimRoundedScrollbar)
+                ]
+                self.assertEqual(len(scrollbars), 1)
+                self.assertTrue(str(popup.bind("<MouseWheel>")))
+                self._find_by_text(popup, "关闭").invoke()
+            finally:
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
+
+    def test_workflow_detail_puts_install_model_action_in_header(self):
+        workflow = {
+            "id": "flux2_klein_4b_v1",
+            "name": "FLUX.2 Klein 4B",
+            "description": "轻量图像生成工作流",
+            "model_group": "Flux2 Klein 4B",
+            "capability": "text_image_to_image",
+        }
+        with (
+            mock.patch.object(threading.Thread, "start", lambda _thread: None),
+            mock.patch.object(GatewayApp, "_maybe_show_login_prompt", lambda _app: None),
+            mock.patch.object(
+                GatewayApp,
+                "_missing_model_items",
+                return_value=[{"path": "missing.safetensors"}],
+            ),
+        ):
+            app = GatewayApp()
+            try:
+                app.attributes("-alpha", 0.0)
+                app.update()
+                app._show_workflow_schema(workflow)
+                app.update()
+                popup = next(
+                    child
+                    for child in app.winfo_children()
+                    if isinstance(child, tk.Toplevel) and child.title().startswith("工作流详情")
+                )
+                install_button = self._find_by_text(popup, "安装模型")
+                self.assertLess(install_button.winfo_rooty() - popup.winfo_rooty(), 120)
+                self.assertNotIn("下载缺失模型", set(self._all_text(popup)))
+            finally:
+                for child in list(app.winfo_children()):
+                    if isinstance(child, tk.Toplevel):
+                        child.destroy()
+                app._dashboard_pages.cancel_pending()
+                app.destroy()
 
 
 if __name__ == "__main__":

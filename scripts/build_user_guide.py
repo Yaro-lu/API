@@ -301,7 +301,7 @@ def build_story(s):
 
     story.extend([PageBreak(), Paragraph("1. 安装与第一次启动", s["h1"])])
     story.append(Paragraph("1. 双击轻量安装包，按提示完成安装。安装过程不需要管理员权限，也不会安装模型。", s["step"]))
-    story.append(Paragraph("2. 安装完成后，桌面会出现两个同 Logo 入口：“灵境造片厂”用于启动客户端，“灵境造片厂示例页”用于第一次体验接口。", s["step"]))
+    story.append(Paragraph("2. 安装完成后，桌面会出现两个使用同一 Logo 的入口：“灵境造片厂”用于启动客户端，“灵境造片厂示例页”用于第一次体验接口。", s["step"]))
     story.append(Paragraph("3. 客户端界面可以立即打开；此时文字、图片和视频生成仍不可用，因为大型 AI 运行环境独立分发。", s["step"]))
     story.append(Paragraph("4. 进入“模型与环境”，点击“一键修复”。客户端会自动拉取环境包，并使用内置 SHA256 校验，通过后直接安装。", s["step"]))
     story.append(Paragraph("5. 只有自动拉取失败时，客户端才会显示“自动修复失败”弹窗。可复制 GitHub 地址，手动下载环境包，再选择本地环境包完成安装。", s["step"]))
@@ -328,7 +328,7 @@ def build_story(s):
     story.extend([PageBreak(), Paragraph("2. 环境、模型与工作流", s["h1"])])
     story.append(Paragraph("运行环境", s["h2"]))
     story.append(Paragraph("运行环境包含便携 Python、ComfyUI、Torch/CUDA 和 Cloudflared。客户端会先校验环境包名称、SHA256 和目录结构，再事务替换环境目录。模型、工作流和生成结果不会因为环境修复而删除。", s["body"]))
-    story.append(Paragraph("官方环境包版本、文件名、下载地址和 SHA256 固定在客户端发布清单中。需要使用授权镜像时，可以在 runtime/config.local.json 的 runtime.download_url 中填写完整地址、目录地址或带 {package_name} 占位符的模板；镜像不能改变客户端内置的文件名和 SHA256 校验。", s["body"]))
+    story.append(Paragraph("官方环境包版本、文件名、下载地址和 SHA256 固定在客户端发布清单中。需要使用授权镜像时，可以在 runtime/config.local.txt 的 [runtime] 区域修改 download_url；镜像不能改变客户端内置的文件名和 SHA256 校验。", s["body"]))
     story.append(Paragraph("模型", s["h2"]))
     story.append(Paragraph("模型统一放在安装根目录的 `models` 文件夹。优先使用可信来源的 safetensors 或 GGUF 文件，不要导入来源不明的传统 PyTorch checkpoint。", s["body"]))
     story.append(Paragraph("工作流", s["h2"]))

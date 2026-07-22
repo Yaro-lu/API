@@ -1,22 +1,126 @@
-"""
-配置加载器 — 从 runtime/config.local.json 读取配置
-"""
+"""Human-readable local configuration stored in ``runtime/config.local.txt``."""
+
+from __future__ import annotations
+
+import configparser
+import copy
 import json
+import os
+import shlex
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+CONFIG_FILENAME = "config.local.txt"
+LEGACY_CONFIG_FILENAME = "config.local.json"
+
+
 class Config:
+    """Load the client's editable settings from a plain INI-style TXT file."""
+
     def __init__(self, base_dir: Optional[Path] = None):
-        self.base_dir = base_dir or Path(__file__).parent.parent
-        self.config_path = self.base_dir / "runtime" / "config.local.json"
+        self.base_dir = Path(base_dir or Path(__file__).parent.parent)
+        self.config_path = self.base_dir / "runtime" / CONFIG_FILENAME
+        self.legacy_config_path = self.base_dir / "runtime" / LEGACY_CONFIG_FILENAME
+        should_migrate_legacy = (
+            not self.config_path.is_file() and self.legacy_config_path.is_file()
+        )
         self._config = self._load_config()
+        if should_migrate_legacy:
+            self.save()
 
     def _load_config(self) -> Dict[str, Any]:
-        if self.config_path.exists():
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return self._default_config()
+        defaults = self._default_config()
+        loaded: Dict[str, Any] = {}
+        if self.config_path.is_file():
+            loaded = self._read_text_config(self.config_path, defaults)
+        elif self.legacy_config_path.is_file():
+            try:
+                candidate = json.loads(
+                    self.legacy_config_path.read_text(encoding="utf-8-sig")
+                )
+                if isinstance(candidate, dict):
+                    loaded = candidate
+            except (OSError, json.JSONDecodeError):
+                loaded = {}
+        return self._merge_dicts(defaults, loaded)
+
+    @staticmethod
+    def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        result = copy.deepcopy(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = Config._merge_dicts(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    @staticmethod
+    def _parse_text_value(raw: str, template: Any = None, *, key: str = "") -> Any:
+        value = str(raw or "").strip()
+        if isinstance(template, bool):
+            return value.casefold() in {"1", "true", "yes", "on", "开启", "是"}
+        if isinstance(template, int) and not isinstance(template, bool):
+            try:
+                return int(value)
+            except ValueError:
+                return template
+        if isinstance(template, float):
+            try:
+                return float(value)
+            except ValueError:
+                return template
+        if isinstance(template, list) or key == "launch_args":
+            if not value:
+                return []
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+            try:
+                legacy_items = shlex.split(value, posix=False)
+            except ValueError:
+                return []
+            return [
+                item[1:-1]
+                if len(item) >= 2 and item[0] == item[-1] and item[0] in {'"', "'"}
+                else item
+                for item in legacy_items
+            ]
+        return value
+
+    def _read_text_config(
+        self,
+        path: Path,
+        defaults: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        try:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                parser.read_file(handle)
+        except (OSError, configparser.Error):
+            return {}
+
+        loaded: Dict[str, Any] = {}
+        for section in parser.sections():
+            if section.startswith("model_alias:"):
+                alias = section.removeprefix("model_alias:").strip()
+                if not alias:
+                    continue
+                target = loaded.setdefault("model_aliases", {}).setdefault(alias, {})
+                template = defaults.get("model_aliases", {}).get(alias, {})
+            else:
+                target = loaded.setdefault(section, {})
+                template = defaults.get(section, {})
+            if not isinstance(target, dict):
+                continue
+            for key, raw in parser.items(section):
+                expected = template.get(key) if isinstance(template, dict) else None
+                target[key] = self._parse_text_value(raw, expected, key=key)
+        return loaded
 
     def _default_config(self) -> Dict[str, Any]:
         return {
@@ -40,7 +144,12 @@ class Config:
                 "auto_cleanup": False,
                 "unsafe_keep_auth_header": False,
             },
-            "comfyui": {"base_url": "http://127.0.0.1:8188", "timeout_sec": 3600},
+            "comfyui": {
+                "base_url": "http://127.0.0.1:8188",
+                "timeout_sec": 3600,
+                "vram_mode": "auto",
+                "launch_args": [],
+            },
             "text_model": {
                 "mode": "mock",
                 "forward_base_url": "",
@@ -63,17 +172,60 @@ class Config:
             },
         }
 
+    @staticmethod
+    def _format_text_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (list, tuple)):
+            return json.dumps([str(item) for item in value], ensure_ascii=False)
+        return str(value)
+
     def save(self):
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        for section, values in self._config.items():
+            if section == "model_aliases" and isinstance(values, dict):
+                for alias, alias_values in values.items():
+                    if not isinstance(alias_values, dict):
+                        continue
+                    parser[f"model_alias:{alias}"] = {
+                        key: self._format_text_value(value)
+                        for key, value in alias_values.items()
+                    }
+                continue
+            if isinstance(values, dict):
+                parser[section] = {
+                    key: self._format_text_value(value)
+                    for key, value in values.items()
+                }
+
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(self._config, f, ensure_ascii=False, indent=2)
+        temporary = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write("# 灵境造片厂高级设置\n")
+                handle.write("# 修改端口、显存模式等参数后，请退出并重新打开客户端。\n\n")
+                parser.write(handle, space_around_delimiters=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.config_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def ensure_file(self) -> Path:
+        if not self.config_path.is_file():
+            self.save()
+        return self.config_path
+
+    def as_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._config)
 
     def get(self, key: str, default: Any = None) -> Any:
         keys = key.split(".")
-        value = self._config
-        for k in keys:
-            if isinstance(value, dict) and k in value:
-                value = value[k]
+        value: Any = self._config
+        for item in keys:
+            if isinstance(value, dict) and item in value:
+                value = value[item]
             else:
                 return default
         return value
@@ -81,98 +233,97 @@ class Config:
     def set(self, key: str, value: Any):
         keys = key.split(".")
         target = self._config
-        for k in keys[:-1]:
-            if k not in target or not isinstance(target[k], dict):
-                target[k] = {}
-            target = target[k]
+        for item in keys[:-1]:
+            if item not in target or not isinstance(target[item], dict):
+                target[item] = {}
+            target = target[item]
         target[keys[-1]] = value
 
     @property
     def server_host(self) -> str:
-        return self.get("server.host", "127.0.0.1")
+        return str(self.get("server.host", "127.0.0.1"))
 
     @property
     def server_port(self) -> int:
-        return self.get("server.port", 18188)
+        return int(self.get("server.port", 18188))
 
     @property
     def comfyui_url(self) -> str:
-        return self.get("comfyui.base_url", "http://127.0.0.1:8188")
+        return str(self.get("comfyui.base_url", "http://127.0.0.1:8188"))
 
     @property
     def comfyui_timeout(self) -> int:
-        return self.get("comfyui.timeout_sec", 3600)
+        return int(self.get("comfyui.timeout_sec", 3600))
 
     @property
     def max_concurrent(self) -> int:
-        return self.get("queue.max_concurrent", 1)
+        return int(self.get("queue.max_concurrent", 1))
 
     @property
     def max_pending(self) -> int:
-        return self.get("queue.max_pending", 10)
+        return int(self.get("queue.max_pending", 10))
 
     @property
     def runtime_dir(self) -> Path:
-        p = self.base_dir / "runtime"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.base_dir / "runtime"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def requests_dir(self) -> Path:
-        p = self.runtime_dir / "requests"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "requests"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def inputs_dir(self) -> Path:
-        p = self.runtime_dir / "inputs"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "inputs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def outputs_dir(self) -> Path:
-        p = self.runtime_dir / "outputs"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "outputs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def tasks_dir(self) -> Path:
-        p = self.runtime_dir / "tasks"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "tasks"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def logs_dir(self) -> Path:
-        p = self.runtime_dir / "logs"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "logs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def temp_dir(self) -> Path:
-        p = self.runtime_dir / "temp"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.runtime_dir / "temp"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def cloudflared_path(self) -> Path:
-        rel = self.get("tunnel.cloudflared_path", "bin/cloudflared.exe")
-        return self.base_dir / rel
+        relative = self.get("tunnel.cloudflared_path", "bin/cloudflared.exe")
+        return self.base_dir / str(relative)
 
     @property
     def tunnel_protocol(self) -> str:
-        return self.get("tunnel.protocol", "auto")
+        return str(self.get("tunnel.protocol", "auto"))
 
     @property
     def model_aliases(self) -> Dict[str, Any]:
-        return self.get("model_aliases", {})
+        value = self.get("model_aliases", {})
+        return value if isinstance(value, dict) else {}
 
     @property
     def storage_config(self) -> Dict[str, Any]:
-        return self.get("storage", {})
+        value = self.get("storage", {})
+        return value if isinstance(value, dict) else {}
 
     def get_model_alias(self, model_id: str) -> Optional[Dict[str, Any]]:
-        aliases = self.model_aliases
-        for key, val in aliases.items():
-            if key == model_id:
-                return val
-        return None
+        value = self.model_aliases.get(model_id)
+        return value if isinstance(value, dict) else None

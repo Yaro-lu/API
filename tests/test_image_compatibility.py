@@ -421,6 +421,35 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         FakeComfyUIClient.release.set()
         release_timer.cancel()
 
+    async def test_direct_workflow_call_preserves_its_save_image_prefix(self):
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/flux_t2i_v1",
+            headers=self.auth,
+            json_body={"prompt": "保留工作流自己的输出名称"},
+        )
+
+        self.assertEqual(status, 200)
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertEqual(queued["1"]["inputs"]["filename_prefix"], "test")
+
+    async def test_explicit_filename_prefix_overrides_workflow_default(self):
+        status, _headers, _body = await asgi_request(
+            self.app,
+            "POST",
+            "/v1/workflows/run/flux_t2i_v1",
+            headers=self.auth,
+            json_body={
+                "prompt": "调用方指定输出名称",
+                "filename_prefix": "caller-prefix",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        queued = FakeComfyUIClient.queued_workflows[-1]
+        self.assertEqual(queued["1"]["inputs"]["filename_prefix"], "caller-prefix")
+
     async def test_video_request_uploads_frames_and_injects_real_load_image_names(self):
         frame_data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
         status, _headers, body = await asgi_request(
@@ -545,6 +574,18 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(frames=invalid):
                 with self.assertRaises(server.HTTPException) as raised:
                     server._validated_generation_body({"frames": invalid})
+                self.assertEqual(raised.exception.status_code, 422)
+
+    def test_filename_prefix_allows_safe_subfolders_and_rejects_path_escape(self):
+        validated = server._validated_generation_body(
+            {"filename_prefix": "video/我的镜头"}
+        )
+        self.assertEqual(validated["filename_prefix"], "video/我的镜头")
+
+        for invalid in ("../outside", "/absolute", "C:\\outside", "folder//name"):
+            with self.subTest(filename_prefix=invalid):
+                with self.assertRaises(server.HTTPException) as raised:
+                    server._validated_generation_body({"filename_prefix": invalid})
                 self.assertEqual(raised.exception.status_code, 422)
 
     async def test_video_request_rejects_missing_or_fake_frames_before_upload(self):

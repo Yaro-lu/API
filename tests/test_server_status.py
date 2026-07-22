@@ -33,6 +33,12 @@ class ServerStatusTests(unittest.TestCase):
                 {"url": "", "checked_at": 0.0, "nodes": None}
             )
 
+    def test_server_version_matches_release_version_file(self):
+        expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+        self.assertEqual(server.APP_VERSION, expected)
+
     def test_stale_public_url_is_hidden_while_tunnel_is_offline(self):
         fake_state = SimpleNamespace(
             base_url="https://stale.example",

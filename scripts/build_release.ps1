@@ -118,7 +118,10 @@ function Test-ExcludedRelativePath {
     if ($leaf -match '(?i)^git\.exe$') {
         return $true
     }
-    if ($leaf -match '(?i)^(session|account_session|client_instance|workflow_config|config\.local)\.json$') {
+    if (
+        $leaf -match '(?i)^(session|account_session|client_instance|workflow_config)\.json$' -or
+        $leaf -match '(?i)^config\.local\.(json|txt)$'
+    ) {
         return $true
     }
     if ($leaf -match '(?i)^\.(session|workflow_config)\.lock$' -or $leaf -match '(?i)^gateway\.lock$') {
@@ -371,7 +374,8 @@ function Assert-StagingPolicy {
         '^\.venv/share(/|$)',
         '^\.venv/lib/site-packages/(?:torch|torchaudio|torchvision|triton|nvidia)(?:[-./]|$)',
         '^bin/cloudflared\.exe$',
-        '(^|/)(session|account_session|client_instance|workflow_config|config\.local)\.json$',
+        '(^|/)(session|account_session|client_instance|workflow_config)\.json$',
+        '(^|/)config\.local\.(json|txt)$',
         '(^|/)\.(session|workflow_config)\.lock$',
         '(^|/)gateway\.lock$'
     )
@@ -627,6 +631,9 @@ try {
 
     Write-Step "Smoke-testing staged client startup imports"
     Assert-StagedClientImportable -StageRoot $StageRoot
+
+    Write-Step "Rechecking staging after startup smoke test"
+    Assert-StagingPolicy -StageRoot $StageRoot
 
     Write-Step "Generating member manifest with SHA256"
     $members = @(
