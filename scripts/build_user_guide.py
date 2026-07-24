@@ -279,7 +279,7 @@ def build_story(s):
         [Paragraph("项目主页", s["table_head"]), Paragraph(PROJECT_URL, s["table_cell"])],
         [Paragraph("客户端版本", s["table_head"]), Paragraph(CLIENT_VERSION, s["table_cell"])],
         [Paragraph("支持系统", s["table_head"]), Paragraph("Windows 10 22H2 / Windows 11，64 位", s["table_cell"])],
-        [Paragraph("支持硬件", s["table_head"]), Paragraph("NVIDIA RTX 20 系列或更高，显存 8GB 或以上；CUDA 13 环境要求 R580 或更高驱动", s["table_cell"])],
+        [Paragraph("支持硬件", s["table_head"]), Paragraph("NVIDIA RTX 20 系列或更高，显存 8GB 或以上；8GB 仅适合轻量工作流，CUDA 13 环境要求 R580 或更高驱动", s["table_cell"])],
     ]
     info = Table(summary, colWidths=[38 * mm, 128 * mm])
     info.setStyle(
@@ -327,8 +327,8 @@ def build_story(s):
 
     story.extend([PageBreak(), Paragraph("2. 环境、模型与工作流", s["h1"])])
     story.append(Paragraph("运行环境", s["h2"]))
-    story.append(Paragraph("运行环境包含便携 Python、ComfyUI、Torch/CUDA 和 Cloudflared。客户端会先校验环境包名称、SHA256 和目录结构，再事务替换环境目录。模型、工作流和生成结果不会因为环境修复而删除。", s["body"]))
-    story.append(Paragraph("官方环境包版本、文件名、下载地址和 SHA256 固定在客户端发布清单中。需要使用授权镜像时，可以在 runtime/config.local.txt 的 [runtime] 区域修改 download_url；镜像不能改变客户端内置的文件名和 SHA256 校验。", s["body"]))
+    story.append(Paragraph("运行环境包含便携 Python、ComfyUI、Torch/CUDA 和 Cloudflared。客户端会先校验环境包名称、精确大小、SHA256 和目录结构，再事务替换环境目录。模型、工作流和生成结果不会因为环境修复而删除。", s["body"]))
+    story.append(Paragraph("官方环境包版本、文件名、下载地址、大小和 SHA256 固定在客户端发布清单中。需要使用授权镜像时，可以在 runtime/config.local.txt 的 [runtime] 区域修改 HTTPS download_url；镜像不能改变客户端内置的文件名、大小和 SHA256 校验。", s["body"]))
     story.append(Paragraph("模型", s["h2"]))
     story.append(Paragraph("模型统一放在安装根目录的 `models` 文件夹。优先使用可信来源的 safetensors 或 GGUF 文件，不要导入来源不明的传统 PyTorch checkpoint。", s["body"]))
     story.append(Paragraph("工作流", s["h2"]))
@@ -345,7 +345,7 @@ def build_story(s):
         1,
     ):
         story.append(Paragraph(f"{index}. {text}", s["step"]))
-    story.append(note_box("客户端更新只替换程序文件；运行环境、模型、配置、日志和生成结果独立保存。卸载时可能保留可变数据，删除前请先备份。", s["body"]))
+    story.append(note_box("客户端更新只替换程序文件；运行环境、模型、配置、日志和生成结果独立保存。卸载会清理程序、后装运行环境、模型和工作流，但保留 outputs 中的生成资产；重要内容仍请自行备份。", s["body"]))
 
     story.extend([PageBreak(), Paragraph("3. API 接入基础", s["h1"])])
     story.append(Paragraph("新手示例页", s["h2"]))
@@ -386,6 +386,7 @@ def build_story(s):
         ("环境检查提示 NVIDIA 驱动过旧", "CUDA 13 运行环境要求使用 R580 或更高驱动。更新驱动后重启电脑，再点击“检查环境”。"),
         ("接口返回 401 或 403", "检查 Authorization 请求头是否使用 `Bearer API_KEY`，并确认复制的是生成接口 Key，而不是本机管理 Key。"),
         ("接口能访问但工作流失败", "在工作流页面查看缺失模型和公开参数；确认模型文件完整，默认工作流已选中，ComfyUI 状态正常。"),
+        ("登录平台会同步什么", "登录后会向你填写的服务端同步公网 URL、本机 API Key、设备名称、工作流/模型状态和不含提示词的任务进度，供平台调用。提示词与生成结果不在同步数据中；只应登录可信服务。不登录不影响完整本地功能。"),
         ("更新客户端会不会删除模型", "不会。程序、运行环境、模型和用户数据分离。重要模型和输出仍建议定期备份。"),
     ]
     for title, answer in questions:

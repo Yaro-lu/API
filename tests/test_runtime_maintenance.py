@@ -4,7 +4,10 @@ import time
 import unittest
 import io
 import json
+import hashlib
+import os
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -122,10 +125,96 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             )
         )
 
-        result = main_gateway._check_torch(Path("runtime/python/python.exe"), run_command)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONNOUSERSITE": "0",
+                "PYTHONHOME": "unsafe-home",
+                "PYTHONPATH": "unsafe-path",
+                "PYTHONSTARTUP": "unsafe-startup.py",
+            },
+        ):
+            result = main_gateway._check_torch(
+                Path("runtime/python/python.exe"),
+                run_command,
+            )
 
         self.assertTrue(result["success"])
         self.assertGreaterEqual(run_command.call_args.kwargs["timeout"], 90)
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[1:4], ["-s", "-B", "-c"])
+        probe_env = run_command.call_args.kwargs["env"]
+        self.assertEqual(probe_env["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(probe_env["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(probe_env["PYTHONUTF8"], "1")
+        self.assertNotIn("PYTHONHOME", probe_env)
+        self.assertNotIn("PYTHONPATH", probe_env)
+        self.assertNotIn("PYTHONSTARTUP", probe_env)
+
+    def test_download_redirects_are_rejected_before_transport_follows_them(self):
+        original = "https://github.com/Yaro-lu/LingJingAI/releases/download/v1/runtime.7z"
+        request = urllib.request.Request(original)
+        handler = main_gateway._DownloadRedirectHandler(
+            original,
+            main_gateway.RUNTIME_DOWNLOAD_REDIRECT_SUFFIXES,
+        )
+
+        for target in (
+            "http://127.0.0.1/private",
+            "https://127.0.0.1/private",
+            "https://github.com.attacker.invalid/runtime.7z",
+        ):
+            with self.subTest(target=target), mock.patch.object(
+                urllib.request.HTTPRedirectHandler,
+                "redirect_request",
+            ) as delegated:
+                with self.assertRaisesRegex(OSError, "未授权的重定向"):
+                    handler.redirect_request(
+                        request,
+                        None,
+                        302,
+                        "Found",
+                        {},
+                        target,
+                    )
+                delegated.assert_not_called()
+
+    def test_download_redirects_allow_only_expected_hf_xet_and_github_hosts(self):
+        cases = (
+            (
+                "https://huggingface.co/org/repo/resolve/main/model.safetensors",
+                "https://cdn-lfs.hf.co/file",
+                main_gateway.MODEL_DOWNLOAD_REDIRECT_SUFFIXES,
+            ),
+            (
+                "https://huggingface.co/org/repo/resolve/main/model.safetensors",
+                "https://transfer.xethub.hf.co/file",
+                main_gateway.MODEL_DOWNLOAD_REDIRECT_SUFFIXES,
+            ),
+            (
+                "https://github.com/Yaro-lu/LingJingAI/releases/download/v1/runtime.7z",
+                "https://release-assets.githubusercontent.com/file",
+                main_gateway.RUNTIME_DOWNLOAD_REDIRECT_SUFFIXES,
+            ),
+        )
+
+        for original, target, suffixes in cases:
+            with self.subTest(target=target), mock.patch.object(
+                urllib.request.HTTPRedirectHandler,
+                "redirect_request",
+                return_value="delegated",
+            ) as delegated:
+                handler = main_gateway._DownloadRedirectHandler(original, suffixes)
+                result = handler.redirect_request(
+                    urllib.request.Request(original),
+                    None,
+                    302,
+                    "Found",
+                    {},
+                    target,
+                )
+                self.assertEqual(result, "delegated")
+                delegated.assert_called_once()
 
     def test_maintenance_guard_records_and_releases_owned_services(self):
         app = self._app()
@@ -394,11 +483,18 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             control = {
                 "url": "https://example.invalid/model.safetensors",
                 "target": target,
-                "item": {"size_bytes": len(b"model")},
+                "item": {
+                    "size_bytes": len(b"model"),
+                    "sha256": hashlib.sha256(b"model").hexdigest(),
+                },
                 "pause_event": threading.Event(),
                 "status_var": mock.Mock(),
             }
-            with mock.patch("urllib.request.urlopen", return_value=Response(b"model")):
+            with mock.patch.object(
+                main_gateway,
+                "_open_download_request",
+                return_value=Response(b"model"),
+            ):
                 app._download_model_file(control)
 
             self.assertEqual(target.read_bytes(), b"model")
@@ -430,12 +526,19 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             control = {
                 "url": "https://example.invalid/model.safetensors",
                 "target": target,
-                "item": {"size_bytes": 5},
+                "item": {
+                    "size_bytes": 5,
+                    "sha256": hashlib.sha256(b"model").hexdigest(),
+                },
                 "pause_event": threading.Event(),
                 "status_var": mock.Mock(),
             }
             with (
-                mock.patch("urllib.request.urlopen", side_effect=lambda *_args, **_kwargs: Response()),
+                mock.patch.object(
+                    main_gateway,
+                    "_open_download_request",
+                    side_effect=lambda *_args, **_kwargs: Response(),
+                ),
                 mock.patch.object(main_gateway.time, "sleep"),
             ):
                 app._download_model_file(control)
@@ -460,6 +563,7 @@ class RuntimeMaintenanceTests(unittest.TestCase):
                     {
                         "url": "https://example.invalid/model.safetensors",
                         "expected_size": len(b"model"),
+                        "expected_sha256": hashlib.sha256(b"model").hexdigest(),
                         "validator": '"fixture"',
                     }
                 ),
@@ -468,11 +572,14 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             control = {
                 "url": "https://example.invalid/model.safetensors",
                 "target": target,
-                "item": {"size_bytes": len(b"model")},
+                "item": {
+                    "size_bytes": len(b"model"),
+                    "sha256": hashlib.sha256(b"model").hexdigest(),
+                },
                 "pause_event": threading.Event(),
                 "status_var": mock.Mock(),
             }
-            with mock.patch("urllib.request.urlopen") as urlopen:
+            with mock.patch.object(main_gateway, "_open_download_request") as urlopen:
                 app._download_model_file(control)
 
             urlopen.assert_not_called()
@@ -509,12 +616,19 @@ class RuntimeMaintenanceTests(unittest.TestCase):
             control = {
                 "url": "https://example.invalid/model.safetensors",
                 "target": target,
-                "item": {"size_bytes": 5},
+                "item": {
+                    "size_bytes": 5,
+                    "sha256": hashlib.sha256(b"model").hexdigest(),
+                },
                 "pause_event": threading.Event(),
                 "status_var": mock.Mock(),
             }
             with (
-                mock.patch("urllib.request.urlopen", side_effect=responses),
+                mock.patch.object(
+                    main_gateway,
+                    "_open_download_request",
+                    side_effect=responses,
+                ),
                 mock.patch.object(main_gateway.time, "sleep"),
             ):
                 app._download_model_file(control)

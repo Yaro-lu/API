@@ -5,7 +5,7 @@ param(
     [string]$Version = "",
     [string]$SourceRoot = "",
     [string]$PackageBaseName = "runtime-nvidia-rtx20plus-cu130",
-    [string]$Repository = "Yaro-lu/API",
+    [string]$Repository = "Yaro-lu/LingJingAI",
     [switch]$ValidateOnly
 )
 
@@ -413,6 +413,7 @@ try {
         version = $Version
         release_tag = $releaseTag
         package_name = $PackageName
+        size_bytes = (Get-Item -LiteralPath $ArchivePath).Length
         sha256 = $hash
         download_url = $releaseUrl
         homepage_url = "https://github.com/$Repository"

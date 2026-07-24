@@ -752,16 +752,20 @@ def _launch_runtime_update_unlocked(
     )
     popen_factory = popen_factory or subprocess.Popen
     base_creation_flags = (
-        getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     )
     breakaway_flag = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
     popen_kwargs = dict(
         cwd=str(base),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
+        startupinfo=startupinfo,
     )
     _clear_helper_started_markers(base, operation_id)
     _clear_helper_commit_markers(base, operation_id)

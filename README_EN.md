@@ -20,7 +20,7 @@ Available capabilities depend on the workflows and models installed on your comp
 
 ## First-time setup
 
-1. Download and install `LingJingAI-Setup-1.0.1-win-x64.exe` from [Releases](https://github.com/Yaro-lu/LingJingAI/releases/latest).
+1. Download and install `LingJingAI-Setup-1.0.2-win-x64.exe` from [Releases](https://github.com/Yaro-lu/LingJingAI/releases/latest).
 2. Launch LingJing AI Studio, open **模型与环境 (Models & Runtime)**, and select **一键修复 (One-click Repair)**.
 3. Wait while the client downloads, verifies, and installs the runtime. If the network download fails, use the manual runtime package offered by the error dialog.
 4. Select **下载模型 (Download Models)** for the workflow you want to use.
@@ -33,7 +33,7 @@ The Chinese PDF guide installed with the client contains a more detailed walkthr
 ## Before you install
 
 - Windows 10 22H2 or Windows 11, 64-bit.
-- NVIDIA RTX 20 series or newer with at least 8 GB of VRAM.
+- NVIDIA RTX 20 series or newer with at least 8 GB of VRAM. An 8 GB card is suitable only for lightweight workflows; large workflows such as WAN 14B and LTX-2.3 have higher requirements shown in their client detail pages.
 - NVIDIA driver version 580 or newer for the current CUDA 13 runtime.
 - Enough disk space for the runtime, selected models, and generated files.
 - An SSD is strongly recommended because first model load times are substantially faster than on a mechanical drive.
@@ -42,7 +42,7 @@ The Chinese PDF guide installed with the client contains a more detailed walkthr
 
 | File | Purpose |
 | --- | --- |
-| `LingJingAI-Setup-1.0.1-win-x64.exe` | Required lightweight client containing the interface and launcher components |
+| `LingJingAI-Setup-1.0.2-win-x64.exe` | Required lightweight client containing the interface and launcher components |
 | `runtime-nvidia-rtx20plus-cu130-v1.0.0.7z` | Separate runtime package; normally downloaded automatically, with manual installation as a fallback |
 | Model files | Downloaded separately for each workflow; not bundled with the client or runtime |
 
@@ -56,7 +56,7 @@ Large models are not preinstalled. Workflows remain visible and list the exact f
 
 ### Is an internet connection always required?
 
-Internet access is required when downloading the runtime and models. Once they are installed, local generation can run on the same computer without an internet connection. Public tunnel access and online services still require a network connection.
+Internet access is required when downloading the runtime and models. Once they are installed, generation itself can run locally, but the client attempts to establish a public Tunnel by default. Stop the public connection or all background services for fully offline use.
 
 ### What is the example page?
 
@@ -68,14 +68,23 @@ They are stored in the `outputs` folder under the installation directory by defa
 
 ### Is my content uploaded automatically?
 
-No. Generation runs locally by default. External devices can reach the client only when you intentionally enable the public Tunnel or share the URL and API Key.
+No content is uploaded automatically. Generation runs locally by default. When the client starts, it automatically attempts to establish an authenticated public Tunnel; only callers holding both the public URL and a valid API Key can submit jobs or retrieve the corresponding results. If public access is unnecessary, stop all background services in the client. Never publish the URL, API Key, or screenshots containing them.
+
+### What is synchronized when I sign in?
+
+Only after you actively sign in does the client send the public URL, local API Key, device name, workflow/model status, and prompt-free task progress to the server address you entered so that the platform can call this computer. Prompts and generated results are not included in this synchronization. A custom server receives credentials capable of calling the local API, so sign in only to a trusted service. All local features remain available without signing in.
+
+### Does signing out automatically revoke the old API Key?
+
+Not in this version. Signing out stops further platform synchronization but does not replace the API Key already shared with that platform. If you no longer trust it, sign out and then generate a new access key in **Settings**. After the API restarts, the previous key can no longer call the local service.
 
 ## Download and usage notice
 
 - Latest version: [GitHub Releases](https://github.com/Yaro-lu/LingJingAI/releases/latest)
-- Current client version: `1.0.1`
+- Current client version: `1.0.2`
 - This project is publicly available as a non-commercial release, but no open-source license is currently granted.
 - It may be used only for learning, testing, and evaluation. Models and third-party components remain subject to their own licenses.
+- See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for major bundled components and license notices.
 - The installer is not commercially Authenticode-signed. Download it only from this repository's Releases page and verify the SHA-256 digest shown by GitHub.
 
 ---
@@ -92,7 +101,7 @@ Caller (example page / web app / backend / other software)
         ▼
 LingJing AI Studio ── workflow router ── ComfyUI / local models
         │
-        └── Cloudflare Tunnel (only when public access is needed)
+        └── Cloudflare Tunnel (attempted by default; stop background services to close it)
 ```
 
 The lightweight client bundles portable Python, Tk, and 7-Zip components required to open the full interface. ComfyUI, Torch, CUDA, and Cloudflared are distributed in the separate runtime package.
@@ -158,7 +167,7 @@ Trae or VS Code should use `runtime\python\python.exe`. The repository's `.vscod
 ### Security and privacy
 
 - Generation API Keys and local administrative keys have separate permission scopes.
-- Local Windows credentials are protected with the current user's DPAPI, and full keys are not written to logs.
+- Client-generated API and local administrative keys are protected with the current user's DPAPI, and full keys are not written to logs. A third-party text-model key entered in advanced settings is currently stored in plaintext in the local configuration file; use it only on a trusted computer and never include that file in a project archive.
 - Remote account services require HTTPS by default; plain HTTP is allowed only for loopback development.
 - Release packaging uses an allowlist and excludes models, account sessions, requests, logs, and generated outputs.
 - A public URL is still an internet entry point. Keep the API Key private and never commit it to a repository or include it in public screenshots.

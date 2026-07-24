@@ -17,12 +17,13 @@ set "FAILED=0"
 call :check_file "runtime\python\python.exe" "便携 Python"
 call :check_file "runtime\ComfyUI\main.py" "ComfyUI"
 call :check_file ".venv\Lib\site-packages\fastapi\__init__.py" "Python 依赖"
+call :check_file ".venv\Lib\site-packages\torch\__init__.py" "Torch/CUDA 依赖"
 call :check_file "bin\cloudflared.exe" "Cloudflare Tunnel"
 
 if exist "runtime\python\python.exe" (
     echo.
     echo [运行测试]
-    "runtime\python\python.exe" -s -c "import customtkinter, fastapi, PIL, pystray, requests, uvicorn; print('  [正常] 客户端依赖可以加载')"
+    "runtime\python\python.exe" -s -B -c "import customtkinter, fastapi, PIL, pystray, requests, torch, uvicorn; assert torch.cuda.is_available(), 'Torch 无法使用 NVIDIA CUDA'; print('  [正常] 客户端依赖与 CUDA 可以加载:', torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
     if errorlevel 1 set "FAILED=1"
 )
 
@@ -37,7 +38,7 @@ if errorlevel 1 (
 
 echo.
 if "%FAILED%"=="0" (
-    echo 检查完成：客户端基础运行环境正常。
+    echo 检查完成：客户端与 GPU 运行环境正常。
 ) else (
     echo 检查完成：存在缺失项，请重新安装或修复运行环境。
 )

@@ -171,6 +171,7 @@ class LightweightReleaseContractTests(unittest.TestCase):
             "runtime-nvidia-rtx20plus-cu130",
             "$ReleaseManifestPath",
             "schema_version = 1",
+            "size_bytes =",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.runtime_script)
@@ -183,6 +184,7 @@ class LightweightReleaseContractTests(unittest.TestCase):
         package_name = self.runtime_release["package_name"]
         self.assertTrue(package_name.startswith("runtime-nvidia-"))
         self.assertTrue(package_name.endswith(".7z"))
+        self.assertGreater(self.runtime_release["size_bytes"], 0)
         self.assertEqual(len(self.runtime_release["sha256"]), 64)
         self.assertTrue(self.runtime_release["download_url"].endswith(f"/{package_name}"))
 
@@ -202,7 +204,7 @@ class LightweightReleaseContractTests(unittest.TestCase):
         self.assertIn("灵境造片厂使用教学.pdf", self.release_script)
 
     def test_readme_describes_manual_download_and_installed_tutorial(self):
-        for marker in ("https://github.com/Yaro-lu/API", "一键修复", "拉取失败", "灵境造片厂使用教学.pdf"):
+        for marker in ("https://github.com/Yaro-lu/LingJingAI", "一键修复", "拉取失败", "灵境造片厂使用教学.pdf"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.readme)
 

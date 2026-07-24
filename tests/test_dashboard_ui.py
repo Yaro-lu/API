@@ -489,14 +489,14 @@ class DashboardShellTests(unittest.TestCase):
                 app.attributes("-alpha", 0.0)
                 app._download_runtime = mock.Mock()
                 app._runtime_mirror_url = mock.Mock(
-                    return_value="https://github.com/Yaro-lu/API/releases/download/v1/runtime.7z"
+                    return_value="https://github.com/Yaro-lu/LingJingAI/releases/download/v1/runtime.7z"
                 )
 
                 app._install_runtime_from_mirror()
                 app.update_idletasks()
 
                 app._download_runtime.assert_called_once_with(
-                    "https://github.com/Yaro-lu/API/releases/download/v1/runtime.7z",
+                    "https://github.com/Yaro-lu/LingJingAI/releases/download/v1/runtime.7z",
                     repair_confirmed=False,
                 )
                 popups = [
@@ -850,6 +850,149 @@ class DashboardShellTests(unittest.TestCase):
         self.assertIn("退出并完成", notice_source)
         self.assertIn("WM_DELETE_WINDOW", notice_source)
 
+    def test_manual_restart_notice_gives_immediate_visible_feedback(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        app.after = lambda _delay, callback: callback()
+        app._restore_maintenance_dialog = mock.Mock()
+        popup = mock.MagicMock()
+        content = mock.MagicMock()
+        dialog = {
+            "popup": popup,
+            "panel": mock.MagicMock(),
+            "content": content,
+        }
+        action_button = mock.MagicMock()
+        status_label = mock.MagicMock()
+
+        def build_button(_parent, _text, command, _style, **_kwargs):
+            action_button.pack.side_effect = lambda **_pack_kwargs: command()
+            return action_button
+
+        app._button = build_button
+        labels = [mock.MagicMock(), mock.MagicMock(), status_label]
+        with (
+            mock.patch.object(main_gateway.tk, "Frame", return_value=mock.MagicMock()),
+            mock.patch.object(main_gateway.tk, "Label", side_effect=labels),
+        ):
+            accepted = app._show_manual_restart_notice(dialog, component="运行环境")
+
+        self.assertTrue(accepted)
+        action_button.config.assert_called_once_with(
+            state="disabled",
+            text="正在退出并完成安装…",
+        )
+        status_label.config.assert_called_once_with(
+            text="正在关闭后台服务并启动安装助手，请稍候…",
+            fg=C["primary"],
+        )
+        popup.update_idletasks.assert_called_once_with()
+
+    def test_restore_maintenance_dialog_reveals_progress_after_handoff_error(self):
+        app = object.__new__(GatewayApp)
+        popup = mock.MagicMock()
+        popup.winfo_exists.return_value = True
+        content = mock.MagicMock()
+        notice = mock.MagicMock()
+        notice.winfo_exists.return_value = True
+        dialog = {
+            "background_card": None,
+            "popup": popup,
+            "content": content,
+            "restart_notice": notice,
+        }
+
+        app._restore_maintenance_dialog(dialog)
+
+        notice.destroy.assert_called_once_with()
+        content.pack.assert_called_once_with(
+            fill="both",
+            expand=True,
+            padx=24,
+            pady=20,
+        )
+        self.assertIsNone(dialog["restart_notice"])
+
+    def test_runtime_helper_launch_failure_restores_progress_and_services(self):
+        app = object.__new__(GatewayApp)
+        app._shutting_down = False
+        app._dashboard_pages = mock.Mock()
+        app._last_health = {}
+        app.after = lambda _delay, callback: callback()
+        popup = mock.MagicMock()
+        popup.winfo_exists.return_value = True
+        content = mock.MagicMock()
+        notice = mock.MagicMock()
+        notice.winfo_exists.return_value = True
+        dialog = {
+            "popup": popup,
+            "panel": mock.MagicMock(),
+            "content": content,
+            "progress_var": FakeVariable(82),
+            "stage_var": FakeVariable(),
+            "stage_label": FakeWidget(),
+            "detail_var": FakeVariable(),
+            "detail_label": FakeWidget(),
+            "background_card": None,
+        }
+        app._create_runtime_progress_dialog = mock.Mock(return_value=dialog)
+        app._set_runtime_install_stage = mock.Mock()
+        app._process_supervisor = mock.Mock()
+        app._process_supervisor.run.side_effect = [
+            mock.Mock(returncode=0, stdout="members", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        app._process_supervisor.is_running.return_value = False
+        app._begin_runtime_maintenance = mock.Mock(
+            return_value=(True, {"api", "comfyui"}, "")
+        )
+        app._end_runtime_maintenance = mock.Mock()
+        app._exit_for_runtime_update = mock.Mock()
+
+        def accept_notice(_dialog):
+            dialog["restart_notice"] = notice
+            return True
+
+        app._show_runtime_manual_restart_notice = accept_notice
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            package = base / "runtime.7z"
+            package.write_bytes(b"runtime")
+            with (
+                mock.patch.object(main_gateway, "BASE_DIR", base),
+                mock.patch.object(main_gateway, "_runtime_has_package_files", return_value=False),
+                mock.patch.object(main_gateway, "_check_runtime_exists", return_value=True),
+                mock.patch.object(main_gateway, "verify_runtime_package", return_value=(True, "a", "a")),
+                mock.patch.object(main_gateway, "find_extractor", return_value=("tar", "tar.exe")),
+                mock.patch.object(main_gateway, "archive_list_command", return_value=["list"]),
+                mock.patch.object(main_gateway, "archive_extract_command", return_value=["extract"]),
+                mock.patch.object(main_gateway, "parse_archive_members", return_value=[]),
+                mock.patch.object(main_gateway, "missing_archive_entries", return_value=[]),
+                mock.patch.object(main_gateway, "invalid_archive_entries", return_value=[]),
+                mock.patch.object(main_gateway, "validate_staged_runtime"),
+                mock.patch.object(
+                    main_gateway,
+                    "launch_runtime_update",
+                    side_effect=RuntimeError("后台安装助手启动失败"),
+                ),
+                mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
+            ):
+                app._extract_runtime(package)
+
+        app._end_runtime_maintenance.assert_called_once_with(restart=True)
+        app._exit_for_runtime_update.assert_not_called()
+        notice.destroy.assert_called_once_with()
+        content.pack.assert_called_once_with(
+            fill="both",
+            expand=True,
+            padx=24,
+            pady=20,
+        )
+        self.assertEqual(dialog["stage_var"].get(), "安装未完成")
+        self.assertIn("后台安装助手启动失败", dialog["detail_var"].get())
+        popup.protocol.assert_called()
+
     def test_runtime_install_preserves_staging_when_extractor_cannot_stop(self):
         app = object.__new__(GatewayApp)
         app._shutting_down = False
@@ -938,7 +1081,7 @@ class DashboardShellTests(unittest.TestCase):
                     widget
                     for widget in widgets
                     if isinstance(widget, tk.Entry)
-                    and widget.get() == "https://github.com/Yaro-lu/API"
+                    and widget.get() == "https://github.com/Yaro-lu/LingJingAI"
                 ]
                 self.assertEqual(len(url_fields), 1)
 
@@ -946,7 +1089,7 @@ class DashboardShellTests(unittest.TestCase):
                 self.assertIsNotNone(copy_button)
                 copy_button.invoke()
                 app.update()
-                self.assertEqual(app.clipboard_get(), "https://github.com/Yaro-lu/API")
+                self.assertEqual(app.clipboard_get(), "https://github.com/Yaro-lu/LingJingAI")
                 self.assertIsNotNone(self._find_by_text(popup, "自动拉取失败，请手动下载"))
                 self.assertTrue(
                     any("网络连接失败" in text for text in self._all_text(popup))
@@ -967,7 +1110,11 @@ class DashboardShellTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
-                    mock.patch("urllib.request.urlopen", side_effect=OSError("network unavailable")),
+                    mock.patch.object(
+                        main_gateway,
+                        "_open_download_request",
+                        side_effect=OSError("network unavailable"),
+                    ),
                 ):
                     app._download_runtime("https://example.invalid/runtime.7z")
                 app.update()
@@ -1005,7 +1152,7 @@ class DashboardShellTests(unittest.TestCase):
                         "verify_runtime_package",
                         return_value=(True, "expected", "actual"),
                     ) as verify,
-                    mock.patch("urllib.request.urlopen") as urlopen,
+                    mock.patch.object(main_gateway, "_open_download_request") as urlopen,
                 ):
                     app._download_runtime("https://example.invalid/runtime.7z")
 
@@ -1043,7 +1190,12 @@ class DashboardShellTests(unittest.TestCase):
                 with (
                     mock.patch.object(threading.Thread, "start", lambda thread: thread.run()),
                     mock.patch.object(main_gateway, "BASE_DIR", Path(tmp)),
-                    mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
+                    mock.patch.object(main_gateway, "RUNTIME_PACKAGE_SIZE", 7),
+                    mock.patch.object(
+                        main_gateway,
+                        "_open_download_request",
+                        return_value=response,
+                    ) as urlopen,
                 ):
                     app._download_runtime("https://example.invalid/runtime.7z")
                 app.update()
@@ -1113,23 +1265,23 @@ class DashboardShellTests(unittest.TestCase):
         self.assertIn("HTTPS", results[0][1])
         app._set_account_status.assert_called_once()
 
-    def test_dotted_qq_email_is_preserved_and_valid(self):
-        email = "lol.lu@qq.com"
+    def test_dotted_email_is_preserved_and_valid(self):
+        email = "first.last@example.com"
 
         self.assertEqual(main_gateway._normalize_account_email(email), email)
         self.assertEqual(main_gateway._account_email_error(email), "")
 
     def test_full_width_email_punctuation_is_normalized_before_login(self):
         self.assertEqual(
-            main_gateway._normalize_account_email("  lol.lu＠QQ．COM  "),
-            "lol.lu@qq.com",
+            main_gateway._normalize_account_email("  first.last＠EXAMPLE．COM  "),
+            "first.last@example.com",
         )
 
     def test_login_submits_valid_dotted_email_without_removing_periods(self):
         app = object.__new__(GatewayApp)
         app._server_sync_running = False
         app._get_server_url = lambda: "https://api.example.com"
-        app._get_server_email = lambda: "lol.lu@qq.com"
+        app._get_server_email = lambda: "first.last@example.com"
         app._get_server_password = lambda: "password"
         app._set_account_status = mock.Mock()
         app._set_account_form_values = mock.Mock()
@@ -1138,8 +1290,46 @@ class DashboardShellTests(unittest.TestCase):
             app._login_and_sync()
 
         submitted = thread_cls.call_args.kwargs["args"]
-        self.assertEqual(submitted[1], "lol.lu@qq.com")
-        app._set_account_form_values.assert_called_once_with(email="lol.lu@qq.com")
+        self.assertEqual(submitted[1], "first.last@example.com")
+        app._set_account_form_values.assert_called_once_with(email="first.last@example.com")
+
+    def test_json_headers_use_current_app_version(self):
+        app = object.__new__(GatewayApp)
+
+        headers = app._json_headers("https://api.example.com", "test-token")
+
+        self.assertIn(f"LingJingClient/{main_gateway.APP_VERSION}", headers["User-Agent"])
+        self.assertEqual(headers["Origin"], "https://api.example.com")
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+
+    def test_platform_sync_does_not_upload_prompt_or_task_title(self):
+        app = object.__new__(GatewayApp)
+        app._last_health = {
+            "version": "1.0.1",
+            "session_id": "session-test",
+            "workflows": [{"id": "image-test", "name": "图片测试", "type": "image"}],
+            "current_task": {
+                "task_id": "task-test",
+                "workflow_id": "image-test",
+                "status": "running",
+                "progress_percent": 25,
+                "prompt_summary": "private prompt",
+                "prompt": "private prompt full",
+                "title": "private title",
+            },
+        }
+        app._tunnel_url = "https://public.example"
+        app._api_key = "sk-local-test"
+        app._client_instance_id = "instance-test"
+        app._workflow_model_available = mock.Mock(return_value=True)
+
+        payload = app._sync_payload()
+
+        self.assertEqual(payload["current_task"]["task_id"], "task-test")
+        self.assertEqual(payload["current_task"]["progress_percent"], 25)
+        self.assertNotIn("prompt_summary", payload["current_task"])
+        self.assertNotIn("prompt", payload["current_task"])
+        self.assertNotIn("title", payload["current_task"])
 
     def test_account_session_token_is_protected_at_rest(self):
         with tempfile.TemporaryDirectory() as temp_dir:

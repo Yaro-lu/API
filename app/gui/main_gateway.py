@@ -23,6 +23,7 @@ import msvcrt
 import uuid
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+import urllib.request as urllib_request
 
 try:
     import customtkinter as ctk
@@ -33,6 +34,17 @@ BASE_DIR = Path(__file__).parent.parent.parent
 GUI_ASSET_DIR = Path(__file__).parent / "assets"
 MIN_NVIDIA_DRIVER_MAJOR = 580
 MIN_SUPPORTED_VRAM_MB = 8 * 1024
+MAX_BACKEND_LOG_BYTES = 8 * 1024 * 1024
+MODEL_DOWNLOAD_REDIRECT_SUFFIXES = (
+    "huggingface.co",
+    "hf.co",
+    "xethub.hf.co",
+    "hf-mirror.com",
+)
+RUNTIME_DOWNLOAD_REDIRECT_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+)
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
@@ -46,6 +58,7 @@ if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", APP_VERSION):
 from app.core.runtime_package import (  # noqa: E402
     REQUIRED_RUNTIME_PATHS,
     RUNTIME_PACKAGE_NAME,
+    RUNTIME_PACKAGE_SIZE,
     RUNTIME_HOMEPAGE_URL,
     SevenZipProgressParser,
     archive_extract_command,
@@ -109,6 +122,92 @@ from app.workflow_registry import (  # noqa: E402
 _INSTANCE_LOCK_HANDLE = None
 CTK_AVAILABLE = ctk is not None
 PROJECT_HOMEPAGE_URL = RUNTIME_HOMEPAGE_URL
+
+
+def _validate_download_target_url(
+    requested_url: str,
+    target_url: str,
+    *,
+    allowed_suffixes: tuple[str, ...],
+) -> str:
+    """Validate one download target against the original HTTPS host family."""
+    requested = urlsplit(str(requested_url or ""))
+    if (
+        requested.scheme.lower() != "https"
+        or not requested.hostname
+        or requested.username
+        or requested.password
+    ):
+        raise IOError("下载地址必须使用 HTTPS")
+    final_url = str(target_url or "").strip()
+    final = urlsplit(final_url)
+    final_host = str(final.hostname or "").casefold().rstrip(".")
+    initial_host = str(requested.hostname or "").casefold().rstrip(".")
+    allowed = final_host == initial_host or any(
+        final_host == suffix or final_host.endswith(f".{suffix}")
+        for suffix in allowed_suffixes
+    )
+    if (
+        final.scheme.lower() != "https"
+        or not final_host
+        or final.username
+        or final.password
+        or not allowed
+    ):
+        raise IOError("下载发生了未授权的重定向")
+    return final_url
+
+
+class _DownloadRedirectHandler(urllib_request.HTTPRedirectHandler):
+    """Validate every redirect before urllib connects to the next target."""
+
+    def __init__(self, requested_url: str, allowed_suffixes: tuple[str, ...]):
+        super().__init__()
+        self._requested_url = str(requested_url or "")
+        self._allowed_suffixes = tuple(allowed_suffixes)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved = urljoin(req.full_url, newurl)
+        _validate_download_target_url(
+            self._requested_url,
+            resolved,
+            allowed_suffixes=self._allowed_suffixes,
+        )
+        return super().redirect_request(req, fp, code, msg, headers, resolved)
+
+
+def _open_download_request(request, *, timeout: float, allowed_suffixes: tuple[str, ...]):
+    """Open a download with redirect validation enforced before each connection."""
+    requested_url = str(getattr(request, "full_url", "") or "")
+    _validate_download_target_url(
+        requested_url,
+        requested_url,
+        allowed_suffixes=allowed_suffixes,
+    )
+    opener = urllib_request.build_opener(
+        _DownloadRedirectHandler(requested_url, allowed_suffixes)
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def _validate_download_response_url(
+    requested_url: str,
+    response,
+    *,
+    allowed_suffixes: tuple[str, ...],
+) -> str:
+    """Recheck the final response URL as defense in depth."""
+    final_url = requested_url
+    getter = getattr(response, "geturl", None)
+    if callable(getter):
+        observed = getter()
+        if isinstance(observed, str) and observed.strip():
+            final_url = observed.strip()
+    return _validate_download_target_url(
+        requested_url,
+        final_url,
+        allowed_suffixes=allowed_suffixes,
+    )
 
 
 class _ComfyUIOverlayProcessStillRunning(RuntimeError):
@@ -435,12 +534,20 @@ except Exception as e:
     print(json.dumps({"error": str(e)}))
 """
     try:
+        probe_env = os.environ.copy()
+        probe_env["PYTHONNOUSERSITE"] = "1"
+        probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        probe_env["PYTHONUTF8"] = "1"
+        probe_env.pop("PYTHONHOME", None)
+        probe_env.pop("PYTHONSTARTUP", None)
+        probe_env.pop("PYTHONPATH", None)
         proc = run_command(
-            [str(python_path), "-c", check_script],
+            [str(python_path), "-s", "-B", "-c", check_script],
             capture_output=True,
             text=True,
             timeout=TORCH_PROBE_TIMEOUT_SECONDS,
             cwd=str(BASE_DIR),
+            env=probe_env,
         )
         if proc.returncode != 0:
             return {"success": False, "error": "PyTorch 调用失败"}
@@ -772,6 +879,9 @@ class GatewayApp(WindowBase):
         self._health_poll_thread = None
         self._health_poll_lock = threading.Lock()
         self._health_poll_generation = 0
+        self._health_event_sequence = 0
+        self._health_event_applied = 0
+        self._health_needs_full_refresh = True
         self._shutting_down = False
         self._last_health = {}
         self._runtime_start_blocked = False
@@ -1791,7 +1901,7 @@ class GatewayApp(WindowBase):
         popup.configure(bg=C["bg"])
         popup.transient(self)
         popup.resizable(False, False)
-        self._center_popup(popup, 460, 310)
+        self._center_popup(popup, 480, 380)
 
         def close_popup():
             self._account_popup = None
@@ -1833,6 +1943,19 @@ class GatewayApp(WindowBase):
             tk.Label(row, text=label, font=F["small"], fg=C["muted"], bg=C["hover"]).pack(side="left")
             tk.Label(row, text=value, font=F["small"], fg=C["text"], bg=C["hover"]).pack(side="right")
 
+        tk.Label(
+            panel,
+            text=(
+                "退出登录只会停止平台同步，不会自动更换已共享的访问密钥。"
+                "如果不再信任该平台，请退出后到设置中重新生成访问密钥。"
+            ),
+            font=F["small"],
+            fg=C["warn"],
+            bg=C["card"],
+            justify="left",
+            wraplength=400,
+        ).pack(fill="x", padx=24, pady=(0, 14))
+
         actions = tk.Frame(panel, bg=C["card"])
         actions.pack(fill="x", padx=24, pady=(0, 18))
         self._button(actions, "退出登录", lambda: self._logout_account(close_popup), "plain").pack(fill="x", expand=True)
@@ -1850,6 +1973,8 @@ class GatewayApp(WindowBase):
         self._render_account_badge()
         self._set_account_status("本地模式：不会连接平台服务端", "success")
         self._set_light("server", "online", "本地模式")
+        if hasattr(self, "_footer_label"):
+            self._footer_label.config(text="  已退出平台；如需撤销旧调用权限，请重新生成访问密钥")
         if callable(close_callback):
             close_callback()
         if token:
@@ -3222,6 +3347,16 @@ class GatewayApp(WindowBase):
         expected_sha256 = str((control.get("item") or {}).get("sha256") or "").strip()
         max_retries = 3
 
+        if expected_size <= 0 or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+            self.after(
+                0,
+                lambda: self._fail_model_download(
+                    control,
+                    "模型下载清单缺少有效的文件大小或 SHA256，已停止下载",
+                ),
+            )
+            return
+
         def cancelled() -> bool:
             stop_event = control.get("stop_event")
             return bool(stop_event and stop_event.is_set())
@@ -3313,7 +3448,16 @@ class GatewayApp(WindowBase):
                     headers["If-Range"] = str(resume_metadata["validator"])
                 req = ur.Request(url, headers=headers)
                 try:
-                    with ur.urlopen(req, timeout=30) as resp:
+                    with _open_download_request(
+                        req,
+                        timeout=30,
+                        allowed_suffixes=MODEL_DOWNLOAD_REDIRECT_SUFFIXES,
+                    ) as resp:
+                        _validate_download_response_url(
+                            url,
+                            resp,
+                            allowed_suffixes=MODEL_DOWNLOAD_REDIRECT_SUFFIXES,
+                        )
                         if cancelled():
                             return
                         status_code = int(getattr(resp, "status", 200) or 200)
@@ -3368,6 +3512,8 @@ class GatewayApp(WindowBase):
                                     return
                                 if not chunk:
                                     break
+                                if expected_size and done + len(chunk) > expected_size:
+                                    raise IOError("下载数据超过模型清单声明的大小，已停止下载")
                                 f.write(chunk)
                                 done += len(chunk)
                                 if total:
@@ -4098,6 +4244,7 @@ class GatewayApp(WindowBase):
 
         if self._shutting_down:
             return
+        health_event = self._reserve_health_event()
         try:
             req = ur.Request(
                 f"{API_BASE}/v1/status",
@@ -4105,8 +4252,20 @@ class GatewayApp(WindowBase):
                 headers=self._local_api_headers(),
             )
             resp = ur.urlopen(req, timeout=8)
-            data = json.loads(resp.read().decode("utf-8"))
-            self._post_to_ui(lambda d=data: self._on_health_update(d))
+            try:
+                data = json.loads(resp.read().decode("utf-8"))
+            finally:
+                closer = getattr(resp, "close", None)
+                if callable(closer):
+                    closer()
+            if health_event is not None:
+                generation, sequence = health_event
+                self._post_to_ui(
+                    lambda g=generation, d=data, s=sequence:
+                    self._deliver_health_snapshot(g, d, sequence=s)
+                )
+            else:
+                self._post_to_ui(lambda d=data: self._on_health_update(d))
         except Exception as health_error:
             print(f"[Workflow] health refresh failed: {health_error}")
 
@@ -4864,6 +5023,16 @@ class GatewayApp(WindowBase):
         except Exception:
             pass
         dialog["background_card"] = None
+        notice = dialog.get("restart_notice")
+        try:
+            if notice is not None and notice.winfo_exists():
+                notice.destroy()
+                content = dialog.get("content")
+                if content is not None:
+                    content.pack(fill="both", expand=True, padx=24, pady=20)
+        except Exception:
+            pass
+        dialog["restart_notice"] = None
         popup = dialog.get("popup")
         try:
             if popup is None or not popup.winfo_exists():
@@ -5218,24 +5387,52 @@ class GatewayApp(WindowBase):
                         )
                         return
 
+                if partial.is_file() and partial.stat().st_size > RUNTIME_PACKAGE_SIZE:
+                    partial.unlink(missing_ok=True)
                 resume_at = partial.stat().st_size if partial.exists() else 0
                 headers = {"User-Agent": f"LingJing-Desktop/{APP_VERSION}"}
                 if resume_at:
                     headers["Range"] = f"bytes={resume_at}-"
                 request = ur.Request(url, headers=headers)
-                with ur.urlopen(request, timeout=30) as response:
-                    partial_response = getattr(response, "status", None) == 206
+                with _open_download_request(
+                    request,
+                    timeout=30,
+                    allowed_suffixes=RUNTIME_DOWNLOAD_REDIRECT_SUFFIXES,
+                ) as response:
+                    _validate_download_response_url(
+                        url,
+                        response,
+                        allowed_suffixes=RUNTIME_DOWNLOAD_REDIRECT_SUFFIXES,
+                    )
+                    status_code = int(getattr(response, "status", 200) or 200)
+                    partial_response = status_code == 206
                     mode = "ab" if resume_at and partial_response else "wb"
                     if mode == "wb":
                         resume_at = 0
                     remaining = int(response.headers.get("Content-Length") or 0)
-                    total_size = resume_at + remaining if remaining else 0
+                    if partial_response:
+                        content_range = str(response.headers.get("Content-Range") or "").strip()
+                        match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range)
+                        if not resume_at or not match:
+                            raise IOError("环境包服务器返回了无效的断点续传范围")
+                        start, end, total = (int(value) for value in match.groups())
+                        if start != resume_at or end < start or total != RUNTIME_PACKAGE_SIZE:
+                            raise IOError("环境包断点位置或总大小与发布清单不一致")
+                        if remaining and remaining != end - start + 1:
+                            raise IOError("环境包分段长度无效")
+                    elif status_code != 200:
+                        raise IOError(f"环境包服务器返回异常状态：HTTP {status_code}")
+                    elif remaining and remaining != RUNTIME_PACKAGE_SIZE:
+                        raise IOError("环境包服务器返回的文件大小与发布清单不一致")
+                    total_size = RUNTIME_PACKAGE_SIZE
                     downloaded = resume_at
                     with partial.open(mode) as handle:
                         while True:
                             chunk = response.read(8 * 1024 * 1024)
                             if not chunk:
                                 break
+                            if downloaded + len(chunk) > RUNTIME_PACKAGE_SIZE:
+                                raise IOError("下载数据超过环境包发布清单声明的大小，已停止下载")
                             handle.write(chunk)
                             downloaded += len(chunk)
                             if total_size:
@@ -5250,17 +5447,10 @@ class GatewayApp(WindowBase):
                                         f"{p}% · 已下载 {s:.1f} MB",
                                     ),
                                 )
-                            else:
-                                size_mb = downloaded / (1024 * 1024)
-                                self.after(
-                                    0,
-                                    lambda s=size_mb: self._set_runtime_progress(
-                                        dialog,
-                                        0,
-                                        "下载运行环境",
-                                        f"已下载 {s:.1f} MB",
-                                    ),
-                                )
+                    if downloaded != RUNTIME_PACKAGE_SIZE:
+                        raise IOError(
+                            f"环境包下载不完整（应为 {RUNTIME_PACKAGE_SIZE} 字节，实际 {downloaded} 字节）"
+                        )
                 partial.replace(target)
                 sidecar.unlink(missing_ok=True)
                 self.after(
@@ -5543,10 +5733,10 @@ class GatewayApp(WindowBase):
                 notice.pack(fill="both", expand=True, padx=28, pady=24)
                 dialog["restart_notice"] = notice
                 action = "安装" if component == "运行环境" else "更新"
-                popup.title(f"{component}{action}已准备完成")
+                popup.title(f"退出后完成{component}{action}")
                 tk.Label(
                     notice,
-                    text=f"{component}{action}已准备完成",
+                    text=f"退出后完成{component}{action}",
                     font=F["title"],
                     fg=C["text"],
                     bg=C["card"],
@@ -5554,7 +5744,8 @@ class GatewayApp(WindowBase):
                 tk.Label(
                     notice,
                     text=(
-                        f"请退出灵境造片厂，让{component}完成最后的文件切换。\n"
+                        f"{component}{action}文件已经下载、校验并准备就绪。\n"
+                        "最后的文件切换必须在客户端关闭后进行。\n"
                         "程序不会自动重新打开；稍等片刻后，请由你手动打开客户端。\n"
                         "重新打开后会直接检查环境，不会重复显示完成提示。"
                     ),
@@ -5565,24 +5756,45 @@ class GatewayApp(WindowBase):
                     anchor="w",
                     wraplength=450,
                 ).pack(fill="x", pady=(18, 20))
+                status_label = tk.Label(
+                    notice,
+                    text="点击下方按钮后，客户端会先关闭后台服务，再安全退出。",
+                    font=F["small"],
+                    fg=C["muted"],
+                    bg=C["card"],
+                    justify="left",
+                    anchor="w",
+                    wraplength=450,
+                )
+                status_label.pack(fill="x", pady=(0, 12))
 
                 def accept():
                     if completed.is_set():
                         return
                     state["shown"] = True
+                    action_button.config(
+                        state="disabled",
+                        text=f"正在退出并完成{action}…",
+                    )
+                    status_label.config(
+                        text="正在关闭后台服务并启动安装助手，请稍候…",
+                        fg=C["primary"],
+                    )
                     try:
                         popup.protocol("WM_DELETE_WINDOW", lambda: None)
+                        popup.update_idletasks()
                     except Exception:
                         pass
                     completed.set()
 
-                self._button(
+                action_button = self._button(
                     notice,
                     f"退出并完成{action}",
                     accept,
                     "primary",
                     width=142,
-                ).pack(anchor="e")
+                )
+                action_button.pack(anchor="e")
                 popup.protocol("WM_DELETE_WINDOW", accept)
                 popup.lift()
                 popup.focus_force()
@@ -6147,7 +6359,7 @@ class GatewayApp(WindowBase):
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36 LingjingClient/0.2"
+                f"Chrome/126.0.0.0 Safari/537.36 LingJingClient/{APP_VERSION}"
             ),
         }
         if server_url.startswith(("http://", "https://")):
@@ -6308,8 +6520,18 @@ class GatewayApp(WindowBase):
                  fg="#ffffff", bg=C["primary"], width=3).pack(side="left", padx=(0, 10), ipady=4)
         tk.Label(title_row, text="登录灵境造片厂账号", font=F["title"],
                  fg=C["text"], bg=C["card"]).pack(side="left")
-        tk.Label(panel, text="登录后可同步会员与平台信息；不登录也能使用本地工作流和接口功能。",
-                 font=F["small"], fg=C["text2"], bg=C["card"]).pack(anchor="w", padx=28, pady=(0, 18))
+        tk.Label(
+            panel,
+            text=(
+                "登录后会向你填写的服务端同步公网 URL、本机 API Key、设备名称及工作流/模型状态，"
+                "供平台调用；不会同步生成提示词。不登录也能使用完整的本地功能。"
+            ),
+            font=F["small"],
+            fg=C["text2"],
+            bg=C["card"],
+            justify="left",
+            wraplength=500,
+        ).pack(anchor="w", padx=28, pady=(0, 18))
 
         form = tk.Frame(panel, bg=C["card"])
         form.pack(fill="x", padx=28)
@@ -6515,6 +6737,30 @@ class GatewayApp(WindowBase):
             })
             group = self._model_group_for_type(model["type"])
             model_groups.setdefault(group, []).append(model)
+        raw_current_task = self._last_health.get("current_task")
+        safe_current_task = None
+        if isinstance(raw_current_task, dict):
+            safe_fields = (
+                "id",
+                "task_id",
+                "workflow_id",
+                "workflow_name",
+                "phase",
+                "progress_label",
+                "progress_percent",
+                "status",
+                "progress",
+                "progress_max",
+                "started_at",
+                "elapsed",
+                "elapsed_seconds",
+            )
+            safe_current_task = {
+                key: raw_current_task[key]
+                for key in safe_fields
+                if key in raw_current_task
+            }
+
         return {
             "baseUrl": self._tunnel_url,
             "apiKey": self._api_key,
@@ -6538,7 +6784,7 @@ class GatewayApp(WindowBase):
             "models": models,
             "modelGroups": model_groups,
             "model_groups": model_groups,
-            "current_task": self._last_health.get("current_task"),
+            "current_task": safe_current_task,
             "source": "desktop-gui",
             "takeover": bool(takeover),
         }
@@ -7679,6 +7925,7 @@ class GatewayApp(WindowBase):
         python_exe = sys.executable  # 使用当前 venv Python（GUI 自己）
         env = os.environ.copy()
         env["PYTHONPATH"] = str(BASE_DIR)
+        env["PYTHONNOUSERSITE"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         return python_exe, env
 
@@ -7686,6 +7933,18 @@ class GatewayApp(WindowBase):
         log_dir = BASE_DIR / "runtime" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir
+
+    def _open_backend_log(self, filename: str):
+        """Append service output and keep one bounded previous log for diagnosis."""
+        path = self._backend_log_dir() / filename
+        try:
+            if path.is_file() and path.stat().st_size >= MAX_BACKEND_LOG_BYTES:
+                backup = path.with_name(f"{path.name}.1")
+                backup.unlink(missing_ok=True)
+                path.replace(backup)
+        except OSError:
+            pass
+        return open(path, "a", encoding="utf-8", buffering=1)
 
     def _start_comfyui_service(self):
         lock = self._runtime_maintenance_lock
@@ -7719,9 +7978,9 @@ class GatewayApp(WindowBase):
             self._footer_label.config(text=f"  ComfyUI 无法启动：{port_error}")
             print(f"[GUI] ComfyUI start blocked: {port_error}")
         else:
-            comfy_log = open(str(log_dir / "comfyui.log"), "w")
+            comfy_log = self._open_backend_log("comfyui.log")
             comfy_command = [
-                str(python_exe), "main.py",
+                str(python_exe), "-s", "-B", "main.py",
                 "--listen", "127.0.0.1", "--port", str(COMFY_PORT),
                 "--disable-auto-launch",
                 *_comfy_vram_args(),
@@ -7768,11 +8027,11 @@ class GatewayApp(WindowBase):
             self._footer_label.config(text=f"  API 无法启动：{port_error}")
             print(f"[GUI] API start blocked: {port_error}")
             return
-        api_log = open(str(log_dir / "api.log"), "w")
+        api_log = self._open_backend_log("api.log")
         try:
             self._api_proc = self._process_supervisor.launch(
                 "api",
-                [str(python_exe), str(BASE_DIR / "app" / "server.py")],
+                [str(python_exe), "-s", "-B", str(BASE_DIR / "app" / "server.py")],
                 cwd=str(BASE_DIR), env=env,
                 stdout=api_log, stderr=api_log,
             )
@@ -7806,6 +8065,7 @@ class GatewayApp(WindowBase):
             self._health_poll_generation += 1
             generation = self._health_poll_generation
             self._poll_run = True
+            self._health_needs_full_refresh = True
             worker = threading.Thread(
                 target=self._poll_health,
                 args=(generation,),
@@ -7839,30 +8099,127 @@ class GatewayApp(WindowBase):
             self._poll_run = False
             return True
 
+    def _next_health_event_sequence(self) -> int:
+        with self._health_poll_lock:
+            self._health_event_sequence = (
+                int(getattr(self, "_health_event_sequence", 0)) + 1
+            )
+            return self._health_event_sequence
+
+    def _reserve_health_event(self) -> tuple[int, int] | None:
+        with self._health_poll_lock:
+            if self._shutting_down or not self._poll_run:
+                return None
+            self._health_event_sequence = (
+                int(getattr(self, "_health_event_sequence", 0)) + 1
+            )
+            return self._health_poll_generation, self._health_event_sequence
+
+    def _claim_health_event(self, generation: int, sequence: int | None) -> bool:
+        """Accept only the newest queued event from the active poll generation."""
+        with self._health_poll_lock:
+            if (
+                self._shutting_down
+                or not self._poll_run
+                or generation != self._health_poll_generation
+            ):
+                return False
+            if sequence is None:
+                return True
+            applied = int(getattr(self, "_health_event_applied", 0))
+            if sequence <= applied:
+                return False
+            self._health_event_applied = sequence
+            return True
+
     def _deliver_health_snapshot(
         self,
         generation: int,
         data: dict,
         first: bool = False,
+        sequence: int | None = None,
     ):
-        """Discard a queued response if a newer poll generation replaced it."""
-        if not self._health_poll_active(generation):
+        """Discard stale snapshots from old polls or older same-poll probes."""
+        if not self._claim_health_event(generation, sequence):
             return
-        if first:
+        needs_full_refresh = bool(
+            first or getattr(self, "_health_needs_full_refresh", True)
+        )
+        if needs_full_refresh:
             self._on_first_health(data)
+            self._health_needs_full_refresh = False
         else:
             self._on_health_update(data)
 
-    def _deliver_health_failure(self, generation: int):
-        """Apply failure only when no newer poll has already taken over."""
-        with self._health_poll_lock:
-            current_failure = (
-                generation == self._health_poll_generation
-                and not self._poll_run
-                and not self._shutting_down
-            )
-        if current_failure:
+    def _deliver_health_failure(
+        self,
+        generation: int,
+        sequence: int | None = None,
+    ):
+        """Apply a confirmed outage only while its poll is still authoritative."""
+        if self._claim_health_event(generation, sequence):
+            self._health_needs_full_refresh = True
             self._on_server_unreachable()
+
+    def _deliver_health_degraded(
+        self,
+        generation: int,
+        message: str = "",
+        sequence: int | None = None,
+    ):
+        """Show a slow status refresh without declaring healthy services offline."""
+        if self._claim_health_event(generation, sequence):
+            self._on_health_degraded(message)
+
+    @staticmethod
+    def _probe_local_api_health(urlopen) -> bool:
+        """Use the lightweight public health route to distinguish delay from outage."""
+        import urllib.request as ur
+
+        try:
+            request = ur.Request(f"{API_BASE}/health", method="GET")
+            response = urlopen(request, timeout=2)
+            try:
+                data = json.loads(response.read().decode("utf-8"))
+            finally:
+                closer = getattr(response, "close", None)
+                if callable(closer):
+                    closer()
+            return bool(isinstance(data, dict) and data.get("status") == "ok")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _health_degraded_message(error: Exception) -> str:
+        try:
+            code = int(getattr(error, "code", 0) or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code in (401, 403):
+            return "API 已启动，但访问密钥暂未同步，客户端会自动重试"
+        if code == 429:
+            return "API 已启动，状态检查较频繁，客户端会稍后重试"
+        if code >= 500:
+            return "API 已启动，但状态接口暂时异常，客户端会自动重试"
+        return "API 正常运行，状态刷新稍慢，客户端会自动重试"
+
+    @staticmethod
+    def _health_retry_delay(error: Exception, default: float) -> float:
+        try:
+            code = int(getattr(error, "code", 0) or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code != 429:
+            return default
+        headers = getattr(error, "headers", None)
+        try:
+            raw = headers.get("Retry-After") if headers is not None else None
+        except Exception:
+            return default
+        try:
+            return min(30.0, max(default, float(raw)))
+        except (TypeError, ValueError):
+            return default
 
     def _poll_health(self, generation: int | None = None):
         if generation is None:
@@ -7873,45 +8230,15 @@ class GatewayApp(WindowBase):
                 self._health_poll_generation += 1
                 generation = self._health_poll_generation
                 self._poll_run = True
+                self._health_needs_full_refresh = True
         if not self._health_poll_active(generation):
             return
         import urllib.request as ur
 
-        connected = False
-        for i in range(60):
-            if not self._health_poll_active(generation):
-                return
-            try:
-                req = ur.Request(
-                    f"{API_BASE}/v1/status",
-                    method="GET",
-                    headers=self._local_api_headers(),
-                )
-                resp = ur.urlopen(req, timeout=5)
-                data = json.loads(resp.read().decode())
-                if not self._health_poll_active(generation):
-                    return
-                self.after(
-                    0,
-                    lambda g=generation, d=data: self._deliver_health_snapshot(
-                        g, d, first=True
-                    ),
-                )
-                connected = True
-                break
-            except Exception:
-                time.sleep(1)
-
-        if not connected:
-            if self._finish_health_poll(generation) and not self._shutting_down:
-                self.after(
-                    0,
-                    lambda g=generation: self._deliver_health_failure(g),
-                )
-            return
-
-        # 持续轮询（含进度）
-        consecutive_failures = 0
+        ever_connected = False
+        status_failures = 0
+        api_liveness_failures = 0
+        outage_reported = False
         while self._health_poll_active(generation):
             try:
                 req = ur.Request(
@@ -7920,24 +8247,78 @@ class GatewayApp(WindowBase):
                     headers=self._local_api_headers(),
                 )
                 resp = ur.urlopen(req, timeout=5)
-                data = json.loads(resp.read().decode())
+                try:
+                    data = json.loads(resp.read().decode())
+                finally:
+                    closer = getattr(resp, "close", None)
+                    if callable(closer):
+                        closer()
                 if not self._health_poll_active(generation):
                     return
-                consecutive_failures = 0
+                full_refresh = not ever_connected or outage_reported
+                ever_connected = True
+                status_failures = 0
+                api_liveness_failures = 0
+                outage_reported = False
+                sequence = self._next_health_event_sequence()
                 self.after(
                     0,
-                    lambda g=generation, d=data: self._deliver_health_snapshot(g, d),
+                    lambda g=generation, d=data, first=full_refresh, s=sequence:
+                    self._deliver_health_snapshot(
+                        g,
+                        d,
+                        first=first,
+                        sequence=s,
+                    ),
                 )
-            except Exception:
-                consecutive_failures += 1
-                if consecutive_failures >= 3:
-                    if self._finish_health_poll(generation) and not self._shutting_down:
+                time.sleep(3)
+                continue
+            except Exception as error:
+                status_failures += 1
+                api_alive = self._probe_local_api_health(ur.urlopen)
+                if api_alive:
+                    api_liveness_failures = 0
+                    if status_failures == 3 or (
+                        status_failures > 3 and (status_failures - 3) % 10 == 0
+                    ):
+                        sequence = self._next_health_event_sequence()
+                        message = self._health_degraded_message(error)
                         self.after(
                             0,
-                            lambda g=generation: self._deliver_health_failure(g),
+                            lambda g=generation, m=message, s=sequence:
+                            self._deliver_health_degraded(
+                                g,
+                                m,
+                                sequence=s,
+                            ),
                         )
-                    return
-            time.sleep(3)
+                else:
+                    api_liveness_failures += 1
+                    outage_threshold = 3 if ever_connected else 60
+                    should_report = (
+                        api_liveness_failures == outage_threshold
+                        or (
+                            api_liveness_failures > outage_threshold
+                            and (api_liveness_failures - outage_threshold) % 10 == 0
+                        )
+                    )
+                    if should_report:
+                        outage_reported = True
+                        sequence = self._next_health_event_sequence()
+                        self.after(
+                            0,
+                            lambda g=generation, s=sequence:
+                            self._deliver_health_failure(g, sequence=s),
+                        )
+                default_delay = 3.0 if ever_connected or api_alive else 1.0
+                retry_delay = self._health_retry_delay(error, default_delay)
+                closer = getattr(error, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+                time.sleep(retry_delay)
 
     def _on_first_health(self, data: dict):
         """首次获取健康状态"""
@@ -8210,11 +8591,19 @@ class GatewayApp(WindowBase):
         self._set_light("api", "offline")
         self._set_light("tunnel", "offline")
         self._set_light("comfyui", "offline")
-        self._api_key = ""
         self._clear_public_url()
         self._key_label.config(text="（无法连接）")
         self._url_label.config(text="API 服务启动失败")
         self._footer_label.config(text="服务启动失败 — 查看 runtime/logs/")
+
+    def _on_health_degraded(self, message: str = ""):
+        """The API answered /health, so retain the last trusted component state."""
+        if self._shutting_down:
+            return
+        self._set_light("api", "online", "状态同步中")
+        self._footer_label.config(
+            text=f"  {message or 'API 正常运行，状态刷新稍慢，客户端会自动重试'}"
+        )
 
     # ══════════════════════════════════════════════════════
     # 工作流更新

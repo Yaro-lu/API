@@ -20,12 +20,12 @@ def _validated_http_url(value: object, *, field: str) -> str:
     url = str(value or "").strip()
     parsed = urlsplit(url)
     if (
-        parsed.scheme.lower() not in {"http", "https"}
+        parsed.scheme.lower() != "https"
         or not parsed.netloc
         or parsed.username
         or parsed.password
     ):
-        raise ValueError(f"{field} 必须是有效的 HTTP/HTTPS 地址")
+        raise ValueError(f"{field} 必须是有效的 HTTPS 地址")
     return url
 
 
@@ -42,6 +42,10 @@ def load_runtime_release_manifest(path: Path = RUNTIME_RELEASE_MANIFEST_PATH) ->
     version = str(data.get("version") or "").strip()
     release_tag = str(data.get("release_tag") or "").strip()
     package_name = str(data.get("package_name") or "").strip()
+    try:
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("运行环境包大小无效") from exc
     sha256 = str(data.get("sha256") or "").strip().lower()
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
         raise ValueError("运行环境发布版本无效")
@@ -51,6 +55,8 @@ def load_runtime_release_manifest(path: Path = RUNTIME_RELEASE_MANIFEST_PATH) ->
         raise ValueError("运行环境包文件名无效")
     if not package_name.endswith(f"-v{version}.7z"):
         raise ValueError("运行环境包文件名与版本不匹配")
+    if size_bytes <= 0 or size_bytes > 16 * 1024 * 1024 * 1024:
+        raise ValueError("运行环境包大小无效")
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise ValueError("运行环境包 SHA256 无效")
 
@@ -64,6 +70,7 @@ def load_runtime_release_manifest(path: Path = RUNTIME_RELEASE_MANIFEST_PATH) ->
         "version": version,
         "release_tag": release_tag,
         "package_name": package_name,
+        "size_bytes": size_bytes,
         "sha256": sha256,
         "download_url": download_url,
         "homepage_url": homepage_url,
@@ -74,6 +81,7 @@ RUNTIME_RELEASE = load_runtime_release_manifest()
 RUNTIME_PACKAGE_VERSION = str(RUNTIME_RELEASE["version"])
 RUNTIME_RELEASE_TAG = str(RUNTIME_RELEASE["release_tag"])
 RUNTIME_PACKAGE_NAME = str(RUNTIME_RELEASE["package_name"])
+RUNTIME_PACKAGE_SIZE = int(RUNTIME_RELEASE["size_bytes"])
 RUNTIME_PACKAGE_SHA256 = str(RUNTIME_RELEASE["sha256"])
 RUNTIME_RELEASE_URL = str(RUNTIME_RELEASE["download_url"])
 RUNTIME_HOMEPAGE_URL = str(RUNTIME_RELEASE["homepage_url"])
@@ -336,12 +344,16 @@ def verify_runtime_package(package: Path, sidecar: Path | None = None) -> tuple[
     if package.name != RUNTIME_PACKAGE_NAME:
         raise ValueError(f"环境包名称不匹配，应为: {RUNTIME_PACKAGE_NAME}")
     expected = RUNTIME_PACKAGE_SHA256.lower()
+    try:
+        actual_size = package.stat().st_size
+    except OSError:
+        return False, expected, "missing"
     if sidecar is not None and Path(sidecar).is_file():
         sidecar_hash = read_sha256_sidecar(Path(sidecar))
         if sidecar_hash != expected:
             return False, expected, sidecar_hash
     actual = sha256_file(package)
-    return actual == expected, expected, actual
+    return actual_size == RUNTIME_PACKAGE_SIZE and actual == expected, expected, actual
 
 
 def _path_exists(path: Path) -> bool:

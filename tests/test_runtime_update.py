@@ -203,7 +203,7 @@ class RuntimeUpdateLaunchTests(unittest.TestCase):
             self.assertEqual(command[command.index("-OperationId") + 1], "a" * 32)
             self.assertIn("-NoRestart", command)
 
-    def test_launch_is_detached_and_not_registered_with_process_supervisor(self):
+    def test_launch_is_hidden_and_not_registered_with_process_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
             base, staging, _helper = _prepare_handoff(tmp)
             powershell = Path(tmp) / "powershell.exe"
@@ -241,9 +241,12 @@ class RuntimeUpdateLaunchTests(unittest.TestCase):
             self.assertIsInstance(args[0], list)
             self.assertNotIn("shell", kwargs)
             self.assertEqual(kwargs["cwd"], str(base.resolve()))
-            self.assertTrue(kwargs["creationflags"] & 0x00000008)
+            self.assertFalse(kwargs["creationflags"] & 0x00000008)
+            self.assertTrue(kwargs["creationflags"] & 0x08000000)
             self.assertTrue(kwargs["creationflags"] & 0x00000200)
             self.assertTrue(kwargs["creationflags"] & 0x01000000)
+            self.assertTrue(kwargs["startupinfo"].dwFlags & 0x00000001)
+            self.assertEqual(kwargs["startupinfo"].wShowWindow, 0)
             self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
             started_waiter.assert_called_once_with(base.resolve(), "a" * 32, 5678)
             commit_marker, _commit_temporary = runtime_update._helper_commit_paths(

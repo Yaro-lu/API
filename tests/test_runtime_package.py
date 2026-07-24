@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.core.runtime_package import (
     RUNTIME_PACKAGE_NAME,
+    RUNTIME_PACKAGE_SIZE,
     RUNTIME_PACKAGE_SHA256,
     RUNTIME_RELEASE_URL,
     REQUIRED_RUNTIME_PATHS,
@@ -63,6 +64,7 @@ class RuntimePackageContractTests(unittest.TestCase):
         manifest = load_runtime_release_manifest()
 
         self.assertEqual(manifest["package_name"], RUNTIME_PACKAGE_NAME)
+        self.assertEqual(manifest["size_bytes"], RUNTIME_PACKAGE_SIZE)
         self.assertEqual(manifest["sha256"], RUNTIME_PACKAGE_SHA256)
         self.assertEqual(manifest["download_url"], RUNTIME_RELEASE_URL)
         self.assertTrue(RUNTIME_RELEASE_URL.endswith(f"/{RUNTIME_PACKAGE_NAME}"))
@@ -77,6 +79,7 @@ class RuntimePackageContractTests(unittest.TestCase):
                         "version": "1.2.3",
                         "release_tag": "v1.2.3",
                         "package_name": "runtime-nvidia-rtx20plus-cu130-v1.2.3.7z",
+                        "size_bytes": 123,
                         "sha256": "a" * 64,
                         "download_url": "https://example.com/wrong.7z",
                         "homepage_url": "https://example.com/project",
@@ -98,6 +101,7 @@ class RuntimePackageContractTests(unittest.TestCase):
                         "version": "1.2.3",
                         "release_tag": "v1.2.3",
                         "package_name": "runtime-nvidia-rtx20plus-cu130-v9.9.9.7z",
+                        "size_bytes": 123,
                         "sha256": "a" * 64,
                         "download_url": (
                             "https://example.com/v1.2.3/"
@@ -123,6 +127,7 @@ class RuntimePackageContractTests(unittest.TestCase):
                         "version": "1.2.3",
                         "release_tag": "v1.2.3",
                         "package_name": package_name,
+                        "size_bytes": 123,
                         "sha256": "a" * 64,
                         "download_url": f"https://example.com/v9.9.9/{package_name}",
                         "homepage_url": "https://example.com/project",
@@ -155,15 +160,21 @@ class RuntimePackageContractTests(unittest.TestCase):
                 {},
             ),
             RUNTIME_RELEASE_URL.replace(
-                "https://github.com/Yaro-lu/API/releases/download",
+                "https://github.com/Yaro-lu/LingJingAI/releases/download",
                 "https://mirror.example",
             ),
         )
 
     def test_download_url_rejects_unsafe_protocol(self):
-        with self.assertRaisesRegex(ValueError, "HTTP/HTTPS"):
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
             resolve_runtime_download_url(
                 {"runtime": {"download_url": "file:///tmp/runtime.7z"}},
+                {},
+            )
+
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            resolve_runtime_download_url(
+                {"runtime": {"download_url": "http://mirror.example/runtime.7z"}},
                 {},
             )
 

@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+import os
 from unittest import mock
 
 from app.gui import main_gateway
@@ -20,6 +21,9 @@ class ConsoleServiceTests(unittest.TestCase):
         app._health_poll_thread = None
         app._health_poll_lock = threading.Lock()
         app._health_poll_generation = 0
+        app._health_event_sequence = 0
+        app._health_event_applied = 0
+        app._health_needs_full_refresh = True
         app._poll_run = False
         app._ensure_health_polling = mock.Mock()
         app._tunnel_url = ""
@@ -57,6 +61,15 @@ class ConsoleServiceTests(unittest.TestCase):
             "Bearer sk-admin-console-test",
         )
         app._ensure_health_polling.assert_called_once()
+
+    def test_backend_python_disables_user_site_packages(self):
+        app = self._app()
+
+        with mock.patch.dict(os.environ, {"PYTHONNOUSERSITE": "0"}):
+            _python_exe, env = app._backend_env()
+
+        self.assertEqual(env["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
 
     def test_tunnel_retry_can_reload_persisted_admin_key(self):
         app = self._app()
@@ -337,7 +350,7 @@ class ConsoleServiceTests(unittest.TestCase):
 
         app._on_server_unreachable.assert_not_called()
 
-    def test_repeated_health_failures_mark_api_unreachable(self):
+    def test_true_liveness_failure_marks_unreachable_but_worker_keeps_running(self):
         app = self._app()
         app._ensure_health_polling = GatewayApp._ensure_health_polling.__get__(app)
         app._on_first_health = mock.Mock()
@@ -345,19 +358,250 @@ class ConsoleServiceTests(unittest.TestCase):
         app._on_server_unreachable = mock.Mock()
         response = mock.Mock()
         response.read.return_value = b'{"status":"ok"}'
+        status_calls = 0
+
+        def urlopen(request, timeout):
+            nonlocal status_calls
+            if request.full_url.endswith("/v1/status"):
+                status_calls += 1
+                if status_calls == 1:
+                    return response
+            raise OSError("down")
+
+        active_when_reported = []
+        app._on_server_unreachable.side_effect = lambda: active_when_reported.append(
+            app._poll_run
+        )
+        sleep_calls = 0
+
+        def stop_after_outage(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 4:
+                app._poll_run = False
 
         with (
-            mock.patch(
-                "urllib.request.urlopen",
-                side_effect=[response, OSError("down"), OSError("down"), OSError("down")],
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+            mock.patch.object(
+                main_gateway.time,
+                "sleep",
+                side_effect=stop_after_outage,
             ),
-            mock.patch.object(main_gateway.time, "sleep"),
+        ):
+            app._poll_health()
+
+        app._on_server_unreachable.assert_called_once()
+        self.assertEqual(active_when_reported, [True])
+
+    def test_slow_status_with_live_api_keeps_polling_and_recovers(self):
+        app = self._app()
+        app._ensure_health_polling = GatewayApp._ensure_health_polling.__get__(app)
+        app._on_first_health = mock.Mock()
+        app._on_health_update = mock.Mock()
+        app._on_health_degraded = mock.Mock()
+        app._on_server_unreachable = mock.Mock()
+        status_response = mock.Mock()
+        status_response.read.return_value = b'{"status":"ok"}'
+        health_response = mock.Mock()
+        health_response.read.return_value = b'{"status":"ok"}'
+        status_calls = 0
+
+        def urlopen(request, timeout):
+            nonlocal status_calls
+            if request.full_url.endswith("/health"):
+                return health_response
+            status_calls += 1
+            if 2 <= status_calls <= 4:
+                raise TimeoutError("status is still being assembled")
+            return status_response
+
+        sleep_calls = 0
+
+        def stop_after_recovery(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 5:
+                app._poll_run = False
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+            mock.patch.object(main_gateway.time, "sleep", side_effect=stop_after_recovery),
         ):
             app._poll_health()
 
         app._on_first_health.assert_called_once()
+        app._on_health_degraded.assert_called_once()
+        app._on_health_update.assert_called_once()
+        app._on_server_unreachable.assert_not_called()
+
+    def test_health_degraded_preserves_last_trusted_components(self):
+        app = self._app()
+        app._tunnel_url = "https://still-live.example"
+        app._clear_public_url = mock.Mock()
+
+        app._on_health_degraded()
+
+        self.assertEqual(app._api_key, "sk-local-test")
+        self.assertEqual(app._tunnel_url, "https://still-live.example")
+        app._clear_public_url.assert_not_called()
+        app._set_light.assert_called_once_with("api", "online", "状态同步中")
+
+    def test_late_degraded_event_cannot_overwrite_newer_success(self):
+        app = self._app()
+        app._health_poll_generation = 4
+        app._poll_run = True
+        app._health_needs_full_refresh = False
+        app._on_health_update = mock.Mock()
+        app._on_health_degraded = mock.Mock()
+        degraded_sequence = app._next_health_event_sequence()
+        success_sequence = app._next_health_event_sequence()
+
+        app._deliver_health_snapshot(
+            4,
+            {"status": "ok"},
+            sequence=success_sequence,
+        )
+        app._deliver_health_degraded(
+            4,
+            "stale",
+            sequence=degraded_sequence,
+        )
+
+        app._on_health_update.assert_called_once()
+        app._on_health_degraded.assert_not_called()
+
+    def test_dropped_first_snapshot_keeps_full_refresh_required(self):
+        app = self._app()
+        app._health_poll_generation = 3
+        app._poll_run = True
+        app._on_first_health = mock.Mock()
+        app._on_health_update = mock.Mock()
+        dropped_sequence = app._next_health_event_sequence()
+        delivered_sequence = app._next_health_event_sequence()
+
+        # The first callback is intentionally never delivered.
+        self.assertLess(dropped_sequence, delivered_sequence)
+        app._deliver_health_snapshot(
+            3,
+            {"status": "ok"},
+            sequence=delivered_sequence,
+        )
+
+        app._on_first_health.assert_called_once()
+        app._on_health_update.assert_not_called()
+        self.assertFalse(app._health_needs_full_refresh)
+
+    def test_applied_outage_requires_full_refresh_on_recovery(self):
+        app = self._app()
+        app._health_poll_generation = 6
+        app._poll_run = True
+        app._health_needs_full_refresh = False
+        app._on_server_unreachable = mock.Mock()
+        app._on_first_health = mock.Mock()
+        failure_sequence = app._next_health_event_sequence()
+        recovery_sequence = app._next_health_event_sequence()
+
+        app._deliver_health_failure(6, sequence=failure_sequence)
+        app._deliver_health_snapshot(
+            6,
+            {"status": "ok"},
+            sequence=recovery_sequence,
+        )
+
         app._on_server_unreachable.assert_called_once()
-        self.assertFalse(app._poll_run)
+        app._on_first_health.assert_called_once()
+        self.assertFalse(app._health_needs_full_refresh)
+
+    def test_initial_health_uses_consecutive_failures_not_sticky_success(self):
+        app = self._app()
+        app._on_server_unreachable = mock.Mock()
+        health_response = mock.Mock()
+        health_response.read.return_value = b'{"status":"ok"}'
+        health_calls = 0
+
+        def urlopen(request, timeout):
+            nonlocal health_calls
+            if request.full_url.endswith("/health"):
+                health_calls += 1
+                if health_calls == 1:
+                    return health_response
+            raise OSError("down")
+
+        sleep_calls = 0
+
+        def stop_after_report(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 61:
+                app._poll_run = False
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+            mock.patch.object(
+                main_gateway.time,
+                "sleep",
+                side_effect=stop_after_report,
+            ),
+        ):
+            app._poll_health()
+
+        app._on_server_unreachable.assert_called_once()
+
+    def test_health_errors_have_user_facing_recovery_messages(self):
+        unauthorized = type("HttpError", (), {"code": 401})()
+        rate_limited = type(
+            "HttpError",
+            (),
+            {"code": 429, "headers": {"Retry-After": "12"}},
+        )()
+        server_error = type("HttpError", (), {"code": 503})()
+
+        self.assertIn("访问密钥", GatewayApp._health_degraded_message(unauthorized))
+        self.assertIn("较频繁", GatewayApp._health_degraded_message(rate_limited))
+        self.assertIn("状态接口", GatewayApp._health_degraded_message(server_error))
+        self.assertEqual(
+            GatewayApp._health_retry_delay(rate_limited, 3.0),
+            12.0,
+        )
+
+    def test_malformed_health_error_metadata_cannot_break_retry_logic(self):
+        malformed_code = type(
+            "MalformedHttpError",
+            (),
+            {"code": object()},
+        )()
+        malformed_headers = type(
+            "MalformedHeadersError",
+            (),
+            {
+                "code": 429,
+                "headers": type(
+                    "BadHeaders",
+                    (),
+                    {"get": lambda self, _name: (_ for _ in ()).throw(RuntimeError())},
+                )(),
+            },
+        )()
+
+        self.assertIn(
+            "自动重试",
+            GatewayApp._health_degraded_message(malformed_code),
+        )
+        self.assertEqual(
+            GatewayApp._health_retry_delay(malformed_headers, 3.0),
+            3.0,
+        )
+
+    def test_unreachable_health_preserves_in_memory_api_key_for_recovery(self):
+        app = self._app()
+        app._api_key = "sk-local-memory-fallback"
+        app._clear_public_url = mock.Mock()
+        app._key_label = mock.Mock()
+        app._url_label = mock.Mock()
+
+        app._on_server_unreachable()
+
+        self.assertEqual(app._api_key, "sk-local-memory-fallback")
 
     def test_offline_tunnel_clears_stale_public_url(self):
         app = self._app()
